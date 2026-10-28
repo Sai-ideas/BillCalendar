@@ -18,6 +18,7 @@ BillCalendar 是在 `Sai-ideas/BillCalendar` 獨立儲存庫開發的示範應�
 - [技術架構與資料模型](docs/ARCHITECTURE.md)
 - [介面與操作流程](docs/UX.md)
 - [實作階段與未決事項](docs/ROADMAP.md)
+- [V0.3 規格審閱與 MVP 架構收斂提案（待 Review）](docs/REVIEW_V0.3.md)
 
 ## 技術候選
 React + TypeScript + Vite、Tailwind CSS、Cloudflare Workers + Hono、Cloudflare D1 + Drizzle ORM。初期聊天以輪詢為主；未決技術項目在 Roadmap 文件列出。尚未建立應用程式、CI 或正式部署。
