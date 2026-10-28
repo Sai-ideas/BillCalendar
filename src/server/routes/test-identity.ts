@@ -16,13 +16,12 @@ const SESSION_DURATION_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 /**
  * Fail-closed gate for synthetic Email identity simulation.
- * Public/production deployments default to disabled unless APP_ENV !== 'production'
- * AND ALLOW_TEST_IDENTITY is explicitly set to 'true'.
+ * Strictly requires APP_ENV === 'development' AND ALLOW_TEST_IDENTITY === 'true'.
+ * All other environments (production, staging, preview, or unset) default to disabled.
  */
 export function isTestIdentityEnabled(env?: Env): boolean {
   if (!env) return false;
-  if (env.APP_ENV === 'production') return false;
-  return env.ALLOW_TEST_IDENTITY === 'true';
+  return env.APP_ENV === 'development' && env.ALLOW_TEST_IDENTITY === 'true';
 }
 
 function toSimulatedUser(row: typeof users.$inferSelect): SimulatedUser {

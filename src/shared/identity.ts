@@ -1,7 +1,9 @@
 import { z } from 'zod';
 
 export const TEST_IDENTITY_SECURITY_NOTICE =
-  '受控示範測試模式：Email 輸入僅用於模擬內部 user_id 身份，不具備真實身份驗證或安全隔離保證，嚴禁輸入真實個資、密碼或財務資料。' as const;
+  '受控示範測試模式：僅允許 RFC 2606 保留之 .test 虛構網域 Email 模擬內部 user_id，不具備真實身份驗證或安全隔離保證；顯示名稱亦請勿輸入真實姓名、個資、密碼或財務資料。' as const;
+
+export const SYNTHETIC_EMAIL_DOMAIN_REGEX = /^[^@\s]+@(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+test$/;
 
 export const SYNTHETIC_IDENTITY_PRESETS = [
   {
@@ -19,6 +21,13 @@ export const SYNTHETIC_IDENTITY_PRESETS = [
  */
 export function normalizeEmail(rawEmail: string): string {
   return rawEmail.trim().toLowerCase();
+}
+
+/**
+ * Checks whether a normalized email uses a reserved `.test` synthetic domain (RFC 2606 / RFC 6761).
+ */
+export function isSyntheticTestEmail(emailNormalized: string): boolean {
+  return SYNTHETIC_EMAIL_DOMAIN_REGEX.test(emailNormalized);
 }
 
 /**
@@ -41,7 +50,11 @@ export const NormalizedEmailSchema = z
       .string()
       .min(3, 'Email 長度過短')
       .max(254, 'Email 長度不可超過 254 字元')
-      .email('請輸入有效的合成 Email 格式（例如 alice.demo@billcalendar.test）'),
+      .email('請輸入有效的 Email 格式')
+      .refine(
+        (val) => isSyntheticTestEmail(val),
+        '僅允許使用 .test 結尾的虛構測試網域（例如 alice.demo@billcalendar.test），禁止輸入真實 Email 地址',
+      ),
   );
 
 export const SelectTestIdentityRequestSchema = z.object({

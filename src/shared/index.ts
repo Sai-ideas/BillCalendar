@@ -6,8 +6,10 @@ export {
 
 export {
   TEST_IDENTITY_SECURITY_NOTICE,
+  SYNTHETIC_EMAIL_DOMAIN_REGEX,
   SYNTHETIC_IDENTITY_PRESETS,
   normalizeEmail,
+  isSyntheticTestEmail,
   deriveDisplayName,
   NormalizedEmailSchema,
   SelectTestIdentityRequestSchema,

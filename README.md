@@ -38,7 +38,8 @@ BillCalendar/
 1. **測試／正式環境分離（`wrangler.toml`）**
    - **預設／公開正式配置（Top-level production）**：`APP_ENV = "production"`、`ALLOW_TEST_IDENTITY = "false"`，綁定獨立資料庫 `billcalendar-db-prod`。公開入口**預設禁用**未驗證的測試 Email 身份模擬（呼叫 `/api/test-identity/*` 一律回傳 `403 Forbidden`）。
    - **Staging 配置（`[env.staging]`）**：`APP_ENV = "staging"`、`ALLOW_TEST_IDENTITY = "false"`，綁定獨立資料庫 `billcalendar-db-staging`。
-   - **本機開發／受控 Demo 配置（`[env.development]`）**：`APP_ENV = "development"`、`ALLOW_TEST_IDENTITY = "true"`，綁定本地資料庫 `billcalendar-db`。即使設定 `ALLOW_TEST_IDENTITY = "true"`，只要 `APP_ENV === "production"`，後端仍強制拒絕啟用測試身份模擬。
+   - **本機開發／受控 Demo 配置（`[env.development]`）**：`APP_ENV = "development"`、`ALLOW_TEST_IDENTITY = "true"`，綁定本地資料庫 `billcalendar-db`。後端僅在 `APP_ENV === "development"` 且 `ALLOW_TEST_IDENTITY === "true"` 時啟用測試身份模擬（`production`、`staging` 或其他環境即使誤設 `ALLOW_TEST_IDENTITY = "true"` 仍一律拒絕）。
+   - **合成 Email 網域限制與網路邊界注意**：API 強制限制僅接受 RFC 2606 保留之 `.test` 結尾虛構網域（如 `alice.demo@billcalendar.test`），拒絕真實信箱網域（如 `@gmail.com`）；但格式驗證無法防止使用者於顯示名稱填入真實姓名，且 `--env development` 僅控制應用程式變數、不等同於網路層存取限制，切勿將開啟測試身份之環境直接暴露於公網。
 
 2. **Cloudflare Workers 本地環境變數（`.dev.vars`）**
    - 可複製 `.dev.vars.example` 為 `.dev.vars`：

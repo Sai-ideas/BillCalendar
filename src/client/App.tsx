@@ -319,12 +319,12 @@ export function App() {
 
                 <form onSubmit={handleCustomSubmit} className="space-y-3 pt-2">
                   <h3 className="text-xs font-semibold tracking-wider text-slate-500 uppercase">
-                    輸入自訂虛構 Email 建立／切換身份
+                    輸入自訂虛構 Email 建立／切換身份（限 .test 測試網域）
                   </h3>
                   <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
                     <div>
                       <label htmlFor="synthetic-email" className="block text-xs font-medium text-slate-700">
-                        虛構 Email（自動轉小寫與去空白）
+                        虛構 Email（限 *.test 網域，禁止真實信箱）
                       </label>
                       <input
                         id="synthetic-email"
@@ -338,18 +338,21 @@ export function App() {
                     </div>
                     <div>
                       <label htmlFor="synthetic-name" className="block text-xs font-medium text-slate-700">
-                        顯示名稱（選填）
+                        虛構顯示名稱（選填，請勿填真實姓名）
                       </label>
                       <input
                         id="synthetic-name"
                         type="text"
-                        placeholder="Charlie (選填)"
+                        placeholder="Charlie (虛構代稱)"
                         value={displayNameInput}
                         onChange={(e) => setDisplayNameInput(e.target.value)}
                         className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-900 focus:border-indigo-600 focus:outline-hidden"
                       />
                     </div>
                   </div>
+                  <p className="text-[11px] text-amber-800">
+                    注意：系統僅允許 <code>.test</code> 保留網域；格式檢查無法自動辨識真實姓名，顯示名稱欄亦請勿輸入真實個資。
+                  </p>
                   <button
                     type="submit"
                     disabled={submitting || !emailInput.trim()}

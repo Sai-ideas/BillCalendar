@@ -5,6 +5,7 @@ import { createApp } from './index';
 import {
   SYNTHETIC_IDENTITY_PRESETS,
   TestIdentityStateResponseSchema,
+  isSyntheticTestEmail,
   normalizeEmail,
 } from '../shared';
 import { createMigratedSqliteD1 } from './test-utils/sqlite-d1';
@@ -72,6 +73,70 @@ describe('Issue #2 Test Email Identity Simulation & Security Boundaries', () => 
     sqlite.close();
   });
 
+  it('accepts reserved .test synthetic addresses and rejects real domains or invalid addresses without writing to users', async () => {
+    const { sqlite, db } = createMigratedSqliteD1();
+    const app = createApp();
+    const devEnv = {
+      DB: db,
+      APP_ENV: 'development',
+      ALLOW_TEST_IDENTITY: 'true',
+      DEFAULT_TIMEZONE: 'Asia/Taipei',
+    };
+
+    expect(isSyntheticTestEmail('alice.demo@billcalendar.test')).toBe(true);
+    expect(isSyntheticTestEmail('real.user@gmail.com')).toBe(false);
+
+    const rejectedAddresses = [
+      'real.user@gmail.com',
+      'someone@outlook.com',
+      'user@company.com.tw',
+      'trick@test.com',
+      'not-an-email',
+      'user@.test',
+      'user@test',
+    ];
+
+    for (const invalidEmail of rejectedAddresses) {
+      const res = await app.request(
+        '/api/test-identity/select',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: invalidEmail }),
+        },
+        devEnv,
+      );
+      expect(res.status).toBe(400);
+      const errBody = (await res.json()) as { error: string; message: string };
+      expect(errBody.error).toBe('VALIDATION_ERROR');
+    }
+
+    // Confirm none of the rejected emails were persisted in D1 `users` table
+    const countRow = sqlite.prepare('SELECT COUNT(*) as cnt FROM users').get() as { cnt: number };
+    expect(countRow.cnt).toBe(0);
+
+    // Confirm valid .test synthetic address succeeds and writes exactly 1 user
+    const validRes = await app.request(
+      '/api/test-identity/select',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: '  Charlie@Sub.BillCalendar.TEST  ' }),
+      },
+      devEnv,
+    );
+    expect(validRes.status).toBe(200);
+    const validState = TestIdentityStateResponseSchema.parse(await validRes.json());
+    expect(validState.currentUser?.emailNormalized).toBe('charlie@sub.billcalendar.test');
+
+    const afterCountRow = sqlite.prepare('SELECT COUNT(*) as cnt FROM users').get() as {
+      cnt: number;
+    };
+    expect(afterCountRow.cnt).toBe(1);
+
+    sqlite.close();
+  });
+
   it('supports switching between two synthetic accounts and logging out while preserving stable user_ids', async () => {
     const { sqlite, db } = createMigratedSqliteD1();
     const app = createApp();
@@ -99,7 +164,7 @@ describe('Issue #2 Test Email Identity Simulation & Security Boundaries', () => 
     const stateA = TestIdentityStateResponseSchema.parse(await resA.json());
     expect(stateA.simulationMode).toBe(true);
     expect(stateA.isAuthenticatedSecurity).toBe(false);
-    expect(stateA.securityNotice).toMatch(/嚴禁輸入真實個資/);
+    expect(stateA.securityNotice).toMatch(/請勿輸入真實姓名、個資/);
     const userAId = stateA.currentUser?.id;
     const sessionA = stateA.sessionId;
     expect(userAId).toBeTruthy();
@@ -179,15 +244,19 @@ describe('Issue #2 Test Email Identity Simulation & Security Boundaries', () => 
     sqlite.close();
   });
 
-  it('disables test identity endpoints by default and in production/staging environments', async () => {
+  it('disables test identity endpoints unless APP_ENV === development and ALLOW_TEST_IDENTITY === true', async () => {
     const { sqlite, db } = createMigratedSqliteD1();
     const app = createApp();
 
     const blockedEnvs = [
       { DB: db }, // Unset env vars -> fail-closed
       { DB: db, APP_ENV: 'production', ALLOW_TEST_IDENTITY: 'false' },
-      { DB: db, APP_ENV: 'production', ALLOW_TEST_IDENTITY: 'true' }, // Production always blocks even if flag is misconfigured
+      { DB: db, APP_ENV: 'production', ALLOW_TEST_IDENTITY: 'true' },
       { DB: db, APP_ENV: 'staging', ALLOW_TEST_IDENTITY: 'false' },
+      { DB: db, APP_ENV: 'staging', ALLOW_TEST_IDENTITY: 'true' }, // Non-development blocked even if flag is true
+      { DB: db, APP_ENV: 'preview', ALLOW_TEST_IDENTITY: 'true' },
+      { DB: db, APP_ENV: 'development', ALLOW_TEST_IDENTITY: 'false' },
+      { DB: db, APP_ENV: 'development' },
     ];
 
     for (const env of blockedEnvs) {
