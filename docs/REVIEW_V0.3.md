@@ -1,6 +1,6 @@
 # V0.3 規格審閱與 MVP 架構收斂提案（供 Agent / 開發者 Review）
 
-- **狀態**：Proposed（待 Review，尚未合併為最終定案）
+- **狀態**：Reviewed — 主要架構建議已收斂，待 PR Merge 後同步正式 Architecture / UX / Issues；本文件本身不是已實作證明。
 - **對應基準**：需求基準 V0.3（`README.md`, `docs/PRD.md`, `docs/ARCHITECTURE.md`, `docs/UX.md`, `docs/ROADMAP.md`）
 - **目的**：在不違反 `docs/ROADMAP.md`「尚待決策（不可假裝已確定）」原則的前提下，針對進入 **階段 1（基礎）與階段 2（月曆）** 前必須收斂的資料模型、索引效能與未決 UX 行為提出具體技術提案，供另一個 Agent 或維護者逐項 Review。
 
@@ -20,33 +20,27 @@
 
 ## 2. 架構與 Schema 修正提案（Architecture Proposals）
 
-### 提案 A1：簡化訊息衍生紀錄的關聯模型（具名外鍵 vs. 多型 `record_links`）
+### 提案 A1：MVP 採用單一具名來源外鍵（Review 結論：採納並修訂）
 
-- **現況（`docs/ARCHITECTURE.md`）**：
-  - 定義了多型關聯表 `record_links(id, source_type, source_id, target_type, target_id, relation_type, created_by)`。
-- **問題分析**：
-  - 在 SQLite（Cloudflare D1）中，多型關聯無法使用原生 Foreign Key 約束（如 `ON DELETE SET NULL`）。
-  - MVP 階段所有的關聯場景只有單一固定方向：**由一則 `message` 衍生出 `event`、`task`（雙向回溯）或複製為 `diary` 草稿**。
-- **建議方案（二擇一供 Review）**：
-  - **方案 A1-a（推薦，混合或具名外鍵）**：在 `events` 與 `tasks` 表直接保留 `source_message_id TEXT NULL REFERENCES messages(id) ON DELETE SET NULL`（或者保留 `record_links` 但在 `events`/`tasks` 同步記錄 `source_message_id`）。
-    - **優點**：查詢事件／待辦時可單表得知是否有來源訊息；查某則訊息衍生了哪些紀錄時只需簡單索引；訊息若未來支援刪除，SQLite 可自動 `SET NULL` 或由應用層顯式標記 `source_deleted`。
-  - **方案 A1-b（維持原案）**：完全使用 `record_links`，但於應用層嚴格限制 `source_type = 'message'` 且 `target_type IN ('event', 'task')`，並建立複合索引 `idx_record_links_source(source_type, source_id)` 與 `idx_record_links_target(target_type, target_id)`。
+- `events.source_message_id`、`tasks.source_message_id`：可為 NULL，參照 `messages(id)`；各自為來源欄位建立索引。
+- **不在 MVP 同時保存同一關聯於 `record_links`**，避免兩份真相不一致。每個事件／待辦至多一則直接來源訊息；同一訊息可衍生多個事件／待辦。
+- 聊天轉私人日記採「複製為草稿」，目前不必建立永久來源外鍵；日後多來源或跨類型關聯有明確需求再評估 join table。
+- **MVP 訊息原則採軟刪除（`deleted_at`），保留 ID 與來源連結**。一般閱讀與搜尋均不可再取回已刪內容；實際資料保留／清除政策及管理員存取需另定義。若未來執行實體刪除，外鍵可 `ON DELETE SET NULL`，UI 顯示無來源，不可假裝仍有原訊息。
+- 正反向導覽**每次同時檢查目標與來源的存取權**；家庭訊息衍生私人待辦時，其他家庭成員不得看到待辦本體，**也不能看到是否建立了該私人待辦**。後端只回傳授權可見的關聯數量與詳情。
+- 使用者離開家庭後，即便保留了其私人事件或待辦，也不可藉來源連結讀取原家庭訊息。軟刪除的來源只能顯示「已移除」，無權限來源只顯示泛化不可存取訊息，避免資訊洩漏。
+- 驗收：單訊息建立多目標、修改目標不改原文、軟刪／退群回源顯示、跨空間不可見性，皆須列為測試。
 
 ---
 
-### 提案 A2：`messages` 表新增預算好的日曆日期欄位 `local_date` 與複合索引
+### 提案 A2：分開訊息的發送日期與補記日期（Review 結論：採納並修訂）
 
-- **現況（`docs/ARCHITECTURE.md`）**：
-  - `messages` 欄位為 `(id, room_id, sender_user_id, body, created_at, record_date NULL)`。
-  - 同時系統要求：`GET /api/calendar/month?year=YYYY&month=MM` 需回傳當月每天「是否有聊天紀錄」的摘要 icon，且點擊日期需快速定位到該聊天室當天的第一則訊息游標。
-- **問題分析**：
-  - 若 `created_at` 以 UTC 儲存，而月曆以 `Asia/Taipei`（或空間預設時區）呈現，在 D1 SQLite 查詢整月每天是否有訊息時，若動態對 `created_at` 做時區偏移字串切割，將無法有效命中索引並增加 D1 列掃描成本。
-- **建議方案**：
-  - 將 `record_date NULL` 明確定義為 **`local_date TEXT NOT NULL`**（格式 `YYYY-MM-DD`，於寫入訊息時依該聊天室／使用者時區預設 `Asia/Taipei` 計算寫入；若使用者指定補記日期則為指定日）。
-  - 建立複合索引：`CREATE INDEX idx_messages_room_date_created ON messages(room_id, local_date, created_at, id);`。
-  - **效益**：
-    1. 月曆摘要查詢：`SELECT DISTINCT local_date FROM messages WHERE room_id = ? AND local_date BETWEEN '2026-10-01' AND '2026-10-31'` 可 100% Index-Only Scan。
-    2. 日期定位游標：直接以 `WHERE room_id = ? AND local_date >= ? ORDER BY local_date ASC, created_at ASC LIMIT 1` 取得該日第一筆訊息 ID，再載入前後上下文。
+- `created_at`：UTC 建立時間，作為訊息時間軸主要排序依據（同時間以 `id` 斷同分）。
+- `local_date TEXT NOT NULL`：依訊息發送當下聊天室指定時區計算的本地發送日期（`YYYY-MM-DD`）；MVP 預設 `Asia/Taipei`。供聊天日期定位與按發送日的月曆存在性摘要。
+- `record_date TEXT NULL`：使用者明確指定的生活紀錄日期，供未來補記使用；**不得覆寫 `local_date`**。MVP 可不提供編輯該欄位的 UI。
+- 建立索引 `CREATE INDEX idx_messages_room_date_created ON messages(room_id, local_date, created_at, id);`；如日後開放按補記日期篩選，再評估獨立索引。
+- 月曆標記先以 `selectedSpace` 對應聊天室的 `local_date` 定義存在性；未來若需要「指定紀錄日」圖示，必須另訂清楚的聚合規則。
+- 當 `local_date` 與 `created_at` 可能排序不同（例如聊天空間時區變更）時，定位 SQL 需先查當日符合的訊息，再以 UTC / id 載入其相鄰上下文，**不得直接假設 `ORDER BY local_date, created_at` 永遠等於完整聊天時間軸**。
+- 索引有助於縮小掃描範圍，但不能承諾固定為 Index-Only Scan；以 `EXPLAIN QUERY PLAN` 與測試資料驗證實際查詢計畫與效能。
 
 ---
 
@@ -84,13 +78,14 @@
 
 ---
 
-## 4. 給 Reviewer Agent 的檢核問題（Review Checklist）
+## 4. Review 結論與 Merge 前檢核
 
-請另一個 Agent 在審閱本提案時協助確認以下問題：
+本次 Review 的採納結果：
 
-1. **[Schema - A1]** 是否同意在 `events` / `tasks` 直接加上 `source_message_id`（或維持純 `record_links` 表）？
-2. **[Schema - A2]** 是否同意在 `messages` 將日期欄位定名為 `local_date TEXT NOT NULL`（`YYYY-MM-DD`）並建立 `(room_id, local_date, created_at)` 索引以支援月曆存在性摘要與日期跳轉？
-3. **[Project Layout - A3]** 是否同意採用單一倉庫根目錄整合 Vite + Hono + Cloudflare Workers + Drizzle 的目錄結構？
-4. **[Open Decisions - D1~D7]** 上述 7 項針對 `ROADMAP.md` 未決事項的 MVP 預設方案是否有任何與原始規劃意圖衝突之處？
+1. **A1 採用**具名來源外鍵、軟刪除；不與多型表雙寫；跨私人／家庭來源關聯永不洩露未授權目標的存在性。
+2. **A2 採用** `created_at` + `local_date` + 可空 `record_date`；索引效果需測量。
+3. **A3 採用**單專案根目錄整合 Vite / Hono / Workers / Drizzle；`src/shared` 僅共用型別、純工具與驗證，不混入伺服器密碼或資料庫存取。
+4. **D1–D7 採納為 MVP 預設**，另補充：D2 以軟刪除保 ID；D3 個人空間只顯示本人日記，家庭空間初期不顯示私人日記 icon；D4 事件須保留時區語意且全天日期不經 UTC 換日；D5 函式庫授權／更新狀況與閏月／節日資料需實測，不直接保證正確；D6 禁止最後一位 admin 在無交接下退出或被移除；D7 僅 https，分享頁降級一般連結，不進行後端抓取或第三方 script 注入。
+5. **尚未定案的後續範圍**：訊息實體刪除／保留期限、群組跨國時區的切換行為、節慶資料的年度維護、超出 MVP 的搜尋／通知／匯出。
 
-> 確認後，即可直接合併本分支（或於 PR 留言修正意見），並依據階段 1 啟動專案初始化與資料庫 Migration 建立。
+**合併流程**：本 PR 可作為已 Review 的決策紀錄 Merge；實作前需將上述決策同步到 `docs/ARCHITECTURE.md`、`docs/UX.md`、`docs/ROADMAP.md` 與涉及的 Issues，避免舊版的 `record_links` 方案被視為正式 Schema。此 PR 不建立資料庫、不修改執行程式，也不宣稱已驗收功能。
