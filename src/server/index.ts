@@ -2,7 +2,8 @@ import { Hono } from 'hono';
 import { sql } from 'drizzle-orm';
 import { DEFAULT_TIMEZONE, type HealthResponse } from '../shared';
 import { createDb } from './db/client';
-import { appMeta, testSessions, users } from './db/schema';
+import { appMeta, families, familyInvitations, familyMembers, testSessions, users } from './db/schema';
+import { createFamiliesRouter, createInvitationsRouter } from './routes/families';
 import { createTestIdentityRouter } from './routes/test-identity';
 
 export interface Env {
@@ -17,7 +18,9 @@ function isMissingTableError(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err);
   const causeMessage =
     err instanceof Error && err.cause instanceof Error ? err.cause.message : '';
-  return /no such table:\s*(app_meta|users|test_sessions)/i.test(`${message} ${causeMessage}`);
+  return /no such table:\s*(app_meta|users|test_sessions|families|family_members|family_invitations)/i.test(
+    `${message} ${causeMessage}`,
+  );
 }
 
 export function createApp() {
@@ -47,6 +50,9 @@ export function createApp() {
           await db.select().from(appMeta).limit(1);
           await db.select().from(users).limit(1);
           await db.select().from(testSessions).limit(1);
+          await db.select().from(families).limit(1);
+          await db.select().from(familyMembers).limit(1);
+          await db.select().from(familyInvitations).limit(1);
           migrated = true;
         } catch (err: unknown) {
           if (isMissingTableError(err)) {
@@ -79,6 +85,8 @@ export function createApp() {
   });
 
   app.route('/api/test-identity', createTestIdentityRouter());
+  app.route('/api/families', createFamiliesRouter());
+  app.route('/api/invitations', createInvitationsRouter());
 
   return app;
 }
