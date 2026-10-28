@@ -8,22 +8,14 @@ import {
   type SimulatedUser,
   type TestIdentityStateResponse,
 } from '../../shared';
-import { resolveSession, toSimulatedUser } from '../auth';
+import { isTestIdentityEnabled, resolveSession, toSimulatedUser } from '../auth';
 import { createDb, type AppDatabase } from '../db/client';
 import { testSessions, users } from '../db/schema';
 import type { Env } from '../index';
 
-const SESSION_DURATION_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+export { isTestIdentityEnabled };
 
-/**
- * Fail-closed gate for synthetic Email identity simulation.
- * Strictly requires APP_ENV === 'development' AND ALLOW_TEST_IDENTITY === 'true'.
- * All other environments (production, staging, preview, or unset) default to disabled.
- */
-export function isTestIdentityEnabled(env?: Env): boolean {
-  if (!env) return false;
-  return env.APP_ENV === 'development' && env.ALLOW_TEST_IDENTITY === 'true';
-}
+const SESSION_DURATION_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 async function listAvailableUsers(db: AppDatabase): Promise<SimulatedUser[]> {
   const rows = await db.select().from(users).orderBy(asc(users.createdAt)).limit(20);

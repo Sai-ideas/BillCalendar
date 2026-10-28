@@ -358,7 +358,7 @@ describe('Issue #3 Family Model, Members and In-App Invitations', () => {
     );
     expect(accept1.status).toBe(200);
 
-    // Bob accepts again -> idempotent 200 without creating a duplicate record
+    // Bob accepts again while being a member -> idempotent 200 without creating a duplicate record
     const accept2 = await app.request(
       `/api/invitations/${inv.id}/accept`,
       {
@@ -761,6 +761,316 @@ describe('Issue #3 Family Model, Members and In-App Invitations', () => {
       devEnv,
     );
     expect(aliceRemoveSelfRes.status).toBe(400);
+  });
+
+  it('Blocking 1: strictly enforces test identity environment gate on family and invitation routes in non-dev envs', async () => {
+    const { db } = createMigratedSqliteD1();
+    const app = createApp();
+    const devEnv = {
+      DB: db,
+      APP_ENV: 'development',
+      ALLOW_TEST_IDENTITY: 'true',
+      DEFAULT_TIMEZONE: 'Asia/Taipei',
+    };
+
+    // First obtain a valid test session token in development
+    const users = await setupTestUsers(app, devEnv);
+
+    // Define production and staging environments (fail-closed)
+    const prodEnv = {
+      DB: db,
+      APP_ENV: 'production',
+      ALLOW_TEST_IDENTITY: 'false',
+    };
+
+    const stagingEnv = {
+      DB: db,
+      APP_ENV: 'staging',
+      ALLOW_TEST_IDENTITY: 'false',
+    };
+
+    // Even with a valid session header, all family and invitation routes must reject with 403 in production
+    const prodGetFam = await app.request(
+      '/api/families',
+      {
+        headers: { 'X-Test-Session-Id': users.alice.session },
+      },
+      prodEnv,
+    );
+    expect(prodGetFam.status).toBe(403);
+    const prodFamErr = (await prodGetFam.json()) as { error: string };
+    expect(prodFamErr.error).toBe('TEST_IDENTITY_DISABLED');
+
+    const prodPostFam = await app.request(
+      '/api/families',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Test-Session-Id': users.alice.session,
+        },
+        body: JSON.stringify({ name: '禁用的正式環境家庭' }),
+      },
+      prodEnv,
+    );
+    expect(prodPostFam.status).toBe(403);
+
+    const stagingGetInv = await app.request(
+      '/api/invitations',
+      {
+        headers: { 'X-Test-Session-Id': users.alice.session },
+      },
+      stagingEnv,
+    );
+    expect(stagingGetInv.status).toBe(403);
+  });
+
+  it('Blocking 2 & 3: enforces true idempotency and prevents reusing accepted invitation after leaving', async () => {
+    const { db } = createMigratedSqliteD1();
+    const app = createApp();
+    const devEnv = {
+      DB: db,
+      APP_ENV: 'development',
+      ALLOW_TEST_IDENTITY: 'true',
+      DEFAULT_TIMEZONE: 'Asia/Taipei',
+    };
+
+    const users = await setupTestUsers(app, devEnv);
+
+    // Alice creates Family & invites Bob
+    const createRes = await app.request(
+      '/api/families',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Test-Session-Id': users.alice.session,
+        },
+        body: JSON.stringify({ name: '真冪等性與重新授權防護家庭' }),
+      },
+      devEnv,
+    );
+    const fam = (await createRes.json()) as { id: string };
+
+    const invRes = await app.request(
+      `/api/families/${fam.id}/invitations`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Test-Session-Id': users.alice.session,
+        },
+        body: JSON.stringify({ email: users.bob.email }),
+      },
+      devEnv,
+    );
+    const inv = (await invRes.json()) as { id: string };
+
+    // 1. Bob accepts invitation
+    const accept1 = await app.request(
+      `/api/invitations/${inv.id}/accept`,
+      {
+        method: 'POST',
+        headers: { 'X-Test-Session-Id': users.bob.session },
+      },
+      devEnv,
+    );
+    expect(accept1.status).toBe(200);
+
+    // 2. Bob accepts again while currently a member -> 200 (true idempotent)
+    const accept2 = await app.request(
+      `/api/invitations/${inv.id}/accept`,
+      {
+        method: 'POST',
+        headers: { 'X-Test-Session-Id': users.bob.session },
+      },
+      devEnv,
+    );
+    expect(accept2.status).toBe(200);
+    const accept2Json = (await accept2.json()) as { message: string };
+    expect(accept2Json.message).toBe('您已經是該家庭的成員');
+
+    // 3. Trying to revoke an already accepted invite fails with 400
+    const revokeAccepted = await app.request(
+      `/api/families/${fam.id}/invitations/${inv.id}/revoke`,
+      {
+        method: 'POST',
+        headers: { 'X-Test-Session-Id': users.alice.session },
+      },
+      devEnv,
+    );
+    expect(revokeAccepted.status).toBe(400);
+
+    // 4. Bob leaves the family
+    const leaveRes = await app.request(
+      `/api/families/${fam.id}/leave`,
+      {
+        method: 'POST',
+        headers: { 'X-Test-Session-Id': users.bob.session },
+      },
+      devEnv,
+    );
+    expect(leaveRes.status).toBe(200);
+
+    // 5. Bob tries to accept the old accepted invitation after leaving -> returns 400 INVITATION_ALREADY_USED
+    const reuseAttempt = await app.request(
+      `/api/invitations/${inv.id}/accept`,
+      {
+        method: 'POST',
+        headers: { 'X-Test-Session-Id': users.bob.session },
+      },
+      devEnv,
+    );
+    expect(reuseAttempt.status).toBe(400);
+    const reuseErr = (await reuseAttempt.json()) as { error: string };
+    expect(reuseErr.error).toBe('INVITATION_ALREADY_USED');
+
+    // Verify Bob is not re-added as a member
+    const famView = await app.request(
+      `/api/families/${fam.id}`,
+      {
+        headers: { 'X-Test-Session-Id': users.alice.session },
+      },
+      devEnv,
+    );
+    const famDetail = (await famView.json()) as { members: Array<{ userId: string }> };
+    expect(famDetail.members.length).toBe(1);
+    expect(famDetail.members[0].userId).toBe(users.alice.userId);
+  });
+
+  it('Blocking 4: supports admin handover via member role update and enforces last admin protection during demotion', async () => {
+    const { db } = createMigratedSqliteD1();
+    const app = createApp();
+    const devEnv = {
+      DB: db,
+      APP_ENV: 'development',
+      ALLOW_TEST_IDENTITY: 'true',
+      DEFAULT_TIMEZONE: 'Asia/Taipei',
+    };
+
+    const users = await setupTestUsers(app, devEnv);
+
+    // Alice creates Family (Alice is sole admin)
+    const createRes = await app.request(
+      '/api/families',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Test-Session-Id': users.alice.session,
+        },
+        body: JSON.stringify({ name: '管理員交接測試家庭' }),
+      },
+      devEnv,
+    );
+    const fam = (await createRes.json()) as { id: string };
+
+    // Alice invites Bob as member, Bob accepts
+    const invRes = await app.request(
+      `/api/families/${fam.id}/invitations`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Test-Session-Id': users.alice.session,
+        },
+        body: JSON.stringify({ email: users.bob.email }),
+      },
+      devEnv,
+    );
+    const inv = (await invRes.json()) as { id: string };
+    await app.request(
+      `/api/invitations/${inv.id}/accept`,
+      {
+        method: 'POST',
+        headers: { 'X-Test-Session-Id': users.bob.session },
+      },
+      devEnv,
+    );
+
+    // 1. Bob (member) cannot change anyone's role -> 403 Forbidden
+    const bobPromoteAttempt = await app.request(
+      `/api/families/${fam.id}/members/${users.bob.userId}`,
+      {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Test-Session-Id': users.bob.session,
+        },
+        body: JSON.stringify({ role: 'admin' }),
+      },
+      devEnv,
+    );
+    expect(bobPromoteAttempt.status).toBe(403);
+
+    // 2. Alice cannot demote herself while she is the only admin -> 400 LAST_ADMIN_CANNOT_LEAVE
+    const aliceDemoteSelf = await app.request(
+      `/api/families/${fam.id}/members/${users.alice.userId}`,
+      {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Test-Session-Id': users.alice.session,
+        },
+        body: JSON.stringify({ role: 'member' }),
+      },
+      devEnv,
+    );
+    expect(aliceDemoteSelf.status).toBe(400);
+    const demoteErr = (await aliceDemoteSelf.json()) as { error: string };
+    expect(demoteErr.error).toBe('LAST_ADMIN_CANNOT_LEAVE');
+
+    // 3. Alice promotes Bob to admin (Admin Handover!)
+    const promoteBobRes = await app.request(
+      `/api/families/${fam.id}/members/${users.bob.userId}`,
+      {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Test-Session-Id': users.alice.session,
+        },
+        body: JSON.stringify({ role: 'admin' }),
+      },
+      devEnv,
+    );
+    expect(promoteBobRes.status).toBe(200);
+
+    // Verify Bob is now admin
+    const bobFamDetailRes = await app.request(
+      `/api/families/${fam.id}`,
+      {
+        headers: { 'X-Test-Session-Id': users.bob.session },
+      },
+      devEnv,
+    );
+    const bobFamDetail = (await bobFamDetailRes.json()) as { myRole: string };
+    expect(bobFamDetail.myRole).toBe('admin');
+
+    // 4. Now that Bob is also an admin, Alice can safely demote herself or leave the family!
+    const aliceLeaveRes = await app.request(
+      `/api/families/${fam.id}/leave`,
+      {
+        method: 'POST',
+        headers: { 'X-Test-Session-Id': users.alice.session },
+      },
+      devEnv,
+    );
+    expect(aliceLeaveRes.status).toBe(200);
+
+    // Verify Bob is now the sole remaining admin
+    const finalFamView = await app.request(
+      `/api/families/${fam.id}`,
+      {
+        headers: { 'X-Test-Session-Id': users.bob.session },
+      },
+      devEnv,
+    );
+    const finalDetail = (await finalFamView.json()) as {
+      members: Array<{ userId: string; role: string }>;
+    };
+    expect(finalDetail.members.length).toBe(1);
+    expect(finalDetail.members[0].userId).toBe(users.bob.userId);
+    expect(finalDetail.members[0].role).toBe('admin');
   });
 
   it('enforces synthetic email format (.test domain check) on invitation and unauthenticated checks', async () => {

@@ -5,6 +5,16 @@ import { createDb, type AppDatabase } from './db/client';
 import { testSessions, users } from './db/schema';
 import type { Env } from './index';
 
+/**
+ * Fail-closed gate for synthetic Email identity simulation.
+ * Strictly requires APP_ENV === 'development' AND ALLOW_TEST_IDENTITY === 'true'.
+ * All other environments (production, staging, preview, or unset) default to disabled.
+ */
+export function isTestIdentityEnabled(env?: Env): boolean {
+  if (!env) return false;
+  return env.APP_ENV === 'development' && env.ALLOW_TEST_IDENTITY === 'true';
+}
+
 export function toSimulatedUser(row: typeof users.$inferSelect): SimulatedUser {
   return {
     id: row.id,
@@ -51,12 +61,43 @@ export async function resolveSession(
   };
 }
 
-export async function getAuthenticatedUser(
+export type AuthResolutionResult =
+  | { status: 'disabled' }
+  | { status: 'unauthorized' }
+  | { status: 'authenticated'; user: SimulatedUser };
+
+/**
+ * Resolves current simulated test user with strict environment gate checking.
+ */
+export async function authenticateTestRequest(
   c: Context<{ Bindings: Env }>,
-): Promise<SimulatedUser | null> {
-  if (!c.env?.DB) return null;
+): Promise<AuthResolutionResult> {
+  if (!isTestIdentityEnabled(c.env)) {
+    return { status: 'disabled' };
+  }
+  if (!c.env?.DB) {
+    return { status: 'unauthorized' };
+  }
+
   const db = createDb(c.env.DB);
   const sessionHeader = c.req.header('X-Test-Session-Id');
   const { currentUser } = await resolveSession(db, sessionHeader);
-  return currentUser;
+  if (!currentUser) {
+    return { status: 'unauthorized' };
+  }
+
+  return { status: 'authenticated', user: currentUser };
+}
+
+/**
+ * Convenience helper that returns SimulatedUser or null if not authenticated or environment disabled.
+ */
+export async function getAuthenticatedUser(
+  c: Context<{ Bindings: Env }>,
+): Promise<SimulatedUser | null> {
+  const res = await authenticateTestRequest(c);
+  if (res.status === 'authenticated') {
+    return res.user;
+  }
+  return null;
 }

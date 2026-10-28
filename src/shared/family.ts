@@ -25,6 +25,11 @@ export const UpdateFamilyRequestSchema = z.object({
 });
 export type UpdateFamilyRequest = z.infer<typeof UpdateFamilyRequestSchema>;
 
+export const UpdateMemberRoleRequestSchema = z.object({
+  role: FamilyRoleSchema,
+});
+export type UpdateMemberRoleRequest = z.infer<typeof UpdateMemberRoleRequestSchema>;
+
 export const InviteMemberRequestSchema = z.object({
   email: NormalizedEmailSchema,
   role: FamilyRoleSchema.default('member'),

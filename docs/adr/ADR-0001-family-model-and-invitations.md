@@ -4,9 +4,9 @@
 Accepted（已於 PR #18 審閱收斂，並由 Issue #3 規格明確採納）
 
 ## 作者識別與提案來源 (Attribution)
-- **Idea origin**: Gemini / unspecified（源自 PR #18 審閱意見 D1 與 Issue #3 規格）
+- **Idea origin**: unknown（源自 PR #18 審閱意見 D1，詳見 [docs/REVIEW_V0.3.md](../REVIEW_V0.3.md) 與 Issue #3 規格）
 - **Decision**: accepted
-- **Role**: author
+- **Role**: editor / implementation author
 
 ---
 
@@ -17,6 +17,7 @@ BillCalendar 定位為支援個人隨手記與多家庭協作的生活月曆系�
 1. **無驗證郵件下的邀請流程**：本系統目前為受控示範應用，不依賴真實 SMTP 伺服器或外部郵件服務（Email 僅以 RFC 2606 保留之 `.test` 虛構網域模擬內部 `user_id`）。因此無法使用「寄發郵件點擊驗證連結」的傳統註冊機制。
 2. **多家庭與權限角色邊界**：使用者可同時隸屬於多個家庭空間；家庭成員角色在 MVP 階段限定為 `admin` 與 `member`。
 3. **資料安全防護**：家庭空間內的行程、待辦、記帳與聊天對非成員完全隔離；且家庭最後一位管理員（Last Admin）不得在未移交權限的情況下脫離家庭或被刪除，以防家庭空間孤兒化。
+4. **測試身份模擬環境閘門**：此受控示範身份模擬僅適用於本機／受控開發環境（`APP_ENV === 'development' && ALLOW_TEST_IDENTITY === 'true'`），非安全驗證機制，在 staging/production 部署必須保持 fail-closed。
 
 ---
 
@@ -67,40 +68,47 @@ BillCalendar 定位為支援個人隨手記與多家庭協作的生活月曆系�
 | 修改家庭名稱 | ✅ | ❌ (403) | ❌ (403) |
 | 發送新成員邀請 | ✅ (限 `.test` 網域) | ❌ (403) | ❌ (403) |
 | 撤銷已發送的 pending 邀請 | ✅ | ❌ (403) | ❌ (403) |
+| 變更成員角色（交接管理員） | ✅ (`PATCH /api/families/:id/members/:userId`，防護最後 admin) | ❌ (403) | ❌ (403) |
 | 移除其他成員 | ✅ (不得移除最後一位 admin) | ❌ (403) | ❌ (403) |
 | 主動退出家庭 | ✅ (不得無交接退出最後一位 admin) | ✅ | ❌ |
 | 共享家庭行程／待辦／記帳／聊天（後續階段） | ✅ | ✅ | ❌ (403) |
 
 ---
 
-### 3. 受控示範邀請操作流程 (Workflow)
+### 3. 受控示範邀請操作流程與原子性狀態遷移 (Workflow & Concurrency)
 
-1. **發送邀請**：
+1. **環境閘門檢驗**：
+   - 所有的 `/api/families/*` 與 `/api/invitations/*` API 均統一經由 `authenticateTestRequest` 檢查 `APP_ENV === 'development' && ALLOW_TEST_IDENTITY === 'true'`。若在未開放環境呼叫，一律回傳 403 `TEST_IDENTITY_DISABLED`（Fail-Closed）。
+2. **原子化建立家庭**：
+   - 建立家庭時使用 D1 `db.batch` 同步寫入 `families` 與 `family_members`（角色為 `admin`），保證兩筆寫入具有交易原子性。
+3. **發送邀請**：
    - 管理員在家庭設定中輸入受邀者 Email（必須符合 `.test` 虛構網域）。
    - 伺服端檢查：
      - 若受邀者已是該家庭成員，回應 `409 ALREADY_MEMBER`。
      - 若該 Email 已有狀態為 `pending` 的邀請，回應 `409 INVITATION_ALREADY_PENDING`。
    - 寫入 `family_invitations`，狀態為 `pending`。
-2. **查詢待接受清單**：
+4. **查詢待接受清單**：
    - 使用者切換／登入至該 Email 時，系統透過 `GET /api/invitations` 查詢所有 `invited_email == currentUser.emailNormalized AND status == 'pending'`。
    - UI 呈現醒目的「您有待處理的家庭邀請」提示卡片。
-3. **接受邀請**：
+5. **接受邀請之原子性與真實冪等語意 (Atomic & True Idempotent Accept)**：
    - 使用者點擊「接受」(`POST /api/invitations/:id/accept`)。
-   - 伺服端以交易或原子操作寫入 `family_members`（角色為邀請指定角色，預設 `member`），並將邀請狀態更新為 `accepted`。
-   - 若受邀者因重複請求已在家庭中，安全幂等處理，更新邀請為 `accepted`，不重複建立成員。
-4. **拒絕邀請**：
-   - 使用者點擊「拒絕」(`POST /api/invitations/:id/reject`)。
-   - 伺服端將邀請狀態更新為 `rejected`，不建立成員紀錄。
-5. **撤銷邀請**：
-   - 管理員可於家庭管理介面檢視已送出且狀態為 `pending` 的邀請，並點擊「撤銷」(`POST /api/families/:id/invitations/:invId/revoke`)。
-   - 伺服端將狀態更新為 `revoked`。
-6. **最後一位管理員保護規則 (Last Admin Protection)**：
-   - 成員主動退出 (`POST /api/families/:id/leave`) 或管理員移除他人 (`DELETE /api/families/:id/members/:userId`) 時，伺服端先計算該家庭現存 `role == 'admin'` 的總數。
-   - 若受影響目標為 `admin` 且剩餘管理員數量為 1（即僅剩該管理員一人），拒絕執行並回傳 `400 LAST_ADMIN_CANNOT_LEAVE`，提示必須先將其他成員指派為管理員或交接，避免家庭無人可管理。
+   - 若邀請狀態已為 `accepted`：
+     - **檢查當前成員資格**：若使用者目前仍是該家庭成員，回應 200「您已經是該家庭的成員」（冪等成功）；若使用者已退出或曾被移除，則回應 400 `INVITATION_ALREADY_USED`，嚴格禁止藉由舊的已接受邀請重新授權加入。
+   - 若邀請狀態為 `pending`：
+     - 以 D1 `db.batch` 執行原子寫入：新增 `family_members` 紀錄，同時執行條件更新 `UPDATE family_invitations SET status = 'accepted' WHERE id = ? AND status = 'pending'`。
+6. **條件化撤銷邀請 (Conditional Revoke)**：
+   - 管理員點擊「撤銷」(`POST /api/families/:id/invitations/:invId/revoke`)。
+   - 執行條件更新 `UPDATE family_invitations SET status = 'revoked' WHERE id = ? AND status = 'pending'`，防止與接受操作產生競爭覆寫。
+7. **管理員角色變更與交接流程 (Admin Handover)**：
+   - 管理員可透過 `PATCH /api/families/:id/members/:userId` 將家庭內的其他成員提升為 `admin`。
+   - 當嘗試將某位管理員降級為 `member` 時，系統先計算該家庭現存 `role == 'admin'` 的總數；若僅剩一位管理員，則拒絕降級並回傳 `400 LAST_ADMIN_CANNOT_LEAVE`。
+   - 透過此機制，唯一管理員可先指派另一名成員為管理員，完成交接後即可自由降級或退出家庭。
+8. **最後一位管理員退出防護 (Last Admin Protection)**：
+   - 成員主動退出 (`POST /api/families/:id/leave`) 或管理員移除他人 (`DELETE /api/families/:id/members/:userId`) 時，檢查目標是否為最後一位 admin，若是則回傳 `400 LAST_ADMIN_CANNOT_LEAVE`。
 
 ---
 
 ## 效益與後續影響 (Consequences)
-1. **完全離線且無第三方 SMTP 依賴**：在開發與示範環境中，任意兩位測試者（如 Alice 與 Bob）可直觀驗證「邀請 ➔ 接受／拒絕 ➔ 成員空間共享 ➔ 權限退出失效」的完整狀態機。
-2. **無縫銜接正式認證**：日後若引進 Google OIDC 或 Magic Link，只需將 Email 查找切換為真實驗證的帳號，整體 `family_members` 與 `family_invitations` 表結構與權限邏輯完全不需修改。
-3. **資料一致性與防禦性**：以 SQLite unique index 及最後一位管理員檢查，徹底杜絕重複寫入與家庭孤兒化風險。
+1. **完全離線且無第三方 SMTP 依賴**：在開發與示範環境中，任意兩位測試者（如 Alice 與 Bob）可直觀驗證「邀請 ➔ 接受／拒絕 ➔ 成員空間共享 ➔ 管理員交接 ➔ 權限退出失效」的完整狀態機。
+2. **嚴密的環境與狀態防護**：Fail-closed 環境閘門防止測試 session 滲漏至 staging/production；D1 batch 與條件更新杜絕競態條件；真正冪等的邀請檢查防止退出成員被重複授權。
+3. **無縫銜接正式認證**：日後引進 Google OIDC 或 Magic Link 時，只需將 Email 查找切換為真實驗證的帳號，整體 `family_members` 與 `family_invitations` 表結構、角色交接與權限邏輯完全不需修改。

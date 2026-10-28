@@ -84,6 +84,7 @@ npm run db:migrate:local
     - `POST /api/families`（建立新家庭，建立者為 admin）
     - `GET /api/families/:id`（取得家庭詳情、成員列表與待處理邀請）
     - `PATCH /api/families/:id`（修改家庭名稱，僅限 admin）
+    - `PATCH /api/families/:id/members/:userId`（變更成員角色／管理員交接，僅限 admin；防護最後一位 admin）
     - `POST /api/families/:id/invitations`（發送家庭成員邀請，僅限 admin）
     - `POST /api/families/:id/invitations/:invId/revoke`（撤銷邀請，僅限 admin）
     - `DELETE /api/families/:id/members/:userId`（移除成員，僅限 admin；防護最後一位 admin）

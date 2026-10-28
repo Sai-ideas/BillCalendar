@@ -1,19 +1,45 @@
-import { Hono } from 'hono';
+import { type Context, Hono } from 'hono';
 import { and, desc, eq, sql } from 'drizzle-orm';
 import {
   CreateFamilyRequestSchema,
   InviteMemberRequestSchema,
   UpdateFamilyRequestSchema,
+  UpdateMemberRoleRequestSchema,
   type FamilyDetail,
   type FamilyInvitationSummary,
   type FamilyMemberSummary,
   type FamilyRole,
   type FamilySummary,
 } from '../../shared';
-import { getAuthenticatedUser } from '../auth';
+import { authenticateTestRequest } from '../auth';
 import { createDb } from '../db/client';
 import { families, familyInvitations, familyMembers, users } from '../db/schema';
 import type { Env } from '../index';
+
+async function requireAuth(c: Context<{ Bindings: Env }>) {
+  const authRes = await authenticateTestRequest(c);
+  if (authRes.status === 'disabled') {
+    return {
+      user: null,
+      errorResponse: c.json(
+        {
+          error: 'TEST_IDENTITY_DISABLED',
+          simulationMode: true,
+          isAuthenticatedSecurity: false,
+          message: '公開／正式部署已禁用測試 Email 身份模擬；此機制非正式安全驗證。',
+        },
+        403,
+      ),
+    };
+  }
+  if (authRes.status === 'unauthorized' || !authRes.user) {
+    return {
+      user: null,
+      errorResponse: c.json({ error: 'UNAUTHORIZED', message: '請先選擇或切換測試身份' }, 401),
+    };
+  }
+  return { user: authRes.user, errorResponse: null };
+}
 
 export function createFamiliesRouter() {
   const router = new Hono<{ Bindings: Env }>();
@@ -26,10 +52,10 @@ export function createFamiliesRouter() {
 
   // GET /api/families - List all families for current user
   router.get('/', async (c) => {
-    const currentUser = await getAuthenticatedUser(c);
-    if (!currentUser) {
-      return c.json({ error: 'UNAUTHORIZED', message: '請先選擇或切換測試身份' }, 401);
-    }
+    const { user: currentUser, errorResponse } = await requireAuth(c);
+    if (errorResponse) return errorResponse;
+    if (!currentUser) return c.json({ error: 'UNAUTHORIZED' }, 401);
+
     if (!c.env?.DB) {
       return c.json({ error: 'DB_NOT_CONFIGURED', message: 'D1 database binding is missing' }, 503);
     }
@@ -68,12 +94,12 @@ export function createFamiliesRouter() {
     return c.json(result, 200);
   });
 
-  // POST /api/families - Create a new family
+  // POST /api/families - Create a new family atomically
   router.post('/', async (c) => {
-    const currentUser = await getAuthenticatedUser(c);
-    if (!currentUser) {
-      return c.json({ error: 'UNAUTHORIZED', message: '請先選擇或切換測試身份' }, 401);
-    }
+    const { user: currentUser, errorResponse } = await requireAuth(c);
+    if (errorResponse) return errorResponse;
+    if (!currentUser) return c.json({ error: 'UNAUTHORIZED' }, 401);
+
     if (!c.env?.DB) {
       return c.json({ error: 'DB_NOT_CONFIGURED', message: 'D1 database binding is missing' }, 503);
     }
@@ -96,22 +122,24 @@ export function createFamiliesRouter() {
     const memberId = crypto.randomUUID();
     const db = createDb(c.env.DB);
 
-    await db.insert(families).values({
-      id: familyId,
-      name: parsed.data.name,
-      createdBy: currentUser.id,
-      createdAt: nowIso,
-      updatedAt: nowIso,
-    });
-
-    await db.insert(familyMembers).values({
-      id: memberId,
-      familyId,
-      userId: currentUser.id,
-      role: 'admin',
-      joinedAt: nowIso,
-      updatedAt: nowIso,
-    });
+    // Atomic creation of family + admin member via db.batch
+    await db.batch([
+      db.insert(families).values({
+        id: familyId,
+        name: parsed.data.name,
+        createdBy: currentUser.id,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      }),
+      db.insert(familyMembers).values({
+        id: memberId,
+        familyId,
+        userId: currentUser.id,
+        role: 'admin',
+        joinedAt: nowIso,
+        updatedAt: nowIso,
+      }),
+    ]);
 
     const responsePayload: FamilyDetail = {
       id: familyId,
@@ -138,10 +166,10 @@ export function createFamiliesRouter() {
 
   // GET /api/families/:id - Get family detail (requires membership)
   router.get('/:id', async (c) => {
-    const currentUser = await getAuthenticatedUser(c);
-    if (!currentUser) {
-      return c.json({ error: 'UNAUTHORIZED', message: '請先選擇或切換測試身份' }, 401);
-    }
+    const { user: currentUser, errorResponse } = await requireAuth(c);
+    if (errorResponse) return errorResponse;
+    if (!currentUser) return c.json({ error: 'UNAUTHORIZED' }, 401);
+
     if (!c.env?.DB) {
       return c.json({ error: 'DB_NOT_CONFIGURED', message: 'D1 database binding is missing' }, 503);
     }
@@ -195,7 +223,12 @@ export function createFamiliesRouter() {
         })
         .from(familyInvitations)
         .innerJoin(users, eq(familyInvitations.invitedBy, users.id))
-        .where(and(eq(familyInvitations.familyId, familyId), eq(familyInvitations.status, 'pending')))
+        .where(
+          and(
+            eq(familyInvitations.familyId, familyId),
+            eq(familyInvitations.status, 'pending'),
+          ),
+        )
         .orderBy(desc(familyInvitations.createdAt));
 
       pendingInvites = inviteRows.map((inv) => ({
@@ -227,10 +260,10 @@ export function createFamiliesRouter() {
 
   // PATCH /api/families/:id - Update family name (admin only)
   router.patch('/:id', async (c) => {
-    const currentUser = await getAuthenticatedUser(c);
-    if (!currentUser) {
-      return c.json({ error: 'UNAUTHORIZED', message: '請先選擇或切換測試身份' }, 401);
-    }
+    const { user: currentUser, errorResponse } = await requireAuth(c);
+    if (errorResponse) return errorResponse;
+    if (!currentUser) return c.json({ error: 'UNAUTHORIZED' }, 401);
+
     if (!c.env?.DB) {
       return c.json({ error: 'DB_NOT_CONFIGURED', message: 'D1 database binding is missing' }, 503);
     }
@@ -276,12 +309,99 @@ export function createFamiliesRouter() {
     return c.json({ success: true, name: parsed.data.name }, 200);
   });
 
+  // PATCH /api/families/:id/members/:userId - Update member role (admin handover, admin only)
+  router.patch('/:id/members/:userId', async (c) => {
+    const { user: currentUser, errorResponse } = await requireAuth(c);
+    if (errorResponse) return errorResponse;
+    if (!currentUser) return c.json({ error: 'UNAUTHORIZED' }, 401);
+
+    if (!c.env?.DB) {
+      return c.json({ error: 'DB_NOT_CONFIGURED', message: 'D1 database binding is missing' }, 503);
+    }
+
+    const familyId = c.req.param('id');
+    const targetUserId = c.req.param('userId');
+    const db = createDb(c.env.DB);
+
+    const membership = await db
+      .select()
+      .from(familyMembers)
+      .where(and(eq(familyMembers.familyId, familyId), eq(familyMembers.userId, currentUser.id)))
+      .limit(1);
+
+    if (membership.length === 0) {
+      return c.json({ error: 'FORBIDDEN', message: '您不是該家庭空間的成員或已退出' }, 403);
+    }
+    if (membership[0].role !== 'admin') {
+      return c.json({ error: 'FORBIDDEN', message: '僅管理員有權變更成員角色' }, 403);
+    }
+
+    let rawBody: unknown;
+    try {
+      rawBody = await c.req.json();
+    } catch {
+      return c.json({ error: 'INVALID_JSON', message: '請提供有效的 JSON 請求內容' }, 400);
+    }
+
+    const parsed = UpdateMemberRoleRequestSchema.safeParse(rawBody);
+    if (!parsed.success) {
+      const msg = parsed.error.issues[0]?.message ?? '無效的角色';
+      return c.json({ error: 'VALIDATION_ERROR', message: msg }, 400);
+    }
+
+    const targetMembers = await db
+      .select()
+      .from(familyMembers)
+      .where(and(eq(familyMembers.familyId, familyId), eq(familyMembers.userId, targetUserId)))
+      .limit(1);
+
+    if (targetMembers.length === 0) {
+      return c.json({ error: 'NOT_FOUND', message: '找不到該成員' }, 404);
+    }
+
+    const currentRole = targetMembers[0].role;
+    const newRole = parsed.data.role;
+
+    if (currentRole === newRole) {
+      return c.json({ success: true, role: newRole }, 200);
+    }
+
+    // If demoting an admin to member, ensure there is at least one OTHER admin remaining
+    if (currentRole === 'admin' && newRole === 'member') {
+      const adminCountRes = await db
+        .select({ count: sql<number>`count(*)` })
+        .from(familyMembers)
+        .where(and(eq(familyMembers.familyId, familyId), eq(familyMembers.role, 'admin')));
+      const adminCount = Number(adminCountRes[0]?.count ?? 1);
+      if (adminCount <= 1) {
+        return c.json(
+          {
+            error: 'LAST_ADMIN_CANNOT_LEAVE',
+            message: '家庭必須至少保留一位管理員，不可降級最後一位管理員',
+          },
+          400,
+        );
+      }
+    }
+
+    const nowIso = new Date().toISOString();
+    await db
+      .update(familyMembers)
+      .set({
+        role: newRole,
+        updatedAt: nowIso,
+      })
+      .where(and(eq(familyMembers.familyId, familyId), eq(familyMembers.userId, targetUserId)));
+
+    return c.json({ success: true, role: newRole }, 200);
+  });
+
   // POST /api/families/:id/invitations - Send invitation (admin only)
   router.post('/:id/invitations', async (c) => {
-    const currentUser = await getAuthenticatedUser(c);
-    if (!currentUser) {
-      return c.json({ error: 'UNAUTHORIZED', message: '請先選擇或切換測試身份' }, 401);
-    }
+    const { user: currentUser, errorResponse } = await requireAuth(c);
+    if (errorResponse) return errorResponse;
+    if (!currentUser) return c.json({ error: 'UNAUTHORIZED' }, 401);
+
     if (!c.env?.DB) {
       return c.json({ error: 'DB_NOT_CONFIGURED', message: 'D1 database binding is missing' }, 503);
     }
@@ -317,7 +437,7 @@ export function createFamiliesRouter() {
 
     const { email: invitedEmail, role: invitedRole } = parsed.data;
 
-    // Check if target user already exists and is a member of this family
+    // Check if target user already exists and is an active member of this family
     const existingUser = await db
       .select()
       .from(users)
@@ -392,12 +512,12 @@ export function createFamiliesRouter() {
     return c.json(payload, 201);
   });
 
-  // POST /api/families/:id/invitations/:invId/revoke - Revoke invitation (admin only)
+  // POST /api/families/:id/invitations/:invId/revoke - Revoke invitation (admin only, conditional update)
   router.post('/:id/invitations/:invId/revoke', async (c) => {
-    const currentUser = await getAuthenticatedUser(c);
-    if (!currentUser) {
-      return c.json({ error: 'UNAUTHORIZED', message: '請先選擇或切換測試身份' }, 401);
-    }
+    const { user: currentUser, errorResponse } = await requireAuth(c);
+    if (errorResponse) return errorResponse;
+    if (!currentUser) return c.json({ error: 'UNAUTHORIZED' }, 401);
+
     if (!c.env?.DB) {
       return c.json({ error: 'DB_NOT_CONFIGURED', message: 'D1 database binding is missing' }, 503);
     }
@@ -433,23 +553,30 @@ export function createFamiliesRouter() {
     }
 
     const nowIso = new Date().toISOString();
+    // Conditional update ensuring status is strictly 'pending' at update time
     await db
       .update(familyInvitations)
       .set({
         status: 'revoked',
         updatedAt: nowIso,
       })
-      .where(eq(familyInvitations.id, invId));
+      .where(
+        and(
+          eq(familyInvitations.id, invId),
+          eq(familyInvitations.familyId, familyId),
+          eq(familyInvitations.status, 'pending'),
+        ),
+      );
 
     return c.json({ success: true, message: '邀請已撤銷' }, 200);
   });
 
   // DELETE /api/families/:id/members/:userId - Remove a member (admin only)
   router.delete('/:id/members/:userId', async (c) => {
-    const currentUser = await getAuthenticatedUser(c);
-    if (!currentUser) {
-      return c.json({ error: 'UNAUTHORIZED', message: '請先選擇或切換測試身份' }, 401);
-    }
+    const { user: currentUser, errorResponse } = await requireAuth(c);
+    if (errorResponse) return errorResponse;
+    if (!currentUser) return c.json({ error: 'UNAUTHORIZED' }, 401);
+
     if (!c.env?.DB) {
       return c.json({ error: 'DB_NOT_CONFIGURED', message: 'D1 database binding is missing' }, 503);
     }
@@ -508,10 +635,10 @@ export function createFamiliesRouter() {
 
   // POST /api/families/:id/leave - Leave family
   router.post('/:id/leave', async (c) => {
-    const currentUser = await getAuthenticatedUser(c);
-    if (!currentUser) {
-      return c.json({ error: 'UNAUTHORIZED', message: '請先選擇或切換測試身份' }, 401);
-    }
+    const { user: currentUser, errorResponse } = await requireAuth(c);
+    if (errorResponse) return errorResponse;
+    if (!currentUser) return c.json({ error: 'UNAUTHORIZED' }, 401);
+
     if (!c.env?.DB) {
       return c.json({ error: 'DB_NOT_CONFIGURED', message: 'D1 database binding is missing' }, 503);
     }
@@ -567,10 +694,10 @@ export function createInvitationsRouter() {
 
   // GET /api/invitations - List pending invitations for current user
   router.get('/', async (c) => {
-    const currentUser = await getAuthenticatedUser(c);
-    if (!currentUser) {
-      return c.json({ error: 'UNAUTHORIZED', message: '請先選擇或切換測試身份' }, 401);
-    }
+    const { user: currentUser, errorResponse } = await requireAuth(c);
+    if (errorResponse) return errorResponse;
+    if (!currentUser) return c.json({ error: 'UNAUTHORIZED' }, 401);
+
     if (!c.env?.DB) {
       return c.json({ error: 'DB_NOT_CONFIGURED', message: 'D1 database binding is missing' }, 503);
     }
@@ -608,12 +735,12 @@ export function createInvitationsRouter() {
     return c.json(result, 200);
   });
 
-  // POST /api/invitations/:id/accept - Accept invitation
+  // POST /api/invitations/:id/accept - Accept invitation (Atomic & True Idempotent)
   router.post('/:id/accept', async (c) => {
-    const currentUser = await getAuthenticatedUser(c);
-    if (!currentUser) {
-      return c.json({ error: 'UNAUTHORIZED', message: '請先選擇或切換測試身份' }, 401);
-    }
+    const { user: currentUser, errorResponse } = await requireAuth(c);
+    if (errorResponse) return errorResponse;
+    if (!currentUser) return c.json({ error: 'UNAUTHORIZED' }, 401);
+
     if (!c.env?.DB) {
       return c.json({ error: 'DB_NOT_CONFIGURED', message: 'D1 database binding is missing' }, 503);
     }
@@ -638,17 +765,48 @@ export function createInvitationsRouter() {
 
     const nowIso = new Date().toISOString();
 
+    // Check if invitation is not in pending status
     if (invite.status !== 'pending') {
       if (invite.status === 'accepted') {
-        return c.json({ success: true, message: '已加入該家庭', familyId: invite.familyId }, 200);
+        // True idempotency verification (Blocking 2):
+        // Only return success if the user is STILL currently an active member of this family
+        const activeMembership = await db
+          .select()
+          .from(familyMembers)
+          .where(
+            and(
+              eq(familyMembers.familyId, invite.familyId),
+              eq(familyMembers.userId, currentUser.id),
+            ),
+          )
+          .limit(1);
+
+        if (activeMembership.length > 0) {
+          return c.json(
+            { success: true, message: '您已經是該家庭的成員', familyId: invite.familyId },
+            200,
+          );
+        }
+
+        // User previously accepted but has since left or was removed; cannot reuse old accepted invitation
+        return c.json(
+          {
+            error: 'INVITATION_ALREADY_USED',
+            message:
+              '此邀請已被使用且您目前非家庭成員；不可透過已使用之舊邀請重新加入，請聯繫管理員重新發送邀請',
+          },
+          400,
+        );
       }
+
       return c.json(
         { error: 'INVITATION_INVALID', message: `該邀請目前狀態為 ${invite.status}，無法接受` },
         400,
       );
     }
 
-    // Check if already a member (idempotency & unique constraint safeguard)
+    // Atomic join (Blocking 3):
+    // Check if user is somehow already in family_members (e.g. added through another invitation or race)
     const existingMember = await db
       .select()
       .from(familyMembers)
@@ -661,33 +819,52 @@ export function createInvitationsRouter() {
       .limit(1);
 
     if (existingMember.length === 0) {
-      await db.insert(familyMembers).values({
-        id: crypto.randomUUID(),
-        familyId: invite.familyId,
-        userId: currentUser.id,
-        role: invite.role,
-        joinedAt: nowIso,
-        updatedAt: nowIso,
-      });
+      await db.batch([
+        db.insert(familyMembers).values({
+          id: crypto.randomUUID(),
+          familyId: invite.familyId,
+          userId: currentUser.id,
+          role: invite.role,
+          joinedAt: nowIso,
+          updatedAt: nowIso,
+        }),
+        db
+          .update(familyInvitations)
+          .set({
+            status: 'accepted',
+            updatedAt: nowIso,
+          })
+          .where(
+            and(
+              eq(familyInvitations.id, inviteId),
+              eq(familyInvitations.status, 'pending'),
+            ),
+          ),
+      ]);
+    } else {
+      await db
+        .update(familyInvitations)
+        .set({
+          status: 'accepted',
+          updatedAt: nowIso,
+        })
+        .where(
+          and(
+            eq(familyInvitations.id, inviteId),
+            eq(familyInvitations.status, 'pending'),
+          ),
+        );
     }
-
-    await db
-      .update(familyInvitations)
-      .set({
-        status: 'accepted',
-        updatedAt: nowIso,
-      })
-      .where(eq(familyInvitations.id, inviteId));
 
     return c.json({ success: true, message: '成功加入家庭', familyId: invite.familyId }, 200);
   });
 
-  // POST /api/invitations/:id/reject - Reject invitation
+  // POST /api/invitations/:id/reject - Reject invitation (conditional update)
   router.post('/:id/reject', async (c) => {
-    const currentUser = await getAuthenticatedUser(c);
-    if (!currentUser) {
-      return c.json({ error: 'UNAUTHORIZED', message: '請先選擇或切換測試身份' }, 401);
-    }
+    const { user: currentUser, errorResponse } = await requireAuth(c);
+    if (errorResponse) return errorResponse;
+    if (!currentUser) return c.json({ error: 'UNAUTHORIZED' }, 401);
+
     if (!c.env?.DB) {
       return c.json({ error: 'DB_NOT_CONFIGURED', message: 'D1 database binding is missing' }, 503);
     }
@@ -724,7 +901,12 @@ export function createInvitationsRouter() {
         status: 'rejected',
         updatedAt: nowIso,
       })
-      .where(eq(familyInvitations.id, inviteId));
+      .where(
+        and(
+          eq(familyInvitations.id, inviteId),
+          eq(familyInvitations.status, 'pending'),
+        ),
+      );
 
     return c.json({ success: true, message: '已拒絕該家庭邀請' }, 200);
   });

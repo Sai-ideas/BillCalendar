@@ -423,6 +423,40 @@ export function App() {
     }
   };
 
+  const handleUpdateMemberRole = async (
+    userId: string,
+    newRole: 'admin' | 'member',
+    displayName: string,
+  ) => {
+    if (!selectedFamilyId) return;
+    setFamilyMessage(null);
+    try {
+      const res = await fetch(`${baseUrl}/api/families/${selectedFamilyId}/members/${userId}`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(),
+        },
+        body: JSON.stringify({ role: newRole }),
+      });
+      const data = (await res.json()) as { message?: string };
+      if (!res.ok) {
+        throw new Error(data.message ?? '變更成員角色失敗');
+      }
+      setFamilyMessage({
+        type: 'success',
+        text: `已成功將 ${displayName} 的角色變更為 ${newRole === 'admin' ? '管理員' : '一般成員'}`,
+      });
+      await fetchFamilyDetail(selectedFamilyId);
+      await fetchFamilies(selectedFamilyId);
+    } catch (err: unknown) {
+      setFamilyMessage({
+        type: 'error',
+        text: err instanceof Error ? err.message : '變更成員角色失敗',
+      });
+    }
+  };
+
   const handleLeaveFamily = async () => {
     if (!selectedFamilyId || !familyDetail) return;
     if (!confirm(`確定要退出「${familyDetail.name}」嗎？退出後您將無法再存取該家庭空間。`)) return;
@@ -787,13 +821,28 @@ export function App() {
                           </div>
 
                           {isAdmin && !isMe && (
-                            <button
-                              type="button"
-                              onClick={() => void handleRemoveMember(m.userId, m.displayName)}
-                              className="rounded-md border border-slate-200 px-2 py-1 text-[11px] font-medium text-red-600 hover:border-red-300 hover:bg-red-50"
-                            >
-                              移除
-                            </button>
+                            <div className="flex items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  void handleUpdateMemberRole(
+                                    m.userId,
+                                    m.role === 'admin' ? 'member' : 'admin',
+                                    m.displayName,
+                                  )
+                                }
+                                className="rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-50"
+                              >
+                                {m.role === 'admin' ? '降為成員' : '升為管理員'}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => void handleRemoveMember(m.userId, m.displayName)}
+                                className="rounded-md border border-slate-200 px-2 py-1 text-[11px] font-medium text-red-600 hover:border-red-300 hover:bg-red-50"
+                              >
+                                移除
+                              </button>
+                            </div>
                           )}
                         </div>
                       );
