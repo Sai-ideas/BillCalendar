@@ -25,11 +25,27 @@ export function createSqliteD1Adapter(sqlite: DatabaseSync): D1Database {
       },
       async run<T = Record<string, unknown>>(): Promise<D1Result<T>> {
         const stmt = sqlite.prepare(query);
-        stmt.run(...(boundValues as never[]));
+        let rows: T[] = [];
+        let changes = 0;
+        let lastInsertRowid = 0;
+        if (/returning/i.test(query)) {
+          rows = stmt.all(...(boundValues as never[])) as T[];
+          changes = rows.length;
+        } else {
+          const info = stmt.run(...(boundValues as never[]));
+          changes = Number(info.changes);
+          lastInsertRowid = Number(info.lastInsertRowid);
+        }
         return {
-          results: [],
+          results: rows,
           success: true,
-          meta: {} as D1Meta & Record<string, unknown>,
+          meta: {
+            changes,
+            last_row_id: lastInsertRowid,
+            duration: 0,
+            rows_read: 0,
+            rows_written: changes,
+          } as D1Meta & Record<string, unknown>,
         };
       },
       async all<T = Record<string, unknown>>(): Promise<D1Result<T>> {
@@ -38,7 +54,13 @@ export function createSqliteD1Adapter(sqlite: DatabaseSync): D1Database {
         return {
           results: rows,
           success: true,
-          meta: {} as D1Meta & Record<string, unknown>,
+          meta: {
+            changes: rows.length,
+            last_row_id: 0,
+            duration: 0,
+            rows_read: rows.length,
+            rows_written: rows.length,
+          } as D1Meta & Record<string, unknown>,
         };
       },
       raw: (async <T = unknown[]>(options?: { columnNames?: boolean }) => {
@@ -65,8 +87,15 @@ export function createSqliteD1Adapter(sqlite: DatabaseSync): D1Database {
     },
     async batch<T = unknown>(statements: D1PreparedStatement[]): Promise<D1Result<T>[]> {
       const results: D1Result<T>[] = [];
-      for (const s of statements) {
-        results.push(await s.all<T>());
+      sqlite.exec('BEGIN TRANSACTION;');
+      try {
+        for (const s of statements) {
+          results.push(await s.all<T>());
+        }
+        sqlite.exec('COMMIT;');
+      } catch (err) {
+        sqlite.exec('ROLLBACK;');
+        throw err;
       }
       return results;
     },
@@ -98,8 +127,5 @@ export function createMigratedSqliteD1(): { sqlite: DatabaseSync; db: D1Database
     sqlite.exec(sqlContent);
   }
 
-  return {
-    sqlite,
-    db: createSqliteD1Adapter(sqlite),
-  };
+  return { sqlite, db: createSqliteD1Adapter(sqlite) };
 }

@@ -309,7 +309,7 @@ export function createFamiliesRouter() {
     return c.json({ success: true, name: parsed.data.name }, 200);
   });
 
-  // PATCH /api/families/:id/members/:userId - Update member role (admin handover, admin only)
+  // PATCH /api/families/:id/members/:userId - Update member role with atomic last-admin enforcement
   router.patch('/:id/members/:userId', async (c) => {
     const { user: currentUser, errorResponse } = await requireAuth(c);
     if (errorResponse) return errorResponse;
@@ -366,14 +366,29 @@ export function createFamiliesRouter() {
       return c.json({ success: true, role: newRole }, 200);
     }
 
-    // If demoting an admin to member, ensure there is at least one OTHER admin remaining
+    const nowIso = new Date().toISOString();
+
+    // Atomic demotion protection: SQL subquery ensures remaining admin count > 1
     if (currentRole === 'admin' && newRole === 'member') {
-      const adminCountRes = await db
-        .select({ count: sql<number>`count(*)` })
-        .from(familyMembers)
-        .where(and(eq(familyMembers.familyId, familyId), eq(familyMembers.role, 'admin')));
-      const adminCount = Number(adminCountRes[0]?.count ?? 1);
-      if (adminCount <= 1) {
+      const updateResult = await db
+        .update(familyMembers)
+        .set({
+          role: 'member',
+          updatedAt: nowIso,
+        })
+        .where(
+          and(
+            eq(familyMembers.familyId, familyId),
+            eq(familyMembers.userId, targetUserId),
+            sql`(
+              SELECT COUNT(*) FROM family_members
+              WHERE family_id = ${familyId} AND role = 'admin'
+            ) > 1`,
+          ),
+        )
+        .returning({ id: familyMembers.id });
+
+      if (updateResult.length === 0) {
         return c.json(
           {
             error: 'LAST_ADMIN_CANNOT_LEAVE',
@@ -382,18 +397,20 @@ export function createFamiliesRouter() {
           400,
         );
       }
+
+      return c.json({ success: true, role: 'member' }, 200);
     }
 
-    const nowIso = new Date().toISOString();
+    // Promotion to admin
     await db
       .update(familyMembers)
       .set({
-        role: newRole,
+        role: 'admin',
         updatedAt: nowIso,
       })
       .where(and(eq(familyMembers.familyId, familyId), eq(familyMembers.userId, targetUserId)));
 
-    return c.json({ success: true, role: newRole }, 200);
+    return c.json({ success: true, role: 'admin' }, 200);
   });
 
   // POST /api/families/:id/invitations - Send invitation (admin only)
@@ -512,7 +529,7 @@ export function createFamiliesRouter() {
     return c.json(payload, 201);
   });
 
-  // POST /api/families/:id/invitations/:invId/revoke - Revoke invitation (admin only, conditional update)
+  // POST /api/families/:id/invitations/:invId/revoke - Revoke invitation (admin only, verified conditional update)
   router.post('/:id/invitations/:invId/revoke', async (c) => {
     const { user: currentUser, errorResponse } = await requireAuth(c);
     if (errorResponse) return errorResponse;
@@ -553,8 +570,8 @@ export function createFamiliesRouter() {
     }
 
     const nowIso = new Date().toISOString();
-    // Conditional update ensuring status is strictly 'pending' at update time
-    await db
+    // Conditional update ensuring status is strictly 'pending' at update time, with explicit affected row checking
+    const updateResult = await db
       .update(familyInvitations)
       .set({
         status: 'revoked',
@@ -566,12 +583,20 @@ export function createFamiliesRouter() {
           eq(familyInvitations.familyId, familyId),
           eq(familyInvitations.status, 'pending'),
         ),
+      )
+      .returning({ id: familyInvitations.id });
+
+    if (updateResult.length === 0) {
+      return c.json(
+        { error: 'CANNOT_REVOKE', message: '邀請已被接受、撤銷或狀態已改變，無法撤銷' },
+        400,
       );
+    }
 
     return c.json({ success: true, message: '邀請已撤銷' }, 200);
   });
 
-  // DELETE /api/families/:id/members/:userId - Remove a member (admin only)
+  // DELETE /api/families/:id/members/:userId - Remove a member (admin only, atomic last-admin guard)
   router.delete('/:id/members/:userId', async (c) => {
     const { user: currentUser, errorResponse } = await requireAuth(c);
     if (errorResponse) return errorResponse;
@@ -612,28 +637,38 @@ export function createFamiliesRouter() {
       return c.json({ error: 'NOT_FOUND', message: '目標使用者不是此家庭的成員' }, 404);
     }
 
-    if (targetMember[0].role === 'admin') {
-      const adminCountRes = await db
-        .select({ count: sql<number>`count(*)` })
-        .from(familyMembers)
-        .where(and(eq(familyMembers.familyId, familyId), eq(familyMembers.role, 'admin')));
-      const adminCount = Number(adminCountRes[0]?.count ?? 1);
-      if (adminCount <= 1) {
+    // Atomic SQL removal ensuring last admin is never removed even under concurrent deletes
+    const deletedRows = await db
+      .delete(familyMembers)
+      .where(
+        and(
+          eq(familyMembers.familyId, familyId),
+          eq(familyMembers.userId, targetUserId),
+          sql`(
+            ${familyMembers.role} != 'admin'
+            OR (
+              SELECT COUNT(*) FROM family_members
+              WHERE family_id = ${familyId} AND role = 'admin'
+            ) > 1
+          )`,
+        ),
+      )
+      .returning({ id: familyMembers.id });
+
+    if (deletedRows.length === 0) {
+      if (targetMember[0].role === 'admin') {
         return c.json(
           { error: 'LAST_ADMIN_CANNOT_LEAVE', message: '最後一位管理員不可被移除' },
           400,
         );
       }
+      return c.json({ error: 'NOT_FOUND', message: '目標成員不存在或已被移除' }, 404);
     }
-
-    await db
-      .delete(familyMembers)
-      .where(and(eq(familyMembers.familyId, familyId), eq(familyMembers.userId, targetUserId)));
 
     return c.json({ success: true, message: '成員已移除' }, 200);
   });
 
-  // POST /api/families/:id/leave - Leave family
+  // POST /api/families/:id/leave - Leave family with atomic last-admin guard
   router.post('/:id/leave', async (c) => {
     const { user: currentUser, errorResponse } = await requireAuth(c);
     if (errorResponse) return errorResponse;
@@ -656,13 +691,26 @@ export function createFamiliesRouter() {
       return c.json({ error: 'FORBIDDEN', message: '您不是該家庭空間的成員或已退出' }, 403);
     }
 
-    if (membership[0].role === 'admin') {
-      const adminCountRes = await db
-        .select({ count: sql<number>`count(*)` })
-        .from(familyMembers)
-        .where(and(eq(familyMembers.familyId, familyId), eq(familyMembers.role, 'admin')));
-      const adminCount = Number(adminCountRes[0]?.count ?? 1);
-      if (adminCount <= 1) {
+    // Atomic SQL removal ensuring last admin cannot leave without handover even under concurrency
+    const leftRows = await db
+      .delete(familyMembers)
+      .where(
+        and(
+          eq(familyMembers.familyId, familyId),
+          eq(familyMembers.userId, currentUser.id),
+          sql`(
+            ${familyMembers.role} != 'admin'
+            OR (
+              SELECT COUNT(*) FROM family_members
+              WHERE family_id = ${familyId} AND role = 'admin'
+            ) > 1
+          )`,
+        ),
+      )
+      .returning({ id: familyMembers.id });
+
+    if (leftRows.length === 0) {
+      if (membership[0].role === 'admin') {
         return c.json(
           {
             error: 'LAST_ADMIN_CANNOT_LEAVE',
@@ -671,11 +719,8 @@ export function createFamiliesRouter() {
           400,
         );
       }
+      return c.json({ error: 'FORBIDDEN', message: '退出家庭失敗' }, 403);
     }
-
-    await db
-      .delete(familyMembers)
-      .where(and(eq(familyMembers.familyId, familyId), eq(familyMembers.userId, currentUser.id)));
 
     return c.json({ success: true, message: '已成功退出家庭' }, 200);
   });
@@ -735,7 +780,7 @@ export function createInvitationsRouter() {
     return c.json(result, 200);
   });
 
-  // POST /api/invitations/:id/accept - Accept invitation (Atomic & True Idempotent)
+  // POST /api/invitations/:id/accept - Accept invitation (Atomic, Contingent & True Idempotent)
   router.post('/:id/accept', async (c) => {
     const { user: currentUser, errorResponse } = await requireAuth(c);
     if (errorResponse) return errorResponse;
@@ -763,13 +808,10 @@ export function createInvitationsRouter() {
       return c.json({ error: 'FORBIDDEN', message: '您不是此邀請的收件人' }, 403);
     }
 
-    const nowIso = new Date().toISOString();
-
-    // Check if invitation is not in pending status
+    // If invitation is already in a non-pending state:
     if (invite.status !== 'pending') {
       if (invite.status === 'accepted') {
-        // True idempotency verification (Blocking 2):
-        // Only return success if the user is STILL currently an active member of this family
+        // True idempotency verification: only return success if still actively in family
         const activeMembership = await db
           .select()
           .from(familyMembers)
@@ -788,7 +830,7 @@ export function createInvitationsRouter() {
           );
         }
 
-        // User previously accepted but has since left or was removed; cannot reuse old accepted invitation
+        // Left or removed: cannot reuse already accepted invitation
         return c.json(
           {
             error: 'INVITATION_ALREADY_USED',
@@ -805,61 +847,85 @@ export function createInvitationsRouter() {
       );
     }
 
-    // Atomic join (Blocking 3):
-    // Check if user is somehow already in family_members (e.g. added through another invitation or race)
-    const existingMember = await db
-      .select()
-      .from(familyMembers)
+    // Atomic conditional status transition: only succeeds if invitation status is STILL 'pending'
+    const nowIso = new Date().toISOString();
+    const updatedInvites = await db
+      .update(familyInvitations)
+      .set({
+        status: 'accepted',
+        updatedAt: nowIso,
+      })
       .where(
         and(
-          eq(familyMembers.familyId, invite.familyId),
-          eq(familyMembers.userId, currentUser.id),
+          eq(familyInvitations.id, inviteId),
+          eq(familyInvitations.invitedEmail, currentUser.emailNormalized),
+          eq(familyInvitations.status, 'pending'),
         ),
       )
-      .limit(1);
+      .returning({ id: familyInvitations.id });
 
-    if (existingMember.length === 0) {
-      await db.batch([
-        db.insert(familyMembers).values({
-          id: crypto.randomUUID(),
-          familyId: invite.familyId,
-          userId: currentUser.id,
-          role: invite.role,
-          joinedAt: nowIso,
-          updatedAt: nowIso,
-        }),
-        db
-          .update(familyInvitations)
-          .set({
-            status: 'accepted',
-            updatedAt: nowIso,
-          })
+    // Explicit affected-row handling:
+    if (updatedInvites.length === 0) {
+      // Concurrently revoked, accepted, or rejected
+      const latestInvite = await db
+        .select()
+        .from(familyInvitations)
+        .where(eq(familyInvitations.id, inviteId))
+        .limit(1);
+
+      const latestStatus = latestInvite[0]?.status ?? 'invalid';
+      if (latestStatus === 'accepted') {
+        const activeMembership = await db
+          .select()
+          .from(familyMembers)
           .where(
             and(
-              eq(familyInvitations.id, inviteId),
-              eq(familyInvitations.status, 'pending'),
+              eq(familyMembers.familyId, invite.familyId),
+              eq(familyMembers.userId, currentUser.id),
             ),
-          ),
-      ]);
-    } else {
-      await db
-        .update(familyInvitations)
-        .set({
-          status: 'accepted',
-          updatedAt: nowIso,
-        })
-        .where(
-          and(
-            eq(familyInvitations.id, inviteId),
-            eq(familyInvitations.status, 'pending'),
-          ),
+          )
+          .limit(1);
+
+        if (activeMembership.length > 0) {
+          return c.json(
+            { success: true, message: '您已經是該家庭的成員', familyId: invite.familyId },
+            200,
+          );
+        }
+        return c.json(
+          {
+            error: 'INVITATION_ALREADY_USED',
+            message:
+              '此邀請已被使用且您目前非家庭成員；不可透過已使用之舊邀請重新加入，請聯繫管理員重新發送邀請',
+          },
+          400,
         );
+      }
+
+      return c.json(
+        {
+          error: 'INVITATION_INVALID',
+          message: `該邀請狀態已非待處理 (目前為 ${latestStatus})，無法接受`,
+        },
+        400,
+      );
     }
+
+    // Membership write itself is contingent on winning the pending status transition
+    const newMemberId = crypto.randomUUID();
+    await db.run(sql`
+      INSERT INTO family_members (id, family_id, user_id, role, joined_at, updated_at)
+      SELECT ${newMemberId}, ${invite.familyId}, ${currentUser.id}, ${invite.role}, ${nowIso}, ${nowIso}
+      WHERE NOT EXISTS (
+        SELECT 1 FROM family_members
+        WHERE family_id = ${invite.familyId} AND user_id = ${currentUser.id}
+      );
+    `);
 
     return c.json({ success: true, message: '成功加入家庭', familyId: invite.familyId }, 200);
   });
 
-  // POST /api/invitations/:id/reject - Reject invitation (conditional update)
+  // POST /api/invitations/:id/reject - Reject invitation (verified conditional update)
   router.post('/:id/reject', async (c) => {
     const { user: currentUser, errorResponse } = await requireAuth(c);
     if (errorResponse) return errorResponse;
@@ -895,7 +961,8 @@ export function createInvitationsRouter() {
     }
 
     const nowIso = new Date().toISOString();
-    await db
+    // Conditional update with explicit affected row checking
+    const updateResult = await db
       .update(familyInvitations)
       .set({
         status: 'rejected',
@@ -904,9 +971,18 @@ export function createInvitationsRouter() {
       .where(
         and(
           eq(familyInvitations.id, inviteId),
+          eq(familyInvitations.invitedEmail, currentUser.emailNormalized),
           eq(familyInvitations.status, 'pending'),
         ),
+      )
+      .returning({ id: familyInvitations.id });
+
+    if (updateResult.length === 0) {
+      return c.json(
+        { error: 'INVITATION_INVALID', message: '該邀請狀態已改變或已被處理，無法拒絕' },
+        400,
       );
+    }
 
     return c.json({ success: true, message: '已拒絕該家庭邀請' }, 200);
   });
