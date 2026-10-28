@@ -2,20 +2,22 @@ import { Hono } from 'hono';
 import { sql } from 'drizzle-orm';
 import { DEFAULT_TIMEZONE, type HealthResponse } from '../shared';
 import { createDb } from './db/client';
-import { appMeta } from './db/schema';
+import { appMeta, testSessions, users } from './db/schema';
+import { createTestIdentityRouter } from './routes/test-identity';
 
 export interface Env {
   DB?: D1Database;
   ASSETS?: Fetcher;
   APP_ENV?: string;
   DEFAULT_TIMEZONE?: string;
+  ALLOW_TEST_IDENTITY?: string;
 }
 
 function isMissingTableError(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err);
   const causeMessage =
     err instanceof Error && err.cause instanceof Error ? err.cause.message : '';
-  return /no such table:\s*app_meta/i.test(`${message} ${causeMessage}`);
+  return /no such table:\s*(app_meta|users|test_sessions)/i.test(`${message} ${causeMessage}`);
 }
 
 export function createApp() {
@@ -43,11 +45,13 @@ export function createApp() {
       if (connected) {
         try {
           await db.select().from(appMeta).limit(1);
+          await db.select().from(users).limit(1);
+          await db.select().from(testSessions).limit(1);
           migrated = true;
         } catch (err: unknown) {
           if (isMissingTableError(err)) {
             migrated = false;
-            dbError = 'Database migrations have not been applied (missing app_meta table)';
+            dbError = 'Database migrations have not been applied (missing required schema tables)';
           } else {
             connected = false;
             migrated = false;
@@ -73,6 +77,8 @@ export function createApp() {
 
     return c.json(payload, status === 'ok' ? 200 : 503);
   });
+
+  app.route('/api/test-identity', createTestIdentityRouter());
 
   return app;
 }

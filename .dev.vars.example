@@ -1,4 +1,6 @@
 # Cloudflare Workers Local Development Variables (.dev.vars)
 # Copy this file to .dev.vars for local overrides. Do NOT commit secrets.
+# Warning: ALLOW_TEST_IDENTITY=true is strictly for local/controlled synthetic demo environments.
 APP_ENV=development
+ALLOW_TEST_IDENTITY=true
 DEFAULT_TIMEZONE=Asia/Taipei
