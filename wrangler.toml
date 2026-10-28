@@ -1,0 +1,20 @@
+name = "billcalendar"
+main = "src/server/index.ts"
+compatibility_date = "2025-02-04"
+
+[assets]
+directory = "./dist/client"
+not_found_handling = "single-page-application"
+binding = "ASSETS"
+run_worker_first = ["/api/*"]
+
+[vars]
+APP_ENV = "development"
+DEFAULT_TIMEZONE = "Asia/Taipei"
+
+# Cloudflare D1 Database Binding (No R2 bucket is used per PRD/Architecture)
+[[d1_databases]]
+binding = "DB"
+database_name = "billcalendar-db"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "drizzle"
