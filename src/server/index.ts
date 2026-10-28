@@ -11,6 +11,13 @@ export interface Env {
   DEFAULT_TIMEZONE?: string;
 }
 
+function isMissingTableError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  const causeMessage =
+    err instanceof Error && err.cause instanceof Error ? err.cause.message : '';
+  return /no such table:\s*app_meta/i.test(`${message} ${causeMessage}`);
+}
+
 export function createApp() {
   const app = new Hono<{ Bindings: Env }>();
 
@@ -19,17 +26,34 @@ export function createApp() {
     const timezone = c.env?.DEFAULT_TIMEZONE ?? DEFAULT_TIMEZONE;
     let connected = false;
     let migrated = false;
+    let dbError: string | undefined;
 
-    if (c.env?.DB) {
+    if (!c.env?.DB) {
+      dbError = 'D1 database binding (DB) is not configured';
+    } else {
+      const db = createDb(c.env.DB);
       try {
-        const db = createDb(c.env.DB);
         await db.run(sql`SELECT 1`);
         connected = true;
-
-        await db.select().from(appMeta).limit(1);
-        migrated = true;
       } catch {
-        // If SELECT 1 succeeded, connected remains true while migrated stays false
+        connected = false;
+        dbError = 'Failed to connect to D1 database';
+      }
+
+      if (connected) {
+        try {
+          await db.select().from(appMeta).limit(1);
+          migrated = true;
+        } catch (err: unknown) {
+          if (isMissingTableError(err)) {
+            migrated = false;
+            dbError = 'Database migrations have not been applied (missing app_meta table)';
+          } else {
+            connected = false;
+            migrated = false;
+            dbError = 'Unexpected SQL error while verifying schema state';
+          }
+        }
       }
     }
 
@@ -43,6 +67,7 @@ export function createApp() {
       database: {
         connected,
         migrated,
+        ...(dbError ? { error: dbError } : {}),
       },
     };
 

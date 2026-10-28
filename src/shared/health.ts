@@ -11,6 +11,7 @@ export const HealthResponseSchema = z.object({
   database: z.object({
     connected: z.boolean(),
     migrated: z.boolean(),
+    error: z.string().optional(),
   }),
 });
 

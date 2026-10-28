@@ -95,6 +95,40 @@ describe('Issue #1 Scaffold & Health API Verification', () => {
     expect(parsed.status).toBe('degraded');
     expect(parsed.database.connected).toBe(true);
     expect(parsed.database.migrated).toBe(false);
+    expect(parsed.database.error).toMatch(/missing app_meta table/i);
+    sqlite.close();
+  });
+
+  it('distinguishes unexpected SQL errors from unapplied migrations', async () => {
+    const sqlite = new DatabaseSync(':memory:');
+    const baseDb = createSqliteD1Adapter(sqlite);
+    const faultyDb: D1Database = {
+      batch: (statements) => baseDb.batch(statements),
+      exec: (query) => baseDb.exec(query),
+      dump: () => baseDb.dump(),
+      withSession: () => baseDb.withSession(),
+      prepare(query: string) {
+        if (query.includes('app_meta')) {
+          throw new Error('SQLITE_IOERR: disk I/O error');
+        }
+        return baseDb.prepare(query);
+      },
+    };
+    const app = createApp();
+
+    const res = await app.request('/api/health', undefined, {
+      DB: faultyDb,
+      APP_ENV: 'test',
+      DEFAULT_TIMEZONE: 'Asia/Taipei',
+    });
+
+    expect(res.status).toBe(503);
+    const json: unknown = await res.json();
+    const parsed = HealthResponseSchema.parse(json);
+    expect(parsed.status).toBe('degraded');
+    expect(parsed.database.connected).toBe(false);
+    expect(parsed.database.migrated).toBe(false);
+    expect(parsed.database.error).toMatch(/Unexpected SQL error/i);
     sqlite.close();
   });
 
@@ -130,6 +164,7 @@ describe('Issue #1 Scaffold & Health API Verification', () => {
     expect(parsed.timezone).toBe('Asia/Taipei');
     expect(parsed.database.connected).toBe(true);
     expect(parsed.database.migrated).toBe(true);
+    expect(parsed.database.error).toBeUndefined();
     sqlite.close();
   });
 
