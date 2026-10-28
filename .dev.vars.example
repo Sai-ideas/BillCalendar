@@ -1,0 +1,4 @@
+# Cloudflare Workers Local Development Variables (.dev.vars)
+# Copy this file to .dev.vars for local overrides. Do NOT commit secrets.
+APP_ENV=development
+DEFAULT_TIMEZONE=Asia/Taipei

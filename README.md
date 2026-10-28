@@ -1,6 +1,6 @@
 # BillCalendar — 生活行事曆 Demo
 
-版本：需求基準 V0.3（2026-10-27）。狀態：規劃／未實作。
+版本：需求基準 V0.3（2026-10-27）。狀態：Issue #1 專案骨架已建立（功能模組按階段實作中）。
 
 BillCalendar 是在 `Sai-ideas/BillCalendar` 獨立儲存庫開發的示範應用，參考 Jorte 的月曆呈現與 ienon 的家庭協作。核心理念為**資料模組獨立、日期視圖整合**：月曆導航、聊天快速記錄、行程／待辦／記帳／私人日記結構化管理。
 
@@ -18,10 +18,67 @@ BillCalendar 是在 `Sai-ideas/BillCalendar` 獨立儲存庫開發的示範應�
 - [技術架構與資料模型](docs/ARCHITECTURE.md)
 - [介面與操作流程](docs/UX.md)
 - [實作階段與未決事項](docs/ROADMAP.md)
-- [V0.3 規格審閱與 MVP 架構收斂提案（待 Review）](docs/REVIEW_V0.3.md)
+- [V0.3 規格審閱與 MVP 架構收斂提案（已審閱）](docs/REVIEW_V0.3.md)
 
-## 技術候選
-React + TypeScript + Vite、Tailwind CSS、Cloudflare Workers + Hono、Cloudflare D1 + Drizzle ORM。初期聊天以輪詢為主；未決技術項目在 Roadmap 文件列出。尚未建立應用程式、CI 或正式部署。
+## 專案結構（Single-Repo Vite + Hono + Workers + D1）
+```text
+BillCalendar/
+├── src/
+│   ├── client/        # React + TypeScript + Tailwind CSS + Vite 前端
+│   ├── server/        # Cloudflare Workers + Hono API routes + Drizzle D1 連線與 Schema
+│   └── shared/        # 前後端共用純型別、Zod 驗證與常數（嚴禁匯入 DB 或伺服器秘密）
+├── drizzle/           # 版本化 D1 SQL migrations
+├── wrangler.toml      # Cloudflare Workers + D1 binding 設定（不使用 R2）
+└── vite.config.ts     # Vite 建置與本機 /api 代理設定
+```
+
+## 環境變數與設定檔
+本專案區分 Workers 後端變數與 Vite 前端變數，**請勿將實際秘密提交至版本控制**：
+
+1. **Cloudflare Workers 本地環境變數（`.dev.vars`）**
+   - 可複製 `.dev.vars.example` 為 `.dev.vars`：
+     - `APP_ENV`：執行環境標識（預設 `development`）。
+     - `DEFAULT_TIMEZONE`：預設日曆與訊息本地日期時區（預設 `Asia/Taipei`）。
+   - Cloudflare D1 資料庫透過 `wrangler.toml` 中的 `[[d1_databases]]` 綁定為 `DB`（本地開發自動建立於 `.wrangler/state/v3/d1`）。
+
+2. **Vite 前端環境變數（`.env`）**
+   - 可複製 `.env.example` 為 `.env`：
+     - `VITE_API_BASE_URL`：API 基底路徑（預設留空，本機開發由 Vite Dev Server 將 `/api/*` 代理至 `http://127.0.0.1:8787`）。
+
+## 本機開發與啟動方式
+
+### 1. 安裝依賴
+```bash
+npm install
+```
+
+### 2. 套用本機 D1 Migration（從空庫初始化）
+```bash
+npm run db:migrate:local
+```
+> 若修改了 `src/server/db/schema.ts`，可執行 `npm run db:generate` 產生新的 Drizzle SQL migration。
+
+### 3. 啟動本機開發環境
+- **同時啟動前後端（推薦）**：
+  ```bash
+  npm run dev
+  ```
+  - 前端（Vite）：`http://localhost:5173`
+  - 後端（Wrangler Workers + Local D1）：`http://127.0.0.1:8787`
+  - Health API：`http://127.0.0.1:8787/api/health`（或經前端代理 `http://localhost:5173/api/health`）
+
+- **分別啟動**：
+  ```bash
+  npm run dev:api     # 啟動 Workers API (port 8787)
+  npm run dev:client  # 啟動 Vite 前端 (port 5173)
+  ```
+
+### 4. 型別檢查、建置與測試
+```bash
+npm run typecheck   # TypeScript 前後端型別檢查
+npm run build       # 建置前端資產至 dist/client
+npm test            # 執行 Vitest 自動化測試（含空庫 migration 與 /api/health 驗證）
+```
 
 ## 儲存庫界線
 本專案使用獨立 Repository；Issue 直接在此追蹤。
