@@ -1077,6 +1077,116 @@ describe('Issue #3 Family Model, Members and In-App Invitations', () => {
     expect(acceptRejectedJson.error).toBe('INVITATION_INVALID');
   });
 
+  it('Blocking: cross-table transaction rollback on partial failure (INSERT failure rolls back accepted status to pending, and retry succeeds)', async () => {
+    const { sqlite, db } = createMigratedSqliteD1();
+    const app = createApp();
+
+    let failInsertOnce = false;
+    const testDb: D1Database = {
+      prepare: (query: string) => db.prepare(query),
+      exec: (query: string) => db.exec(query),
+      dump: () => db.dump(),
+      withSession: (token?: string) => db.withSession(token as never),
+      batch: async <T = unknown>(statements: D1PreparedStatement[]): Promise<D1Result<T>[]> => {
+        if (failInsertOnce) {
+          failInsertOnce = false;
+          // Run statement 1 within transaction, then simulate failure on statement 2:
+          sqlite.exec('BEGIN TRANSACTION;');
+          await statements[0].all();
+          // Simulate failure before statement 2 commits:
+          sqlite.exec('ROLLBACK;');
+          throw new Error('Simulated D1 INSERT failure or interrupted Worker during member insert');
+        }
+        return db.batch<T>(statements);
+      },
+    };
+
+    const devEnv = {
+      DB: testDb,
+      APP_ENV: 'development',
+      ALLOW_TEST_IDENTITY: 'true',
+      DEFAULT_TIMEZONE: 'Asia/Taipei',
+    };
+
+    const users = await setupTestUsers(app, devEnv);
+
+    // 1. Alice creates family & invites Bob
+    const createRes = await app.request(
+      '/api/families',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Test-Session-Id': users.alice.session,
+        },
+        body: JSON.stringify({ name: '交易一致性測試家庭' }),
+      },
+      devEnv,
+    );
+    const fam = (await createRes.json()) as { id: string };
+
+    const invRes = await app.request(
+      `/api/families/${fam.id}/invitations`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Test-Session-Id': users.alice.session,
+        },
+        body: JSON.stringify({ email: users.bob.email }),
+      },
+      devEnv,
+    );
+    const inv = (await invRes.json()) as { id: string };
+
+    // 2. Bob attempts to accept invitation, but member INSERT encounters failure
+    failInsertOnce = true;
+    const acceptFailRes = await app.request(
+      `/api/invitations/${inv.id}/accept`,
+      {
+        method: 'POST',
+        headers: { 'X-Test-Session-Id': users.bob.session },
+      },
+      devEnv,
+    );
+    expect(acceptFailRes.status).toBe(500);
+
+    // 3. Verify cross-table consistency after rollback:
+    // - family_invitations.status MUST remain 'pending' (NOT left as 'accepted')
+    const inviteRow = sqlite
+      .prepare('SELECT status FROM family_invitations WHERE id = ?')
+      .get(inv.id) as { status: string };
+    expect(inviteRow.status).toBe('pending');
+
+    // - family_members table MUST NOT have Bob
+    const bobMember = sqlite
+      .prepare('SELECT COUNT(*) as count FROM family_members WHERE family_id = ? AND user_id = ?')
+      .get(fam.id, users.bob.userId) as { count: number };
+    expect(bobMember.count).toBe(0);
+
+    // 4. Retry accepting without failure -> must succeed, transition status to 'accepted', and create membership
+    const acceptRetryRes = await app.request(
+      `/api/invitations/${inv.id}/accept`,
+      {
+        method: 'POST',
+        headers: { 'X-Test-Session-Id': users.bob.session },
+      },
+      devEnv,
+    );
+    expect(acceptRetryRes.status).toBe(200);
+
+    // 5. Verify both tables are now consistently updated
+    const inviteRowAfter = sqlite
+      .prepare('SELECT status FROM family_invitations WHERE id = ?')
+      .get(inv.id) as { status: string };
+    expect(inviteRowAfter.status).toBe('accepted');
+
+    const bobMemberAfter = sqlite
+      .prepare('SELECT COUNT(*) as count FROM family_members WHERE family_id = ? AND user_id = ?')
+      .get(fam.id, users.bob.userId) as { count: number };
+    expect(bobMemberAfter.count).toBe(1);
+  });
+
   it('Blocking 4 & Follow-up: supports admin handover and enforces atomic last-admin protection on demote, remove, and leave', async () => {
     const { db } = createMigratedSqliteD1();
     const app = createApp();

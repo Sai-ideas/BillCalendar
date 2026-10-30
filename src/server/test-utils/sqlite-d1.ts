@@ -94,7 +94,11 @@ export function createSqliteD1Adapter(sqlite: DatabaseSync): D1Database {
         }
         sqlite.exec('COMMIT;');
       } catch (err) {
-        sqlite.exec('ROLLBACK;');
+        try {
+          sqlite.exec('ROLLBACK;');
+        } catch {
+          // If transaction was already aborted by SQLite, ignore rollback error
+        }
         throw err;
       }
       return results;

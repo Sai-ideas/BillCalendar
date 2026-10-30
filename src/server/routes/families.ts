@@ -847,26 +847,50 @@ export function createInvitationsRouter() {
       );
     }
 
-    // Atomic conditional status transition: only succeeds if invitation status is STILL 'pending'
+    // Atomic cross-table transaction:
+    // Statement 1: Conditional UPDATE on family_invitations (only succeeds if status is still 'pending')
+    // Statement 2: INSERT into family_members with family_id contingent on changes() = 1.
+    // If update affects 0 rows (concurrent revoke/accept/reject), changes() = 0, causing NOT NULL violation on family_id,
+    // which fails and rolls back the entire batch transaction.
+    // If member insert fails (e.g. database error/interrupted worker), the batch transaction rolls back, restoring
+    // family_invitations status to 'pending' without leaving an orphaned accepted status.
     const nowIso = new Date().toISOString();
-    const updatedInvites = await db
-      .update(familyInvitations)
-      .set({
-        status: 'accepted',
-        updatedAt: nowIso,
-      })
-      .where(
-        and(
-          eq(familyInvitations.id, inviteId),
-          eq(familyInvitations.invitedEmail, currentUser.emailNormalized),
-          eq(familyInvitations.status, 'pending'),
-        ),
-      )
-      .returning({ id: familyInvitations.id });
+    const newMemberId = crypto.randomUUID();
 
-    // Explicit affected-row handling:
-    if (updatedInvites.length === 0) {
-      // Concurrently revoked, accepted, or rejected
+    const updateStmt = c.env.DB.prepare(`
+      UPDATE family_invitations
+      SET status = 'accepted', updated_at = ?
+      WHERE id = ? AND invited_email = ? AND status = 'pending'
+    `).bind(nowIso, inviteId, currentUser.emailNormalized);
+
+    const insertStmt = c.env.DB.prepare(`
+      INSERT INTO family_members (id, family_id, user_id, role, joined_at, updated_at)
+      SELECT
+        ?,
+        (CASE WHEN changes() = 1 THEN ? ELSE NULL END),
+        ?,
+        ?,
+        ?,
+        ?
+      WHERE NOT EXISTS (
+        SELECT 1 FROM family_members WHERE family_id = ? AND user_id = ?
+      )
+    `).bind(
+      newMemberId,
+      invite.familyId,
+      currentUser.id,
+      invite.role,
+      nowIso,
+      nowIso,
+      invite.familyId,
+      currentUser.id,
+    );
+
+    try {
+      await c.env.DB.batch([updateStmt, insertStmt]);
+    } catch {
+      // Transaction aborted / rolled back:
+      // Inspect current database state to return the precise semantic error response
       const latestInvite = await db
         .select()
         .from(familyInvitations)
@@ -902,25 +926,26 @@ export function createInvitationsRouter() {
         );
       }
 
+      if (latestStatus === 'revoked' || latestStatus === 'rejected') {
+        return c.json(
+          {
+            error: 'INVITATION_INVALID',
+            message: `該邀請狀態已非待處理 (目前為 ${latestStatus})，無法接受`,
+          },
+          400,
+        );
+      }
+
+      // If status is still pending, but the transaction failed (e.g. database error during insert):
+      // The transaction was fully rolled back, preserving pending status for future retries.
       return c.json(
         {
-          error: 'INVITATION_INVALID',
-          message: `該邀請狀態已非待處理 (目前為 ${latestStatus})，無法接受`,
+          error: 'TRANSACTION_FAILED',
+          message: '接受邀請交易失敗，已完整復原，請稍後重試',
         },
-        400,
+        500,
       );
     }
-
-    // Membership write itself is contingent on winning the pending status transition
-    const newMemberId = crypto.randomUUID();
-    await db.run(sql`
-      INSERT INTO family_members (id, family_id, user_id, role, joined_at, updated_at)
-      SELECT ${newMemberId}, ${invite.familyId}, ${currentUser.id}, ${invite.role}, ${nowIso}, ${nowIso}
-      WHERE NOT EXISTS (
-        SELECT 1 FROM family_members
-        WHERE family_id = ${invite.familyId} AND user_id = ${currentUser.id}
-      );
-    `);
 
     return c.json({ success: true, message: '成功加入家庭', familyId: invite.familyId }, 200);
   });
