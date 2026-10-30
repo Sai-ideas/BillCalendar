@@ -1,12 +1,18 @@
-import { useMemo } from 'react';
+import { useCallback, useEffect, useMemo } from 'react';
 import {
+  DEFAULT_TIMEZONE,
+  LUNAR_AND_HOLIDAY_PROVENANCE,
   RIGHT_PANEL_TABS,
   WEEKDAY_LABELS_ZH,
   buildMonthCalendarGrid,
   formatYearMonthLabel,
+  getLunarDateInfo,
+  getTodayLocalDate,
   jumpCalendarToDate,
   navigateCalendarMonth,
+  refreshCalendarTodayDate,
   selectCalendarDateBlank,
+  selectCalendarSpace,
   switchRightPanelTab,
   type CalendarNavigationState,
   type FamilySummary,
@@ -19,6 +25,8 @@ export interface CalendarWorkspaceProps {
   onChangeNavState: (next: CalendarNavigationState) => void;
   families: FamilySummary[];
   onSelectFamilySpace?: (familyId: string) => void;
+  timezone?: string;
+  getNow?: () => Date;
 }
 
 export function CalendarWorkspace({
@@ -26,6 +34,8 @@ export function CalendarWorkspace({
   onChangeNavState,
   families,
   onSelectFamilySpace,
+  timezone = DEFAULT_TIMEZONE,
+  getNow,
 }: CalendarWorkspaceProps) {
   const {
     todayDate,
@@ -34,11 +44,47 @@ export function CalendarWorkspace({
     activeTab,
     selectedSpace,
     mobileView,
+    diaryAutoSwitchedToPersonal,
   } = navState;
+
+  // Automatically refresh `todayDate` on midnight rollover, window focus, or visibilitychange (PR #25 Follow-up #2)
+  const syncTodayDateIfNeeded = useCallback(() => {
+    const now = getNow ? getNow() : new Date();
+    const latestToday = getTodayLocalDate(now, timezone);
+    if (latestToday !== navState.todayDate) {
+      onChangeNavState(refreshCalendarTodayDate(navState, latestToday));
+    }
+  }, [getNow, timezone, navState, onChangeNavState]);
+
+  useEffect(() => {
+    const handleFocus = () => {
+      syncTodayDateIfNeeded();
+    };
+    const handleVisibilityChange = () => {
+      if (typeof document === 'undefined' || document.visibilityState !== 'hidden') {
+        syncTodayDateIfNeeded();
+      }
+    };
+
+    window.addEventListener('focus', handleFocus);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    const intervalId = window.setInterval(syncTodayDateIfNeeded, 30_000);
+
+    return () => {
+      window.removeEventListener('focus', handleFocus);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.clearInterval(intervalId);
+    };
+  }, [syncTodayDateIfNeeded]);
 
   const gridCells = useMemo(
     () => buildMonthCalendarGrid(displayedMonth, selectedDate, todayDate),
     [displayedMonth, selectedDate, todayDate],
+  );
+
+  const selectedDateLunar = useMemo(
+    () => getLunarDateInfo(selectedDate),
+    [selectedDate],
   );
 
   const selectedFamily = useMemo(() => {
@@ -54,10 +100,7 @@ export function CalendarWorkspace({
         : '家庭空間';
 
   const handleSelectSpace = (space: SelectedSpace) => {
-    onChangeNavState({
-      ...navState,
-      selectedSpace: space,
-    });
+    onChangeNavState(selectCalendarSpace(navState, space));
     if (space.kind === 'family' && onSelectFamilySpace) {
       onSelectFamilySpace(space.familyId);
     }
@@ -72,7 +115,10 @@ export function CalendarWorkspace({
   };
 
   const handleJumpToday = () => {
-    onChangeNavState(jumpCalendarToDate(navState, todayDate));
+    const now = getNow ? getNow() : new Date();
+    const latestToday = getTodayLocalDate(now, timezone);
+    const refreshed = refreshCalendarTodayDate(navState, latestToday);
+    onChangeNavState(jumpCalendarToDate(refreshed, latestToday));
   };
 
   const handleCellBlankClick = (dateStr: string, openMobilePanel: boolean) => {
@@ -208,6 +254,13 @@ export function CalendarWorkspace({
               >
                 {selectedDate}
               </strong>
+              <span
+                data-testid="status-selected-lunar"
+                className="ml-1.5 text-[11px] font-medium text-slate-500"
+              >
+                ({selectedDateLunar.lunarMonthLabel}
+                {selectedDateLunar.lunarDayLabel})
+              </span>
             </span>
             <span className="text-slate-300">|</span>
             <span>
@@ -263,7 +316,7 @@ export function CalendarWorkspace({
 
       {/* Desktop 62% / 38% Split & Mobile Responsive Container */}
       <div className="grid grid-cols-1 lg:grid-cols-12">
-        {/* Left 60-65% on Desktop (7 of 12 cols = 58.3% or custom grid): Let's use lg:col-span-7 (~60%) */}
+        {/* Left 60-65% on Desktop (7 of 12 cols = 58.3%) */}
         <div
           data-testid="calendar-left-pane"
           className={`border-b border-slate-200 p-4 sm:p-5 lg:col-span-7 lg:border-r lg:border-b-0 ${
@@ -288,7 +341,7 @@ export function CalendarWorkspace({
             ))}
           </div>
 
-          {/* 6-week High-Density Month Grid */}
+          {/* 6-week High-Density Month Grid (Solar + Lunar + 24 Solar Terms + Holidays) */}
           <div
             role="grid"
             aria-label={`${formatYearMonthLabel(displayedMonth)} 月曆格`}
@@ -302,7 +355,25 @@ export function CalendarWorkspace({
                 isToday,
                 isSelected,
                 dayOfWeek,
+                lunar,
               } = cell;
+
+              const lunarTextClass =
+                lunar.cellHighlightKind === 'festival'
+                  ? isCurrentMonth
+                    ? 'font-bold text-rose-600'
+                    : 'font-semibold text-rose-400'
+                  : lunar.cellHighlightKind === 'solar_term'
+                    ? isCurrentMonth
+                      ? 'font-bold text-teal-700'
+                      : 'font-semibold text-teal-500'
+                    : lunar.cellHighlightKind === 'lunar_first_day'
+                      ? isCurrentMonth
+                        ? 'font-bold text-indigo-700'
+                        : 'font-semibold text-indigo-400'
+                      : isCurrentMonth
+                        ? 'text-slate-500'
+                        : 'text-slate-400';
 
               return (
                 <button
@@ -312,10 +383,11 @@ export function CalendarWorkspace({
                   data-current-month={isCurrentMonth ? 'true' : 'false'}
                   data-is-today={isToday ? 'true' : 'false'}
                   data-is-selected={isSelected ? 'true' : 'false'}
-                  aria-label={`選擇日期 ${dateStr}${isToday ? ' (今日)' : ''}${isSelected ? ' (已選取)' : ''}`}
+                  data-is-leap-month={lunar.isLeapMonth ? 'true' : 'false'}
+                  aria-label={`選擇日期 ${dateStr} 農曆${lunar.lunarMonthLabel}${lunar.lunarDayLabel}${lunar.cellDisplayText !== lunar.lunarDayLabel ? ` (${lunar.cellDisplayText})` : ''}${isToday ? ' (今日)' : ''}${isSelected ? ' (已選取)' : ''}`}
                   aria-selected={isSelected}
                   onClick={() => handleCellBlankClick(dateStr, false)}
-                  className={`group relative flex min-h-[76px] flex-col items-start justify-between rounded-lg border p-1.5 text-left transition sm:min-h-[88px] sm:p-2 ${
+                  className={`group relative flex min-h-[78px] flex-col items-start justify-between rounded-lg border p-1.5 text-left transition sm:min-h-[90px] sm:p-2 ${
                     isSelected
                       ? 'border-indigo-600 bg-indigo-50/75 ring-2 ring-indigo-600/30'
                       : isToday
@@ -325,8 +397,8 @@ export function CalendarWorkspace({
                           : 'border-slate-100 bg-slate-50/60 text-slate-400 hover:border-slate-200'
                   }`}
                 >
-                  {/* Top Row of Cell: Solar Day + Today/Selected Badges */}
-                  <div className="flex w-full items-center justify-between gap-1">
+                  {/* Top Row of Cell: Solar Day + Holiday/Today Badges */}
+                  <div className="flex w-full items-center justify-between gap-0.5">
                     <span
                       className={`inline-flex h-6 w-6 items-center justify-center rounded-full text-xs font-bold ${
                         isSelected
@@ -335,7 +407,7 @@ export function CalendarWorkspace({
                             ? 'bg-emerald-600 text-white'
                             : !isCurrentMonth
                               ? 'text-slate-400'
-                              : dayOfWeek === 0
+                              : dayOfWeek === 0 || lunar.isHolidayDayOff
                                 ? 'text-rose-600'
                                 : dayOfWeek === 6
                                   ? 'text-indigo-600'
@@ -346,6 +418,14 @@ export function CalendarWorkspace({
                     </span>
 
                     <div className="flex items-center gap-0.5">
+                      {lunar.isHolidayDayOff && isCurrentMonth && (
+                        <span
+                          data-testid={`calendar-cell-holiday-badge-${dateStr}`}
+                          className="rounded-xs bg-rose-100 px-1 py-0.5 text-[9px] font-bold text-rose-700"
+                        >
+                          休
+                        </span>
+                      )}
                       {isToday && (
                         <span className="rounded-xs bg-emerald-100 px-1 py-0.5 text-[10px] font-bold text-emerald-800">
                           今日
@@ -354,16 +434,48 @@ export function CalendarWorkspace({
                     </div>
                   </div>
 
-                  {/* Middle/Bottom Slot: Reserved for Lunar label (Issue #6), Event/Task bars (Issues #7/#8) & Existence Icons (Issue #14) */}
+                  {/* Middle/Bottom Slot: Lunar Date / Leap Month / 24 Solar Term / Festival (Issue #6) */}
                   <div className="mt-1 w-full space-y-0.5">
+                    <div className="flex items-center justify-between gap-1">
+                      <span
+                        data-testid={`calendar-cell-lunar-${dateStr}`}
+                        data-lunar-highlight={lunar.cellHighlightKind}
+                        className={`truncate text-[11px] leading-tight ${lunarTextClass}`}
+                      >
+                        {lunar.cellDisplayText}
+                      </span>
+                      {lunar.isLeapMonth && lunar.lunarDay !== 1 && (
+                        <span
+                          data-testid={`calendar-cell-leap-tag-${dateStr}`}
+                          className="shrink-0 rounded-xs bg-amber-100 px-1 py-0.2 text-[9px] font-semibold text-amber-800"
+                        >
+                          閏
+                        </span>
+                      )}
+                    </div>
                     <div className="truncate text-[10px] text-slate-400">
-                      {/* Issue #6 will populate lunar date & solar terms here */}
-                      {isCurrentMonth ? '點擊看摘要' : `${cell.month}/${cell.day}`}
+                      {lunar.solarTerm && lunar.cellDisplayText !== lunar.solarTerm
+                        ? `節氣：${lunar.solarTerm}`
+                        : `${lunar.lunarMonthLabel}${lunar.lunarDayLabel}`}
                     </div>
                   </div>
                 </button>
               );
             })}
+          </div>
+
+          {/* Lunar & Holiday Disclaimer Footer under Month Grid (Review D5 / UX.md) */}
+          <div
+            data-testid="calendar-lunar-disclaimer"
+            className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-200/80 bg-slate-50 px-3 py-2 text-[11px] text-slate-600"
+          >
+            <span>
+              🌕 <strong>農曆與節慶顯示：</strong>
+              {LUNAR_AND_HOLIDAY_PROVENANCE.officialHolidaySource.disclaimer}
+            </span>
+            <span className="font-medium text-amber-800">
+              ⚠️ {LUNAR_AND_HOLIDAY_PROVENANCE.mvpScopeBoundary.nonGoalNotice}
+            </span>
           </div>
 
           {/* Mobile Quick Bar under calendar to open selected date details on small screens */}
@@ -373,6 +485,10 @@ export function CalendarWorkspace({
               <strong className="font-mono font-bold text-indigo-900">
                 {selectedDate}
               </strong>
+              <span className="ml-1 text-[11px] text-indigo-700">
+                ({selectedDateLunar.lunarMonthLabel}
+                {selectedDateLunar.lunarDayLabel})
+              </span>
             </div>
             <button
               type="button"
@@ -418,21 +534,39 @@ export function CalendarWorkspace({
             >
               {RIGHT_PANEL_TABS.map((tab) => {
                 const isActive = activeTab === tab.id;
+                const isPersonalOnlyInFamily =
+                  Boolean(tab.personalOnly) && selectedSpace.kind === 'family';
                 return (
                   <button
                     key={tab.id}
                     type="button"
                     role="tab"
                     data-testid={`right-tab-${tab.id}`}
+                    data-personal-only={tab.personalOnly ? 'true' : 'false'}
                     aria-selected={isActive}
+                    title={
+                      isPersonalOnlyInFamily
+                        ? '私人日記僅限個人空間存取，點擊將自動切回個人空間'
+                        : tab.shortDescription
+                    }
                     onClick={() => handleTabClick(tab.id)}
                     className={`rounded-lg px-2 py-2 text-xs font-bold transition ${
                       isActive
                         ? 'bg-indigo-600 text-white shadow-2xs'
-                        : 'bg-white/70 text-slate-700 hover:bg-white hover:text-slate-900'
+                        : isPersonalOnlyInFamily
+                          ? 'border border-dashed border-indigo-200 bg-white/60 text-indigo-800 hover:bg-indigo-50'
+                          : 'bg-white/70 text-slate-700 hover:bg-white hover:text-slate-900'
                     }`}
                   >
-                    {tab.label}
+                    <span>{tab.label}</span>
+                    {isPersonalOnlyInFamily && (
+                      <span
+                        data-testid="diary-tab-personal-only-badge"
+                        className="ml-0.5 text-[10px] font-normal text-indigo-600"
+                      >
+                        (個人)
+                      </span>
+                    )}
                   </button>
                 );
               })}
@@ -451,6 +585,46 @@ export function CalendarWorkspace({
                   >
                     {selectedDate} — {activeTabMeta.label}
                   </h3>
+                  <div className="mt-1 flex flex-wrap items-center gap-1.5 text-xs text-slate-600">
+                    <span
+                      data-testid="selected-date-lunar-full"
+                      className="font-medium text-slate-700"
+                    >
+                      農曆：{selectedDateLunar.fullLunarLabel}
+                    </span>
+                    {selectedDateLunar.isLeapMonth && (
+                      <span
+                        data-testid="selected-date-leap-badge"
+                        className="rounded-xs bg-amber-100 px-1.5 py-0.5 text-[10px] font-bold text-amber-900"
+                      >
+                        農曆閏月
+                      </span>
+                    )}
+                    {selectedDateLunar.solarTerm && (
+                      <span
+                        data-testid="selected-date-solar-term"
+                        className="rounded-xs bg-teal-100 px-1.5 py-0.5 text-[10px] font-bold text-teal-800"
+                      >
+                        節氣：{selectedDateLunar.solarTerm}
+                      </span>
+                    )}
+                    {selectedDateLunar.traditionalFestival && (
+                      <span
+                        data-testid="selected-date-traditional-festival"
+                        className="rounded-xs bg-rose-100 px-1.5 py-0.5 text-[10px] font-bold text-rose-800"
+                      >
+                        傳統節日：{selectedDateLunar.traditionalFestival}
+                      </span>
+                    )}
+                    {selectedDateLunar.officialHoliday && (
+                      <span
+                        data-testid="selected-date-official-holiday"
+                        className="rounded-xs bg-rose-50 border border-rose-200 px-1.5 py-0.5 text-[10px] font-semibold text-rose-700"
+                      >
+                        國定假日參考：{selectedDateLunar.officialHoliday}
+                      </span>
+                    )}
+                  </div>
                 </div>
                 <span className="rounded-full bg-indigo-50 px-2.5 py-1 text-xs font-semibold text-indigo-800">
                   {currentSpaceLabel}
@@ -474,14 +648,57 @@ export function CalendarWorkspace({
                         📌 {selectedDate} 單日摘要（{currentSpaceLabel}）
                       </p>
                       <p className="mt-1 text-slate-600">
-                        點擊左側月曆任意日期空白處，即更新全域{' '}
+                        農曆對照：
+                        <strong className="text-slate-900">
+                          {selectedDateLunar.fullLunarLabel}
+                        </strong>
+                        （該農曆月共 {selectedDateLunar.lunarMonthDayCount} 日
+                        {selectedDateLunar.leapMonthOfYear
+                          ? `，本農曆年含閏${selectedDateLunar.leapMonthOfYear}月`
+                          : ''}
+                        ）。點擊左側月曆任意日期空白處，即更新全域{' '}
                         <code>selectedDate</code> 並開啟本摘要面板；
                         <code>selectedDate</code> ({selectedDate}) 與系統今日{' '}
                         <code>today</code> ({todayDate}) 狀態彼此獨立。
                       </p>
                     </div>
 
-                    {/* Quick Module Entry Buttons (UX.md: 摘要顯示當日行程／待辦／收支及其他已授權紀錄，並提供進入各模組的入口) */}
+                    {/* Issue #6 Date/Timezone Strategy & Lunar Data Provenance Card */}
+                    <div
+                      data-testid="timezone-and-lunar-policy-card"
+                      className="rounded-lg border border-indigo-100 bg-indigo-50/40 p-3.5 text-xs text-slate-700 space-y-1.5"
+                    >
+                      <p className="font-semibold text-indigo-950">
+                        🕒 日期時區規則與農曆資料來源說明（Issue #6 / D4 & D5）
+                      </p>
+                      <ul className="list-disc pl-4 space-y-1 text-[11px] text-slate-600">
+                        <li>
+                          <strong>純日期欄位（YYYY-MM-DD）：</strong>全天事件（
+                          <code>all_day = true</code>）、待辦截止日（
+                          <code>due_date</code>）、記帳日（
+                          <code>occurred_on</code>）與私人日記日（
+                          <code>entry_date</code>）均以純日期保存，不做 UTC 換日偏移。
+                        </li>
+                        <li>
+                          <strong>具時間事件與訊息時間戳：</strong>一律以 UTC ISO 8601
+                          保存瞬間，並依空間／事件時區（預設{' '}
+                          <code>{timezone}</code>）換算所屬月曆日期格。
+                        </li>
+                        <li data-testid="lunar-provenance-notice">
+                          <strong>資料來源與範圍限制：</strong>農曆與 24 節氣採用離線演算法庫{' '}
+                          <code>
+                            {LUNAR_AND_HOLIDAY_PROVENANCE.lunarEngine.packageName} v
+                            {LUNAR_AND_HOLIDAY_PROVENANCE.lunarEngine.version} (
+                            {LUNAR_AND_HOLIDAY_PROVENANCE.lunarEngine.license})
+                          </code>
+                          ；國定假日採{' '}
+                          {LUNAR_AND_HOLIDAY_PROVENANCE.officialHolidaySource.authority}
+                          。{LUNAR_AND_HOLIDAY_PROVENANCE.mvpScopeBoundary.nonGoalNotice}
+                        </li>
+                      </ul>
+                    </div>
+
+                    {/* Quick Module Entry Buttons */}
                     <div>
                       <h4 className="text-xs font-semibold text-slate-500">
                         快速前往當日各功能分頁（切換分頁不會改變選取日{' '}
@@ -505,7 +722,9 @@ export function CalendarWorkspace({
                                   前往「{tab.label}」
                                 </span>
                                 <span className="text-[11px] text-slate-400">
-                                  {isHiddenInFamily ? '僅限個人' : '開啟 ➔'}
+                                  {isHiddenInFamily
+                                    ? '切回個人空間開啟 ➔'
+                                    : '開啟 ➔'}
                                 </span>
                               </button>
                             );
@@ -572,14 +791,49 @@ export function CalendarWorkspace({
                 )}
 
                 {activeTab === 'diary' && (
-                  <div className="rounded-lg border border-indigo-200 bg-indigo-50/50 p-4 text-xs text-slate-700">
-                    <p className="font-semibold text-indigo-950">
-                      🔒 私人日記（日期：{selectedDate} ｜ 嚴格個人專屬）
-                    </p>
-                    <p className="mt-1 text-slate-600">
-                      私人日記永遠僅限本人（<code>user_id</code>
-                      ）讀寫，絕不對家庭成員公開。即使頂端切換至家庭空間，月曆也不會洩露私人日記圖示（Issue #12 / #14）。
-                    </p>
+                  <div className="space-y-3">
+                    {diaryAutoSwitchedToPersonal && (
+                      <div
+                        role="status"
+                        data-testid="diary-auto-switched-personal-notice"
+                        className="rounded-lg border border-amber-200 bg-amber-50 px-3.5 py-2.5 text-xs font-medium text-amber-900"
+                      >
+                        🔒 私人日記屬於個人專屬資料（<code>personalOnly</code>
+                        ），不對家庭空間共享；系統已自動為您切換回「個人空間」。
+                      </div>
+                    )}
+
+                    {selectedSpace.kind === 'family' ? (
+                      <div
+                        data-testid="diary-family-space-guard"
+                        className="rounded-lg border border-amber-300 bg-amber-50 p-4 text-xs text-amber-950 space-y-2"
+                      >
+                        <p className="font-semibold">
+                          🔒 家庭空間不顯示私人日記（僅限個人空間存取）
+                        </p>
+                        <p className="text-amber-900">
+                          依據隱私保護規則，私人日記永不對家庭共享。請返回個人空間檢視或撰寫您的私人日記。
+                        </p>
+                        <button
+                          type="button"
+                          data-testid="diary-switch-to-personal-btn"
+                          onClick={() => handleSelectSpace({ kind: 'personal' })}
+                          className="rounded-md bg-indigo-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-indigo-700"
+                        >
+                          立即切回個人空間
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="rounded-lg border border-indigo-200 bg-indigo-50/50 p-4 text-xs text-slate-700">
+                        <p className="font-semibold text-indigo-950">
+                          🔒 私人日記（日期：{selectedDate} ｜ 嚴格個人專屬）
+                        </p>
+                        <p className="mt-1 text-slate-600">
+                          私人日記永遠僅限本人（<code>user_id</code>
+                          ）讀寫，絕不對家庭成員公開。即使頂端切換至家庭空間，月曆也不會洩露私人日記圖示（Issue #12 / #14）。
+                        </p>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>

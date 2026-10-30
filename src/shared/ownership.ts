@@ -1,4 +1,9 @@
 import { z } from 'zod';
+import {
+  isValidIanaTimezone,
+  isValidLocalDateString,
+  isValidUtcIsoTimestamp,
+} from './calendar';
 import { FamilyRoleSchema } from './family';
 
 export const DATA_OWNERSHIP_SECURITY_NOTICE =
@@ -18,7 +23,11 @@ export type SourceMessageStatus = z.infer<typeof SourceMessageStatusSchema>;
 export const LocalDateStringSchema = z
   .string()
   .trim()
-  .regex(/^\d{4}-\d{2}-\d{2}$/, '日期格式必須為 YYYY-MM-DD');
+  .regex(/^\d{4}-\d{2}-\d{2}$/, '日期格式必須為 YYYY-MM-DD')
+  .refine(
+    (val) => isValidLocalDateString(val),
+    '無效的日曆日期（例如非閏年 02-29 或超出該月有效天數）',
+  );
 
 export const AuthorizedSpaceOverviewSchema = z.object({
   simulationMode: z.literal(true),
@@ -256,7 +265,12 @@ export const CreateEventRequestSchema = z
     startsAt: z.string().trim().min(1, '必須提供開始時間或日期'),
     endsAt: z.string().trim().min(1, '必須提供結束時間或日期'),
     allDay: z.boolean().default(false),
-    timezone: z.string().trim().min(1).default('Asia/Taipei'),
+    timezone: z
+      .string()
+      .trim()
+      .min(1)
+      .default('Asia/Taipei')
+      .refine((tz) => isValidIanaTimezone(tz), '無效的 IANA 時區設定'),
     sourceMessageId: z.string().trim().min(1).nullable().optional(),
   })
   .superRefine((val, ctx) => {
@@ -274,6 +288,59 @@ export const CreateEventRequestSchema = z
         message: '個人空間事件不可指定 familyId',
       });
     }
+    if (val.allDay) {
+      if (!isValidLocalDateString(val.startsAt)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['startsAt'],
+          message: '全天事件開始日期必須為有效的 YYYY-MM-DD 純日期字串（不做 UTC 換日）',
+        });
+      }
+      if (!isValidLocalDateString(val.endsAt)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['endsAt'],
+          message: '全天事件結束日期必須為有效的 YYYY-MM-DD 純日期字串（不做 UTC 換日）',
+        });
+      }
+      if (
+        isValidLocalDateString(val.startsAt) &&
+        isValidLocalDateString(val.endsAt) &&
+        val.endsAt < val.startsAt
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['endsAt'],
+          message: '全天事件結束日期不可早於開始日期',
+        });
+      }
+    } else {
+      if (!isValidUtcIsoTimestamp(val.startsAt)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['startsAt'],
+          message: '具時間事件開始時間必須為有效的 ISO 8601 UTC/時區時間戳',
+        });
+      }
+      if (!isValidUtcIsoTimestamp(val.endsAt)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['endsAt'],
+          message: '具時間事件結束時間必須為有效的 ISO 8601 UTC/時區時間戳',
+        });
+      }
+      if (
+        isValidUtcIsoTimestamp(val.startsAt) &&
+        isValidUtcIsoTimestamp(val.endsAt) &&
+        Date.parse(val.endsAt) < Date.parse(val.startsAt)
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['endsAt'],
+          message: '具時間事件結束時間不可早於開始時間',
+        });
+      }
+    }
   });
 export type CreateEventRequest = z.infer<typeof CreateEventRequestSchema>;
 
@@ -289,7 +356,12 @@ export const UpdateEventRequestSchema = z
     startsAt: z.string().trim().min(1).optional(),
     endsAt: z.string().trim().min(1).optional(),
     allDay: z.boolean().optional(),
-    timezone: z.string().trim().min(1).optional(),
+    timezone: z
+      .string()
+      .trim()
+      .min(1)
+      .refine((tz) => isValidIanaTimezone(tz), '無效的 IANA 時區設定')
+      .optional(),
   })
   .refine(
     (val) =>

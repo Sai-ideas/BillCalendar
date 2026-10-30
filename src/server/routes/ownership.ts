@@ -10,6 +10,9 @@ import {
   UpdateDiaryRequestSchema,
   UpdateEventRequestSchema,
   UpdateTaskRequestSchema,
+  isValidLocalDateString,
+  isValidUtcIsoTimestamp,
+  normalizeToUtcIsoTimestamp,
   type ChatRoomSummary,
   type DiaryEntry,
   type EventDetail,
@@ -1426,6 +1429,12 @@ export function createEventsRouter() {
     const nowIso = new Date().toISOString();
     const eventId = crypto.randomUUID();
     const description = parsed.data.description ?? null;
+    const normalizedStartsAt = parsed.data.allDay
+      ? parsed.data.startsAt.trim()
+      : normalizeToUtcIsoTimestamp(parsed.data.startsAt);
+    const normalizedEndsAt = parsed.data.allDay
+      ? parsed.data.endsAt.trim()
+      : normalizeToUtcIsoTimestamp(parsed.data.endsAt);
 
     // Statement-level SQL guard verifying both target calendar ownership/membership AND source message active/readability at insert time
     const insertResult = await c.env.DB!.prepare(`
@@ -1470,8 +1479,8 @@ export function createEventsRouter() {
         calendarId,
         parsed.data.title,
         description,
-        parsed.data.startsAt,
-        parsed.data.endsAt,
+        normalizedStartsAt,
+        normalizedEndsAt,
         parsed.data.allDay ? 1 : 0,
         parsed.data.timezone,
         sourceMessageId,
@@ -1510,8 +1519,8 @@ export function createEventsRouter() {
       familyId,
       title: parsed.data.title,
       description,
-      startsAt: parsed.data.startsAt,
-      endsAt: parsed.data.endsAt,
+      startsAt: normalizedStartsAt,
+      endsAt: normalizedEndsAt,
       allDay: parsed.data.allDay,
       timezone: parsed.data.timezone,
       sourceMessageId,
@@ -1655,15 +1664,64 @@ export function createEventsRouter() {
       return c.json({ error: 'VALIDATION_ERROR', message: msg }, 400);
     }
 
+    const nextAllDay = parsed.data.allDay ?? match.event.allDay;
+    const rawStartsAt = parsed.data.startsAt ?? match.event.startsAt;
+    const rawEndsAt = parsed.data.endsAt ?? match.event.endsAt;
+
+    if (nextAllDay) {
+      if (!isValidLocalDateString(rawStartsAt) || !isValidLocalDateString(rawEndsAt)) {
+        return c.json(
+          {
+            error: 'VALIDATION_ERROR',
+            message: '全天事件開始與結束日期必須為有效的 YYYY-MM-DD 純日期字串（不做 UTC 換日）',
+          },
+          400,
+        );
+      }
+      if (rawEndsAt < rawStartsAt) {
+        return c.json(
+          {
+            error: 'VALIDATION_ERROR',
+            message: '全天事件結束日期不可早於開始日期',
+          },
+          400,
+        );
+      }
+    } else {
+      if (!isValidUtcIsoTimestamp(rawStartsAt) || !isValidUtcIsoTimestamp(rawEndsAt)) {
+        return c.json(
+          {
+            error: 'VALIDATION_ERROR',
+            message: '具時間事件開始與結束時間必須為有效的 ISO 8601 UTC/時區時間戳',
+          },
+          400,
+        );
+      }
+      if (Date.parse(rawEndsAt) < Date.parse(rawStartsAt)) {
+        return c.json(
+          {
+            error: 'VALIDATION_ERROR',
+            message: '具時間事件結束時間不可早於開始時間',
+          },
+          400,
+        );
+      }
+    }
+
+    const finalStartsAt = nextAllDay
+      ? rawStartsAt.trim()
+      : normalizeToUtcIsoTimestamp(rawStartsAt);
+    const finalEndsAt = nextAllDay ? rawEndsAt.trim() : normalizeToUtcIsoTimestamp(rawEndsAt);
+
     const nowIso = new Date().toISOString();
     const updatedRows = await db
       .update(events)
       .set({
         ...(parsed.data.title !== undefined ? { title: parsed.data.title } : {}),
         ...(parsed.data.description !== undefined ? { description: parsed.data.description } : {}),
-        ...(parsed.data.startsAt !== undefined ? { startsAt: parsed.data.startsAt } : {}),
-        ...(parsed.data.endsAt !== undefined ? { endsAt: parsed.data.endsAt } : {}),
-        ...(parsed.data.allDay !== undefined ? { allDay: parsed.data.allDay } : {}),
+        startsAt: finalStartsAt,
+        endsAt: finalEndsAt,
+        allDay: nextAllDay,
         ...(parsed.data.timezone !== undefined ? { timezone: parsed.data.timezone } : {}),
         updatedAt: nowIso,
       })

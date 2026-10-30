@@ -3,13 +3,24 @@ import { cleanup, fireEvent, render, screen, within } from '@testing-library/rea
 import { useState } from 'react';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  ALL_24_SOLAR_TERMS_ZH_TW,
+  CreateEventRequestSchema,
+  LUNAR_AND_HOLIDAY_PROVENANCE,
+  LocalDateStringSchema,
   RIGHT_PANEL_TABS,
   buildMonthCalendarGrid,
   createInitialCalendarNavigationState,
   deriveSelectedDateForMonth,
+  formatInstantToLocalDate,
+  getLunarDateInfo,
   getTodayLocalDate,
   navigateCalendarMonth,
+  reconcileCalendarSelectedSpace,
+  refreshCalendarTodayDate,
+  resetCalendarSelectedSpaceToPersonal,
+  resolveEventCalendarDates,
   selectCalendarDateBlank,
+  selectCalendarSpace,
   switchRightPanelTab,
   type CalendarNavigationState,
   type FamilySummary,
@@ -35,9 +46,11 @@ const MOCK_FAMILIES: FamilySummary[] = [
 function StatefulCalendarHarness({
   initialToday = '2026-10-30',
   families = MOCK_FAMILIES,
+  getNow,
 }: {
   initialToday?: string;
   families?: FamilySummary[];
+  getNow?: () => Date;
 }) {
   const [navState, setNavState] = useState<CalendarNavigationState>(() =>
     createInitialCalendarNavigationState(initialToday),
@@ -47,6 +60,7 @@ function StatefulCalendarHarness({
       navState={navState}
       onChangeNavState={setNavState}
       families={families}
+      getNow={getNow}
     />
   );
 }
@@ -170,7 +184,7 @@ describe('Issue #5 Calendar Layout, Right-Hand Tabs & Date State', () => {
 
       for (const tab of tabExpectations) {
         const tabBtn = screen.getByTestId(`right-tab-${tab.id}`);
-        expect(tabBtn.textContent).toBe(tab.label);
+        expect(tabBtn.textContent).toContain(tab.label);
         fireEvent.click(tabBtn);
 
         expect(tabBtn.getAttribute('aria-selected')).toBe('true');
@@ -224,5 +238,324 @@ describe('Issue #5 Calendar Layout, Right-Hand Tabs & Date State', () => {
       expect(leftPane.className).toContain('block');
       expect(screen.getByTestId('status-selected-date').textContent).toBe('2026-10-22');
     });
+  });
+});
+
+describe('Issue #6 Lunar Display, 24 Solar Terms, Holidays & Date/Timezone Rules', () => {
+  it('verifies Solar-to-Lunar correspondence across Lunar New Year, 29/30-day New Year Eve (除夕), and Leap Months (閏月)', () => {
+    // 1. 2024 Lunar New Year's Eve on a 30-day 12th lunar month (癸卯年臘月三十 -> 除夕)
+    const eve2024 = getLunarDateInfo('2024-02-09');
+    expect(eve2024.lunarYear).toBe(2023);
+    expect(eve2024.lunarMonth).toBe(12);
+    expect(eve2024.lunarDay).toBe(30);
+    expect(eve2024.lunarMonthDayCount).toBe(30);
+    expect(eve2024.lunarMonthLabel).toBe('臘月');
+    expect(eve2024.lunarDayLabel).toBe('三十');
+    expect(eve2024.traditionalFestival).toBe('除夕');
+    expect(eve2024.cellDisplayText).toBe('除夕');
+
+    const cny2024 = getLunarDateInfo('2024-02-10');
+    expect(cny2024.lunarYear).toBe(2024);
+    expect(cny2024.ganZhiYear).toBe('甲辰');
+    expect(cny2024.zodiac).toBe('龍');
+    expect(cny2024.lunarMonthLabel).toBe('正月');
+    expect(cny2024.lunarDayLabel).toBe('初一');
+    expect(cny2024.traditionalFestival).toBe('春節');
+
+    // 2. 2025 & 2026 Lunar New Year's Eve on a 29-day 12th lunar month (臘月廿九 -> 除夕)
+    const eve2025 = getLunarDateInfo('2025-01-28');
+    expect(eve2025.lunarMonth).toBe(12);
+    expect(eve2025.lunarDay).toBe(29);
+    expect(eve2025.lunarMonthDayCount).toBe(29);
+    expect(eve2025.traditionalFestival).toBe('除夕');
+    expect(eve2025.cellDisplayText).toBe('除夕');
+
+    const eve2026 = getLunarDateInfo('2026-02-16');
+    expect(eve2026.lunarMonth).toBe(12);
+    expect(eve2026.lunarDay).toBe(29);
+    expect(eve2026.lunarMonthDayCount).toBe(29);
+    expect(eve2026.traditionalFestival).toBe('除夕');
+
+    const cny2026 = getLunarDateInfo('2026-02-17');
+    expect(cny2026.ganZhiYear).toBe('丙午');
+    expect(cny2026.zodiac).toBe('馬');
+    expect(cny2026.lunarMonthLabel).toBe('正月');
+    expect(cny2026.lunarDayLabel).toBe('初一');
+    expect(cny2026.traditionalFestival).toBe('春節');
+    expect(cny2026.cellDisplayText).toBe('春節');
+
+    // 3. 2025 Lunar Leap 6th Month (乙巳年閏六月: 2025-07-25 ~ 2025-08-22)
+    const beforeLeap2025 = getLunarDateInfo('2025-07-24');
+    expect(beforeLeap2025.isLeapMonth).toBe(false);
+    expect(beforeLeap2025.lunarMonth).toBe(6);
+    expect(beforeLeap2025.lunarDay).toBe(30);
+    expect(beforeLeap2025.lunarMonthLabel).toBe('六月');
+
+    const leapStart2025 = getLunarDateInfo('2025-07-25');
+    expect(leapStart2025.isLeapMonth).toBe(true);
+    expect(leapStart2025.lunarMonth).toBe(6);
+    expect(leapStart2025.lunarDay).toBe(1);
+    expect(leapStart2025.leapMonthOfYear).toBe(6);
+    expect(leapStart2025.lunarMonthLabel).toBe('閏六月');
+    expect(leapStart2025.lunarDayLabel).toBe('初一');
+    expect(leapStart2025.cellDisplayText).toBe('閏六月');
+    expect(leapStart2025.cellHighlightKind).toBe('lunar_first_day');
+
+    const leapEnd2025 = getLunarDateInfo('2025-08-22');
+    expect(leapEnd2025.isLeapMonth).toBe(true);
+    expect(leapEnd2025.lunarMonth).toBe(6);
+    expect(leapEnd2025.lunarDay).toBe(29);
+    expect(leapEnd2025.lunarMonthLabel).toBe('閏六月');
+    expect(leapEnd2025.lunarDayLabel).toBe('廿九');
+
+    const afterLeap2025 = getLunarDateInfo('2025-08-23');
+    expect(afterLeap2025.isLeapMonth).toBe(false);
+    expect(afterLeap2025.lunarMonth).toBe(7);
+    expect(afterLeap2025.lunarDay).toBe(1);
+    expect(afterLeap2025.lunarMonthLabel).toBe('七月');
+    expect(afterLeap2025.solarTerm).toBe('處暑');
+
+    // 4. Leap month does NOT duplicate traditional festivals (e.g. 2028 戊申年 has 閏五月)
+    const regularDragonBoat2028 = getLunarDateInfo('2028-05-28'); // 五月初五
+    expect(regularDragonBoat2028.isLeapMonth).toBe(false);
+    expect(regularDragonBoat2028.lunarMonth).toBe(5);
+    expect(regularDragonBoat2028.lunarDay).toBe(5);
+    expect(regularDragonBoat2028.traditionalFestival).toBe('端午節');
+
+    const leapFifthDay2028 = getLunarDateInfo('2028-06-27'); // 閏五月初五
+    expect(leapFifthDay2028.isLeapMonth).toBe(true);
+    expect(leapFifthDay2028.lunarMonth).toBe(5);
+    expect(leapFifthDay2028.lunarDay).toBe(5);
+    expect(leapFifthDay2028.lunarMonthLabel).toBe('閏五月');
+    expect(leapFifthDay2028.traditionalFestival).toBeNull();
+    expect(leapFifthDay2028.cellDisplayText).toBe('初五');
+  });
+
+  it('recognizes all 24 Solar Terms in Traditional Chinese and Taiwan reference holidays without claiming recurring scheduling', () => {
+    const foundSolarTerms = new Set<string>();
+    for (let month = 1; month <= 12; month++) {
+      for (let day = 1; day <= 31; day++) {
+        const dateStr = `2026-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+        if (!LocalDateStringSchema.safeParse(dateStr).success) continue;
+        const info = getLunarDateInfo(dateStr);
+        if (info.solarTerm) {
+          foundSolarTerms.add(info.solarTerm);
+        }
+      }
+    }
+
+    expect(foundSolarTerms.size).toBe(24);
+    for (const term of ALL_24_SOLAR_TERMS_ZH_TW) {
+      expect(foundSolarTerms.has(term)).toBe(true);
+    }
+
+    // Specific 2026 solar terms & holidays check
+    expect(getLunarDateInfo('2026-03-05').solarTerm).toBe('驚蟄');
+    expect(getLunarDateInfo('2026-04-20').solarTerm).toBe('穀雨');
+    expect(getLunarDateInfo('2026-05-21').solarTerm).toBe('小滿');
+    expect(getLunarDateInfo('2026-06-05').solarTerm).toBe('芒種');
+    expect(getLunarDateInfo('2026-08-23').solarTerm).toBe('處暑');
+    expect(getLunarDateInfo('2026-09-25').traditionalFestival).toBe('中秋節');
+    expect(getLunarDateInfo('2026-10-10').officialHoliday).toBe('國慶日');
+
+    // Provenance & non-goal boundary check
+    expect(LUNAR_AND_HOLIDAY_PROVENANCE.lunarEngine.packageName).toBe('lunar-javascript');
+    expect(LUNAR_AND_HOLIDAY_PROVENANCE.lunarEngine.license).toBe('MIT');
+    expect(LUNAR_AND_HOLIDAY_PROVENANCE.mvpScopeBoundary.supportsLunarRecurringSchedule).toBe(
+      false,
+    );
+  });
+
+  it('enforces UTC timestamp / pure YYYY-MM-DD local date / Asia/Taipei timezone boundary rules (D4)', () => {
+    // 1. Cross-midnight & cross-month boundary in Asia/Taipei (UTC+8)
+    expect(formatInstantToLocalDate('2026-10-31T15:59:59.000Z', 'Asia/Taipei')).toBe(
+      '2026-10-31',
+    );
+    expect(formatInstantToLocalDate('2026-10-31T16:00:00.000Z', 'Asia/Taipei')).toBe(
+      '2026-11-01',
+    );
+
+    // 2. Cross-year boundary in Asia/Taipei (UTC+8)
+    expect(formatInstantToLocalDate('2026-12-31T15:59:59.000Z', 'Asia/Taipei')).toBe(
+      '2026-12-31',
+    );
+    expect(formatInstantToLocalDate('2026-12-31T16:00:00.000Z', 'Asia/Taipei')).toBe(
+      '2027-01-01',
+    );
+
+    // 3. All-day events (allDay = true) use pure YYYY-MM-DD strings without ANY UTC/timezone offset shift
+    const allDayDatesInTaipei = resolveEventCalendarDates(
+      {
+        startsAt: '2026-10-31',
+        endsAt: '2026-11-02',
+        allDay: true,
+        timezone: 'Asia/Taipei',
+      },
+      'Asia/Taipei',
+    );
+    const allDayDatesInNewYork = resolveEventCalendarDates(
+      {
+        startsAt: '2026-10-31',
+        endsAt: '2026-11-02',
+        allDay: true,
+        timezone: 'Asia/Taipei',
+      },
+      'America/New_York',
+    );
+    expect(allDayDatesInTaipei).toEqual(['2026-10-31', '2026-11-01', '2026-11-02']);
+    expect(allDayDatesInNewYork).toEqual(['2026-10-31', '2026-11-01', '2026-11-02']);
+
+    // 4. Timed events (allDay = false) convert UTC instants into target timezone (Asia/Taipei default)
+    // 2026-10-31T15:30:00Z (23:30 Taipei) -> 2026-10-31T17:30:00Z (01:30 Nov 1 Taipei)
+    const timedCrossMidnight = {
+      startsAt: '2026-10-31T15:30:00.000Z',
+      endsAt: '2026-10-31T17:30:00.000Z',
+      allDay: false,
+      timezone: 'Asia/Taipei',
+    };
+    expect(resolveEventCalendarDates(timedCrossMidnight, 'Asia/Taipei')).toEqual([
+      '2026-10-31',
+      '2026-11-01',
+    ]);
+    expect(resolveEventCalendarDates(timedCrossMidnight, 'UTC')).toEqual(['2026-10-31']);
+
+    // 5. Schema validation rejects out-of-range calendar dates (e.g. 2026-02-29) and enforces allDay vs UTC timestamp format
+    expect(LocalDateStringSchema.safeParse('2026-02-29').success).toBe(false);
+    expect(LocalDateStringSchema.safeParse('2028-02-29').success).toBe(true);
+
+    expect(
+      CreateEventRequestSchema.safeParse({
+        scope: 'personal',
+        title: '不合法的全天事件（誤傳 UTC 時間戳）',
+        startsAt: '2026-10-30T00:00:00.000Z',
+        endsAt: '2026-10-30T23:59:59.000Z',
+        allDay: true,
+      }).success,
+    ).toBe(false);
+
+    expect(
+      CreateEventRequestSchema.safeParse({
+        scope: 'personal',
+        title: '不合法的具時間事件（缺少時區偏移）',
+        startsAt: '2026-10-30 10:00:00',
+        endsAt: '2026-10-30 11:00:00',
+        allDay: false,
+      }).success,
+    ).toBe(false);
+  });
+
+  it('renders lunar dates, solar terms, holidays, and provenance/non-goal disclaimers in CalendarWorkspace', () => {
+    render(<StatefulCalendarHarness initialToday="2026-10-10" />);
+
+    // 2026-10-10 is Double Ten National Day (國慶日)
+    expect(screen.getByTestId('calendar-cell-lunar-2026-10-10').textContent).toBe('國慶日');
+    expect(screen.getByTestId('calendar-cell-holiday-badge-2026-10-10').textContent).toBe(
+      '休',
+    );
+
+    // 2026-10-08 is Cold Dew (寒露) solar term, 2026-10-23 is Frost's Descent (霜降)
+    expect(screen.getByTestId('calendar-cell-lunar-2026-10-08').textContent).toBe('寒露');
+    expect(screen.getByTestId('calendar-cell-lunar-2026-10-23').textContent).toBe('霜降');
+
+    // Click 2026-10-18 (重陽節: 農曆九月初九)
+    fireEvent.click(screen.getByTestId('calendar-cell-2026-10-18'));
+    expect(screen.getByTestId('selected-date-lunar-full').textContent).toContain(
+      '丙午年九月初九（馬年）',
+    );
+    expect(screen.getByTestId('selected-date-traditional-festival').textContent).toContain(
+      '重陽節',
+    );
+
+    // Provenance & non-goal disclaimer is visible and explicitly states no lunar recurring schedule
+    expect(screen.getByTestId('calendar-lunar-disclaimer').textContent).toContain(
+      '暫不支援農曆每年重複事件排程',
+    );
+    expect(screen.getByTestId('lunar-provenance-notice').textContent).toContain(
+      'lunar-javascript',
+    );
+  });
+});
+
+describe('PR #25 Follow-up Fixes (Space Reset, Today Rollover, Personal-Only Diary Guard)', () => {
+  it('Follow-up #1: resets or reconciles calendarNavState.selectedSpace when switching identity, logging out, or leaving a family', () => {
+    let state = createInitialCalendarNavigationState('2026-10-30');
+    state = selectCalendarSpace(state, { kind: 'family', familyId: 'fam_01' });
+    expect(state.selectedSpace).toEqual({ kind: 'family', familyId: 'fam_01' });
+
+    // Reconciling when user is still a member of fam_01 keeps the family space
+    const stillMemberState = reconcileCalendarSelectedSpace(state, ['fam_01', 'fam_02']);
+    expect(stillMemberState.selectedSpace).toEqual({ kind: 'family', familyId: 'fam_01' });
+
+    // Reconciling after leaving fam_01 (or switching to an identity not in fam_01) resets to personal space
+    const afterLeaveState = reconcileCalendarSelectedSpace(state, ['fam_02']);
+    expect(afterLeaveState.selectedSpace).toEqual({ kind: 'personal' });
+
+    // Explicit identity switch / logout reset helper
+    const afterLogoutState = resetCalendarSelectedSpaceToPersonal(state);
+    expect(afterLogoutState.selectedSpace).toEqual({ kind: 'personal' });
+  });
+
+  it('Follow-up #2: automatically refreshes todayDate on midnight rollover / window focus / visibilitychange while preserving selectedDate', () => {
+    let fakeNow = new Date('2026-10-30T15:00:00.000Z'); // 2026-10-30 23:00 in Asia/Taipei
+    render(
+      <StatefulCalendarHarness
+        initialToday="2026-10-30"
+        getNow={() => fakeNow}
+      />,
+    );
+
+    // User selects a specific historical date (2026-10-12)
+    fireEvent.click(screen.getByTestId('calendar-cell-2026-10-12'));
+    expect(screen.getByTestId('status-selected-date').textContent).toBe('2026-10-12');
+    expect(screen.getByTestId('status-today-date').textContent).toBe('2026-10-30');
+
+    // Clock crosses midnight in Asia/Taipei -> 2026-10-31 00:05 (+08:00)
+    fakeNow = new Date('2026-10-30T16:05:00.000Z');
+    fireEvent(window, new Event('focus'));
+
+    expect(screen.getByTestId('status-today-date').textContent).toBe('2026-10-31');
+    // selectedDate MUST remain 2026-10-12
+    expect(screen.getByTestId('status-selected-date').textContent).toBe('2026-10-12');
+    expect(
+      screen.getByTestId('calendar-cell-2026-10-31').getAttribute('data-is-today'),
+    ).toBe('true');
+
+    // Clock advances another day -> 2026-11-01 00:10 (+08:00), triggered via visibilitychange
+    fakeNow = new Date('2026-10-31T16:10:00.000Z');
+    fireEvent(document, new Event('visibilitychange'));
+    expect(screen.getByTestId('status-today-date').textContent).toBe('2026-11-01');
+    expect(screen.getByTestId('status-selected-date').textContent).toBe('2026-10-12');
+
+    // Pure helper referential stability when todayDate has not changed
+    const navState = createInitialCalendarNavigationState('2026-10-30');
+    expect(refreshCalendarTodayDate(navState, '2026-10-30')).toBe(navState);
+  });
+
+  it('Follow-up #3: clicking Diary (personalOnly) in family space automatically routes back to personal space with a clear notice, and switching to family space leaves Diary tab', () => {
+    render(<StatefulCalendarHarness initialToday="2026-10-30" />);
+
+    // Switch to Family Space
+    fireEvent.click(screen.getByTestId('space-switch-family-fam_01'));
+    expect(screen.getByTestId('status-selected-space').textContent).toBe(
+      '家庭：陳家生活空間',
+    );
+    // Diary tab displays "(個人)" badge while in family space
+    expect(screen.getByTestId('diary-tab-personal-only-badge').textContent).toBe('(個人)');
+
+    // Click Diary tab while in Family Space -> automatically switches back to Personal Space and shows notice
+    fireEvent.click(screen.getByTestId('right-tab-diary'));
+    expect(screen.getByTestId('status-selected-space').textContent).toBe('個人空間');
+    expect(
+      screen.getByTestId('diary-auto-switched-personal-notice').textContent,
+    ).toContain('已自動為您切換回「個人空間」');
+
+    // Now while on Diary tab, switching to Family Space automatically returns activeTab to 'summary'
+    fireEvent.click(screen.getByTestId('space-switch-family-fam_01'));
+    expect(screen.getByTestId('status-selected-space').textContent).toBe(
+      '家庭：陳家生活空間',
+    );
+    expect(screen.getByTestId('right-tab-summary').getAttribute('aria-selected')).toBe(
+      'true',
+    );
   });
 });
