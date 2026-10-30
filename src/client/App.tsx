@@ -1,10 +1,12 @@
 import { type FormEvent, useCallback, useEffect, useState } from 'react';
 import {
+  DATA_OWNERSHIP_SECURITY_NOTICE,
   DEFAULT_TIMEZONE,
   HealthResponseSchema,
   SYNTHETIC_IDENTITY_PRESETS,
   TEST_IDENTITY_SECURITY_NOTICE,
   TestIdentityStateResponseSchema,
+  type AuthorizedSpaceOverview,
   type FamilyDetail,
   type FamilyInvitationSummary,
   type FamilySummary,
@@ -33,6 +35,7 @@ export function App() {
   const [familyDetail, setFamilyDetail] = useState<FamilyDetail | null>(null);
   const [familyLoading, setFamilyLoading] = useState<boolean>(false);
   const [pendingInvitations, setPendingInvitations] = useState<FamilyInvitationSummary[]>([]);
+  const [spaceOverview, setSpaceOverview] = useState<AuthorizedSpaceOverview | null>(null);
 
   // Family form states
   const [newFamilyName, setNewFamilyName] = useState<string>('');
@@ -194,17 +197,40 @@ export function App() {
     };
   }, [baseUrl, fetchIdentityState]);
 
+  const fetchSpaceOverview = useCallback(async () => {
+    const storedSessionId = window.localStorage.getItem(SESSION_STORAGE_KEY);
+    if (!storedSessionId) {
+      setSpaceOverview(null);
+      return;
+    }
+    try {
+      const res = await fetch(`${baseUrl}/api/spaces`, {
+        headers: getAuthHeaders(),
+      });
+      if (res.ok) {
+        const data = (await res.json()) as AuthorizedSpaceOverview;
+        setSpaceOverview(data);
+      } else {
+        setSpaceOverview(null);
+      }
+    } catch {
+      setSpaceOverview(null);
+    }
+  }, [baseUrl]);
+
   useEffect(() => {
     if (identityState?.currentUser) {
       void fetchFamilies();
       void fetchPendingInvitations();
+      void fetchSpaceOverview();
     } else {
       setFamilies([]);
       setSelectedFamilyId(null);
       setFamilyDetail(null);
       setPendingInvitations([]);
+      setSpaceOverview(null);
     }
-  }, [identityState?.currentUser, fetchFamilies, fetchPendingInvitations]);
+  }, [identityState?.currentUser, fetchFamilies, fetchPendingInvitations, fetchSpaceOverview]);
 
   useEffect(() => {
     if (selectedFamilyId) {
@@ -549,7 +575,7 @@ export function App() {
               BillCalendar — 生活行事曆 Demo
             </h1>
             <p className="text-xs text-slate-500">
-              高密度月曆與家庭協作示範應用（階段：P1 測試身份模擬與家庭模型／成員邀請）
+              高密度月曆與家庭協作示範應用（階段：P1 資料擁有權與權限中介層／家庭模型／測試身份模擬）
             </p>
           </div>
 
@@ -948,6 +974,85 @@ export function App() {
                 )}
               </div>
             )}
+          </section>
+        )}
+
+        {/* Data Ownership & Authorization Middleware Section (Issue #4) */}
+        {currentUser && spaceOverview && (
+          <section className="rounded-xl border border-slate-200 bg-white p-6 shadow-xs">
+            <div className="flex flex-wrap items-start justify-between gap-4 border-b border-slate-150 pb-4">
+              <div>
+                <h2 className="text-base font-semibold text-slate-900">
+                  資料擁有權與權限中介層（Issue #4）
+                </h2>
+                <p className="mt-1 text-sm text-slate-600">
+                  統一驗證個人資源（<code>user_id</code>）與家庭資源（<code>family_members</code> 成員資格），並對跨空間來源訊息（<code>source_message_id</code>）執行雙端獨立授權與隱私存在性隔離。
+                </p>
+              </div>
+              <span className="rounded-md border border-amber-300 bg-amber-50 px-2.5 py-1 text-[11px] font-semibold text-amber-900">
+                邏輯隔離驗證（非加密認證）
+              </span>
+            </div>
+
+            <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50/70 p-3 text-xs text-amber-900">
+              {spaceOverview.securityNotice || DATA_OWNERSHIP_SECURITY_NOTICE}
+            </div>
+
+            <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2">
+              <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
+                <h3 className="text-xs font-semibold tracking-wider text-slate-500 uppercase">
+                  個人空間資源歸屬 (owner_user_id = 本人)
+                </h3>
+                <dl className="mt-2.5 space-y-1.5 font-mono text-xs text-slate-700">
+                  <div>
+                    <span className="text-slate-500">Calendar ID: </span>
+                    <span>{spaceOverview.personalSpace.calendarId}</span>
+                  </div>
+                  <div>
+                    <span className="text-slate-500">Task List ID: </span>
+                    <span>{spaceOverview.personalSpace.taskListId}</span>
+                  </div>
+                  <div>
+                    <span className="text-slate-500">Ledger ID: </span>
+                    <span>{spaceOverview.personalSpace.ledgerId}</span>
+                  </div>
+                  <div>
+                    <span className="text-slate-500">Personal Chat (心情) ID: </span>
+                    <span>{spaceOverview.personalSpace.chatRoomId}</span>
+                  </div>
+                </dl>
+              </div>
+
+              <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
+                <h3 className="text-xs font-semibold tracking-wider text-slate-500 uppercase">
+                  已授權家庭空間容器 ({spaceOverview.familySpaces.length} 個家庭)
+                </h3>
+                {spaceOverview.familySpaces.length === 0 ? (
+                  <p className="mt-2.5 text-xs text-slate-500">
+                    目前無已加入的家庭空間；非成員越權存取家庭資源將一律回傳 403/404。
+                  </p>
+                ) : (
+                  <div className="mt-2.5 space-y-2">
+                    {spaceOverview.familySpaces.map((fs) => (
+                      <div
+                        key={fs.familyId}
+                        className="rounded-md border border-slate-200 bg-white p-2.5 text-xs"
+                      >
+                        <div className="flex items-center justify-between font-semibold text-slate-900">
+                          <span>{fs.familyName}</span>
+                          <span className="rounded-xs bg-indigo-50 px-1.5 py-0.5 text-[10px] text-indigo-800">
+                            {fs.role}
+                          </span>
+                        </div>
+                        <p className="mt-1 font-mono text-[11px] text-slate-500">
+                          ChatRoom: {fs.chatRoomId}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
           </section>
         )}
 

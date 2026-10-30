@@ -2,6 +2,7 @@ import { type Context, Hono } from 'hono';
 import { and, desc, eq, sql } from 'drizzle-orm';
 import {
   CreateFamilyRequestSchema,
+  DATA_OWNERSHIP_SECURITY_NOTICE,
   InviteMemberRequestSchema,
   UpdateFamilyRequestSchema,
   UpdateMemberRoleRequestSchema,
@@ -11,7 +12,7 @@ import {
   type FamilyRole,
   type FamilySummary,
 } from '../../shared';
-import { authenticateTestRequest } from '../auth';
+import { authenticateTestRequest, testIdentitySecurityHeadersMiddleware } from '../auth';
 import { createDb } from '../db/client';
 import { families, familyInvitations, familyMembers, users } from '../db/schema';
 import type { Env } from '../index';
@@ -26,6 +27,7 @@ async function requireAuth(c: Context<{ Bindings: Env }>) {
           error: 'TEST_IDENTITY_DISABLED',
           simulationMode: true,
           isAuthenticatedSecurity: false,
+          securityNotice: DATA_OWNERSHIP_SECURITY_NOTICE,
           message: '公開／正式部署已禁用測試 Email 身份模擬；此機制非正式安全驗證。',
         },
         403,
@@ -35,7 +37,16 @@ async function requireAuth(c: Context<{ Bindings: Env }>) {
   if (authRes.status === 'unauthorized' || !authRes.user) {
     return {
       user: null,
-      errorResponse: c.json({ error: 'UNAUTHORIZED', message: '請先選擇或切換測試身份' }, 401),
+      errorResponse: c.json(
+        {
+          error: 'UNAUTHORIZED',
+          simulationMode: true,
+          isAuthenticatedSecurity: false,
+          securityNotice: DATA_OWNERSHIP_SECURITY_NOTICE,
+          message: '請先選擇或切換測試身份',
+        },
+        401,
+      ),
     };
   }
   return { user: authRes.user, errorResponse: null };
@@ -44,11 +55,7 @@ async function requireAuth(c: Context<{ Bindings: Env }>) {
 export function createFamiliesRouter() {
   const router = new Hono<{ Bindings: Env }>();
 
-  router.use('*', async (c, next) => {
-    await next();
-    c.header('X-Identity-Mode', 'unverified-test-simulation');
-    c.header('Cache-Control', 'no-store');
-  });
+  router.use('*', testIdentitySecurityHeadersMiddleware);
 
   // GET /api/families - List all families for current user
   router.get('/', async (c) => {
@@ -731,11 +738,7 @@ export function createFamiliesRouter() {
 export function createInvitationsRouter() {
   const router = new Hono<{ Bindings: Env }>();
 
-  router.use('*', async (c, next) => {
-    await next();
-    c.header('X-Identity-Mode', 'unverified-test-simulation');
-    c.header('Cache-Control', 'no-store');
-  });
+  router.use('*', testIdentitySecurityHeadersMiddleware);
 
   // GET /api/invitations - List pending invitations for current user
   router.get('/', async (c) => {

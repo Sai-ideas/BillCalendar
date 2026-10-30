@@ -2,8 +2,31 @@ import { Hono } from 'hono';
 import { sql } from 'drizzle-orm';
 import { DEFAULT_TIMEZONE, type HealthResponse } from '../shared';
 import { createDb } from './db/client';
-import { appMeta, families, familyInvitations, familyMembers, testSessions, users } from './db/schema';
+import {
+  appMeta,
+  calendars,
+  chatRooms,
+  diaries,
+  events,
+  families,
+  familyInvitations,
+  familyMembers,
+  ledgers,
+  messages,
+  taskLists,
+  tasks,
+  testSessions,
+  users,
+} from './db/schema';
 import { createFamiliesRouter, createInvitationsRouter } from './routes/families';
+import {
+  createChatRoomsRouter,
+  createDiariesRouter,
+  createEventsRouter,
+  createMessagesRouter,
+  createSpacesRouter,
+  createTasksRouter,
+} from './routes/ownership';
 import { createTestIdentityRouter } from './routes/test-identity';
 
 export interface Env {
@@ -18,7 +41,7 @@ function isMissingTableError(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err);
   const causeMessage =
     err instanceof Error && err.cause instanceof Error ? err.cause.message : '';
-  return /no such table:\s*(app_meta|users|test_sessions|families|family_members|family_invitations)/i.test(
+  return /no such table:\s*(app_meta|users|test_sessions|families|family_members|family_invitations|calendars|chat_rooms|messages|events|task_lists|tasks|ledgers|diaries)/i.test(
     `${message} ${causeMessage}`,
   );
 }
@@ -53,6 +76,14 @@ export function createApp() {
           await db.select().from(families).limit(1);
           await db.select().from(familyMembers).limit(1);
           await db.select().from(familyInvitations).limit(1);
+          await db.select().from(calendars).limit(1);
+          await db.select().from(chatRooms).limit(1);
+          await db.select().from(messages).limit(1);
+          await db.select().from(events).limit(1);
+          await db.select().from(taskLists).limit(1);
+          await db.select().from(tasks).limit(1);
+          await db.select().from(ledgers).limit(1);
+          await db.select().from(diaries).limit(1);
           migrated = true;
         } catch (err: unknown) {
           if (isMissingTableError(err)) {
@@ -87,6 +118,12 @@ export function createApp() {
   app.route('/api/test-identity', createTestIdentityRouter());
   app.route('/api/families', createFamiliesRouter());
   app.route('/api/invitations', createInvitationsRouter());
+  app.route('/api/spaces', createSpacesRouter());
+  app.route('/api/diaries', createDiariesRouter());
+  app.route('/api/chat-rooms', createChatRoomsRouter());
+  app.route('/api/messages', createMessagesRouter());
+  app.route('/api/tasks', createTasksRouter());
+  app.route('/api/events', createEventsRouter());
 
   return app;
 }
