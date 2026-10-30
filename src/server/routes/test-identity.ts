@@ -8,71 +8,18 @@ import {
   type SimulatedUser,
   type TestIdentityStateResponse,
 } from '../../shared';
+import { isTestIdentityEnabled, resolveSession, toSimulatedUser } from '../auth';
 import { createDb, type AppDatabase } from '../db/client';
 import { testSessions, users } from '../db/schema';
 import type { Env } from '../index';
 
+export { isTestIdentityEnabled };
+
 const SESSION_DURATION_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
-
-/**
- * Fail-closed gate for synthetic Email identity simulation.
- * Strictly requires APP_ENV === 'development' AND ALLOW_TEST_IDENTITY === 'true'.
- * All other environments (production, staging, preview, or unset) default to disabled.
- */
-export function isTestIdentityEnabled(env?: Env): boolean {
-  if (!env) return false;
-  return env.APP_ENV === 'development' && env.ALLOW_TEST_IDENTITY === 'true';
-}
-
-function toSimulatedUser(row: typeof users.$inferSelect): SimulatedUser {
-  return {
-    id: row.id,
-    emailNormalized: row.emailNormalized,
-    displayName: row.displayName,
-    defaultTimezone: row.defaultTimezone,
-    createdAt: row.createdAt,
-  };
-}
 
 async function listAvailableUsers(db: AppDatabase): Promise<SimulatedUser[]> {
   const rows = await db.select().from(users).orderBy(asc(users.createdAt)).limit(20);
   return rows.map(toSimulatedUser);
-}
-
-async function resolveSession(
-  db: AppDatabase,
-  sessionId: string | null | undefined,
-): Promise<{ sessionId: string | null; expiresAt: string | null; currentUser: SimulatedUser | null }> {
-  const trimmed = sessionId?.trim();
-  if (!trimmed) {
-    return { sessionId: null, expiresAt: null, currentUser: null };
-  }
-
-  const rows = await db
-    .select({
-      session: testSessions,
-      user: users,
-    })
-    .from(testSessions)
-    .innerJoin(users, eq(testSessions.userId, users.id))
-    .where(eq(testSessions.id, trimmed))
-    .limit(1);
-
-  const match = rows[0];
-  if (!match) {
-    return { sessionId: null, expiresAt: null, currentUser: null };
-  }
-
-  if (new Date(match.session.expiresAt).getTime() <= Date.now()) {
-    await db.delete(testSessions).where(eq(testSessions.id, trimmed));
-    return { sessionId: null, expiresAt: null, currentUser: null };
-  }
-
-  return {
-    sessionId: match.session.id,
-    expiresAt: match.session.expiresAt,
-    currentUser: toSimulatedUser(match.user),
-  };
 }
 
 export function createTestIdentityRouter() {
@@ -199,11 +146,11 @@ export function createTestIdentityRouter() {
       await db.delete(testSessions).where(eq(testSessions.id, previousSessionId));
     }
 
-    const sessionId = crypto.randomUUID();
+    const newSessionId = crypto.randomUUID();
     const expiresAt = new Date(Date.now() + SESSION_DURATION_MS).toISOString();
 
     await db.insert(testSessions).values({
-      id: sessionId,
+      id: newSessionId,
       userId: userRow.id,
       expiresAt,
       createdAt: nowIso,
@@ -215,7 +162,7 @@ export function createTestIdentityRouter() {
       simulationMode: true,
       isAuthenticatedSecurity: false,
       securityNotice: TEST_IDENTITY_SECURITY_NOTICE,
-      sessionId,
+      sessionId: newSessionId,
       expiresAt,
       currentUser: toSimulatedUser(userRow),
       availableUsers,

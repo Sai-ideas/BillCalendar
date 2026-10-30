@@ -1,6 +1,6 @@
 # BillCalendar — 生活行事曆 Demo
 
-版本：需求基準 V0.3（2026-10-27）。狀態：Issue #1 專案骨架與 Issue #2 測試 Email 身份模擬已建立（後續功能模組按階段實作中）。
+版本：需求基準 V0.3（2026-10-27）。狀態：Issue #1 專案骨架、Issue #2 測試 Email 身份模擬、Issue #3 家庭模型與示範邀請機制已實作（後續功能模組按階段推進）。
 
 BillCalendar 是在 `Sai-ideas/BillCalendar` 獨立儲存庫開發的示範應用，參考 Jorte 的月曆呈現與 ienon 的家庭協作。核心理念為**資料模組獨立、日期視圖整合**：月曆導航、聊天快速記錄、行程／待辦／記帳／私人日記結構化管理。
 
@@ -19,10 +19,13 @@ BillCalendar 是在 `Sai-ideas/BillCalendar` 獨立儲存庫開發的示範應�
 - [介面與操作流程](docs/UX.md)
 - [實作階段與未決事項](docs/ROADMAP.md)
 - [V0.3 規格審閱與 MVP 架構收斂提案（已審閱）](docs/REVIEW_V0.3.md)
+- [ADR-0001 家庭資料模型、角色權限與受控示範邀請機制](docs/adr/ADR-0001-family-model-and-invitations.md)
 
 ## 專案結構（Single-Repo Vite + Hono + Workers + D1）
 ```text
 BillCalendar/
+├── docs/
+│   └── adr/           # 架構決策紀錄 (ADR)
 ├── src/
 │   ├── client/        # React + TypeScript + Tailwind CSS + Vite 前端
 │   ├── server/        # Cloudflare Workers + Hono API routes + Drizzle D1 連線與 Schema
@@ -76,6 +79,19 @@ npm run db:migrate:local
     - `GET /api/test-identity/state`
     - `POST /api/test-identity/select`
     - `POST /api/test-identity/logout`
+  - 家庭與成員邀請 API（Issue #3）：
+    - `GET /api/families`（取得目前身份所有加入的家庭）
+    - `POST /api/families`（建立新家庭，建立者為 admin）
+    - `GET /api/families/:id`（取得家庭詳情、成員列表與待處理邀請）
+    - `PATCH /api/families/:id`（修改家庭名稱，僅限 admin）
+    - `PATCH /api/families/:id/members/:userId`（變更成員角色／管理員交接，僅限 admin；防護最後一位 admin）
+    - `POST /api/families/:id/invitations`（發送家庭成員邀請，僅限 admin）
+    - `POST /api/families/:id/invitations/:invId/revoke`（撤銷邀請，僅限 admin）
+    - `DELETE /api/families/:id/members/:userId`（移除成員，僅限 admin；防護最後一位 admin）
+    - `POST /api/families/:id/leave`（退出家庭；防護最後一位 admin）
+    - `GET /api/invitations`（受邀者查詢目前待處理之站內邀請清單）
+    - `POST /api/invitations/:id/accept`（受邀者接受邀請加入家庭）
+    - `POST /api/invitations/:id/reject`（受邀者拒絕家庭邀請）
 
 - **分別啟動**：
   ```bash
@@ -87,7 +103,7 @@ npm run db:migrate:local
 ```bash
 npm run typecheck   # TypeScript 前後端型別檢查 (tsc -b)
 npm run build       # 建置前端資產至 dist/client
-npm test            # 執行 Vitest 自動化測試（含空庫 migration、Health API 與測試身份安全邊界驗證）
+npm test            # 執行 Vitest 自動化測試（含空庫 migration、Health API、測試身份安全邊界與家庭模型/邀請/最後管理員保護測試）
 ```
 
 ## 儲存庫界線

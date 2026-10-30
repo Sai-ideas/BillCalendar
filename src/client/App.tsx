@@ -5,6 +5,9 @@ import {
   SYNTHETIC_IDENTITY_PRESETS,
   TEST_IDENTITY_SECURITY_NOTICE,
   TestIdentityStateResponseSchema,
+  type FamilyDetail,
+  type FamilyInvitationSummary,
+  type FamilySummary,
   type HealthResponse,
   type TestIdentityStateResponse,
 } from '../shared';
@@ -24,17 +27,40 @@ export function App() {
   const [emailInput, setEmailInput] = useState<string>('');
   const [displayNameInput, setDisplayNameInput] = useState<string>('');
 
+  // Family state (Issue #3)
+  const [families, setFamilies] = useState<FamilySummary[]>([]);
+  const [selectedFamilyId, setSelectedFamilyId] = useState<string | null>(null);
+  const [familyDetail, setFamilyDetail] = useState<FamilyDetail | null>(null);
+  const [familyLoading, setFamilyLoading] = useState<boolean>(false);
+  const [pendingInvitations, setPendingInvitations] = useState<FamilyInvitationSummary[]>([]);
+
+  // Family form states
+  const [newFamilyName, setNewFamilyName] = useState<string>('');
+  const [inviteEmailInput, setInviteEmailInput] = useState<string>('');
+  const [inviteRoleInput, setInviteRoleInput] = useState<'admin' | 'member'>('member');
+  const [isEditingName, setIsEditingName] = useState<boolean>(false);
+  const [renameInput, setRenameInput] = useState<string>('');
+
+  const [familyMessage, setFamilyMessage] = useState<{
+    type: 'success' | 'error';
+    text: string;
+  } | null>(null);
+
   const baseUrl = import.meta.env.VITE_API_BASE_URL ?? '';
+
+  const getAuthHeaders = (): Record<string, string> => {
+    const storedSessionId = window.localStorage.getItem(SESSION_STORAGE_KEY);
+    const headers: Record<string, string> = {};
+    if (storedSessionId) {
+      headers['X-Test-Session-Id'] = storedSessionId;
+    }
+    return headers;
+  };
 
   const fetchIdentityState = useCallback(async () => {
     setIdentityLoading(true);
     try {
-      const storedSessionId = window.localStorage.getItem(SESSION_STORAGE_KEY);
-      const headers: Record<string, string> = {};
-      if (storedSessionId) {
-        headers['X-Test-Session-Id'] = storedSessionId;
-      }
-
+      const headers = getAuthHeaders();
       const res = await fetch(`${baseUrl}/api/test-identity/state`, { headers });
       const json: unknown = await res.json();
       const parsed = TestIdentityStateResponseSchema.safeParse(json);
@@ -53,6 +79,87 @@ export function App() {
       setIdentityLoading(false);
     }
   }, [baseUrl]);
+
+  const fetchPendingInvitations = useCallback(async () => {
+    const storedSessionId = window.localStorage.getItem(SESSION_STORAGE_KEY);
+    if (!storedSessionId) {
+      setPendingInvitations([]);
+      return;
+    }
+    try {
+      const res = await fetch(`${baseUrl}/api/invitations`, {
+        headers: getAuthHeaders(),
+      });
+      if (res.ok) {
+        const data = (await res.json()) as FamilyInvitationSummary[];
+        setPendingInvitations(data);
+      } else {
+        setPendingInvitations([]);
+      }
+    } catch {
+      setPendingInvitations([]);
+    }
+  }, [baseUrl]);
+
+  const fetchFamilies = useCallback(
+    async (selectIdAfterFetch?: string) => {
+      const storedSessionId = window.localStorage.getItem(SESSION_STORAGE_KEY);
+      if (!storedSessionId) {
+        setFamilies([]);
+        setSelectedFamilyId(null);
+        setFamilyDetail(null);
+        return;
+      }
+      setFamilyLoading(true);
+      try {
+        const res = await fetch(`${baseUrl}/api/families`, {
+          headers: getAuthHeaders(),
+        });
+        if (res.ok) {
+          const data = (await res.json()) as FamilySummary[];
+          setFamilies(data);
+          const targetId = selectIdAfterFetch ?? selectedFamilyId ?? data[0]?.id ?? null;
+          if (targetId && data.some((f) => f.id === targetId)) {
+            setSelectedFamilyId(targetId);
+          } else if (data.length > 0) {
+            setSelectedFamilyId(data[0].id);
+          } else {
+            setSelectedFamilyId(null);
+            setFamilyDetail(null);
+          }
+        } else {
+          setFamilies([]);
+          setSelectedFamilyId(null);
+          setFamilyDetail(null);
+        }
+      } catch {
+        setFamilies([]);
+      } finally {
+        setFamilyLoading(false);
+      }
+    },
+    [baseUrl, selectedFamilyId],
+  );
+
+  const fetchFamilyDetail = useCallback(
+    async (id: string) => {
+      try {
+        const res = await fetch(`${baseUrl}/api/families/${id}`, {
+          headers: getAuthHeaders(),
+        });
+        if (res.ok) {
+          const detail = (await res.json()) as FamilyDetail;
+          setFamilyDetail(detail);
+          setRenameInput(detail.name);
+        } else {
+          setFamilyDetail(null);
+        }
+      } catch {
+        setFamilyDetail(null);
+      }
+    },
+    [baseUrl],
+  );
 
   useEffect(() => {
     let active = true;
@@ -87,17 +194,35 @@ export function App() {
     };
   }, [baseUrl, fetchIdentityState]);
 
+  useEffect(() => {
+    if (identityState?.currentUser) {
+      void fetchFamilies();
+      void fetchPendingInvitations();
+    } else {
+      setFamilies([]);
+      setSelectedFamilyId(null);
+      setFamilyDetail(null);
+      setPendingInvitations([]);
+    }
+  }, [identityState?.currentUser, fetchFamilies, fetchPendingInvitations]);
+
+  useEffect(() => {
+    if (selectedFamilyId) {
+      void fetchFamilyDetail(selectedFamilyId);
+    } else {
+      setFamilyDetail(null);
+    }
+  }, [selectedFamilyId, fetchFamilyDetail]);
+
   const handleSelectIdentity = async (email: string, displayName?: string) => {
     setSubmitting(true);
     setIdentityError(null);
+    setFamilyMessage(null);
     try {
-      const storedSessionId = window.localStorage.getItem(SESSION_STORAGE_KEY);
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
+        ...getAuthHeaders(),
       };
-      if (storedSessionId) {
-        headers['X-Test-Session-Id'] = storedSessionId;
-      }
 
       const res = await fetch(`${baseUrl}/api/test-identity/select`, {
         method: 'POST',
@@ -121,6 +246,7 @@ export function App() {
       setIdentityState(parsed);
       setEmailInput('');
       setDisplayNameInput('');
+      setSelectedFamilyId(null);
     } catch (err: unknown) {
       setIdentityError(err instanceof Error ? err.message : '切換測試身份失敗');
     } finally {
@@ -137,22 +263,21 @@ export function App() {
   const handleLogout = async () => {
     setSubmitting(true);
     setIdentityError(null);
+    setFamilyMessage(null);
     try {
-      const storedSessionId = window.localStorage.getItem(SESSION_STORAGE_KEY);
-      const headers: Record<string, string> = {};
-      if (storedSessionId) {
-        headers['X-Test-Session-Id'] = storedSessionId;
-      }
-
       const res = await fetch(`${baseUrl}/api/test-identity/logout`, {
         method: 'POST',
-        headers,
+        headers: getAuthHeaders(),
       });
 
       const json: unknown = await res.json();
       const parsed = TestIdentityStateResponseSchema.parse(json);
       window.localStorage.removeItem(SESSION_STORAGE_KEY);
       setIdentityState(parsed);
+      setFamilies([]);
+      setSelectedFamilyId(null);
+      setFamilyDetail(null);
+      setPendingInvitations([]);
     } catch (err: unknown) {
       setIdentityError(err instanceof Error ? err.message : '清除測試身份失敗');
     } finally {
@@ -160,7 +285,247 @@ export function App() {
     }
   };
 
+  // Family handlers
+  const handleCreateFamily = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!newFamilyName.trim()) return;
+    setFamilyMessage(null);
+    try {
+      const res = await fetch(`${baseUrl}/api/families`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(),
+        },
+        body: JSON.stringify({ name: newFamilyName.trim() }),
+      });
+      const data = (await res.json()) as { id?: string; message?: string };
+      if (!res.ok) {
+        throw new Error(data.message ?? '建立家庭失敗');
+      }
+      setNewFamilyName('');
+      setFamilyMessage({ type: 'success', text: '家庭建立成功！您已成為管理員。' });
+      await fetchFamilies(data.id);
+    } catch (err: unknown) {
+      setFamilyMessage({
+        type: 'error',
+        text: err instanceof Error ? err.message : '建立家庭失敗',
+      });
+    }
+  };
+
+  const handleRenameFamily = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!selectedFamilyId || !renameInput.trim()) return;
+    setFamilyMessage(null);
+    try {
+      const res = await fetch(`${baseUrl}/api/families/${selectedFamilyId}`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(),
+        },
+        body: JSON.stringify({ name: renameInput.trim() }),
+      });
+      const data = (await res.json()) as { message?: string };
+      if (!res.ok) {
+        throw new Error(data.message ?? '修改家庭名稱失敗');
+      }
+      setIsEditingName(false);
+      setFamilyMessage({ type: 'success', text: '家庭名稱已更新！' });
+      await fetchFamilies(selectedFamilyId);
+      await fetchFamilyDetail(selectedFamilyId);
+    } catch (err: unknown) {
+      setFamilyMessage({
+        type: 'error',
+        text: err instanceof Error ? err.message : '修改名稱失敗',
+      });
+    }
+  };
+
+  const handleSendInvite = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!selectedFamilyId || !inviteEmailInput.trim()) return;
+    setFamilyMessage(null);
+    try {
+      const res = await fetch(`${baseUrl}/api/families/${selectedFamilyId}/invitations`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(),
+        },
+        body: JSON.stringify({
+          email: inviteEmailInput.trim(),
+          role: inviteRoleInput,
+        }),
+      });
+      const data = (await res.json()) as { message?: string };
+      if (!res.ok) {
+        throw new Error(data.message ?? '發送邀請失敗');
+      }
+      setInviteEmailInput('');
+      setFamilyMessage({ type: 'success', text: '邀請已送出！受邀者切換登入後即可在站內接受。' });
+      await fetchFamilyDetail(selectedFamilyId);
+    } catch (err: unknown) {
+      setFamilyMessage({
+        type: 'error',
+        text: err instanceof Error ? err.message : '發送邀請失敗',
+      });
+    }
+  };
+
+  const handleRevokeInvite = async (invitationId: string) => {
+    if (!selectedFamilyId) return;
+    setFamilyMessage(null);
+    try {
+      const res = await fetch(
+        `${baseUrl}/api/families/${selectedFamilyId}/invitations/${invitationId}/revoke`,
+        {
+          method: 'POST',
+          headers: getAuthHeaders(),
+        },
+      );
+      const data = (await res.json()) as { message?: string };
+      if (!res.ok) {
+        throw new Error(data.message ?? '撤銷邀請失敗');
+      }
+      setFamilyMessage({ type: 'success', text: '邀請已撤銷' });
+      await fetchFamilyDetail(selectedFamilyId);
+    } catch (err: unknown) {
+      setFamilyMessage({
+        type: 'error',
+        text: err instanceof Error ? err.message : '撤銷邀請失敗',
+      });
+    }
+  };
+
+  const handleRemoveMember = async (userId: string, displayName: string) => {
+    if (!selectedFamilyId) return;
+    if (!confirm(`確定要將 ${displayName} 從家庭中移除嗎？`)) return;
+    setFamilyMessage(null);
+    try {
+      const res = await fetch(`${baseUrl}/api/families/${selectedFamilyId}/members/${userId}`, {
+        method: 'DELETE',
+        headers: getAuthHeaders(),
+      });
+      const data = (await res.json()) as { message?: string };
+      if (!res.ok) {
+        throw new Error(data.message ?? '移除成員失敗');
+      }
+      setFamilyMessage({ type: 'success', text: `已移除成員 ${displayName}` });
+      await fetchFamilyDetail(selectedFamilyId);
+      await fetchFamilies(selectedFamilyId);
+    } catch (err: unknown) {
+      setFamilyMessage({
+        type: 'error',
+        text: err instanceof Error ? err.message : '移除成員失敗',
+      });
+    }
+  };
+
+  const handleUpdateMemberRole = async (
+    userId: string,
+    newRole: 'admin' | 'member',
+    displayName: string,
+  ) => {
+    if (!selectedFamilyId) return;
+    setFamilyMessage(null);
+    try {
+      const res = await fetch(`${baseUrl}/api/families/${selectedFamilyId}/members/${userId}`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(),
+        },
+        body: JSON.stringify({ role: newRole }),
+      });
+      const data = (await res.json()) as { message?: string };
+      if (!res.ok) {
+        throw new Error(data.message ?? '變更成員角色失敗');
+      }
+      setFamilyMessage({
+        type: 'success',
+        text: `已成功將 ${displayName} 的角色變更為 ${newRole === 'admin' ? '管理員' : '一般成員'}`,
+      });
+      await fetchFamilyDetail(selectedFamilyId);
+      await fetchFamilies(selectedFamilyId);
+    } catch (err: unknown) {
+      setFamilyMessage({
+        type: 'error',
+        text: err instanceof Error ? err.message : '變更成員角色失敗',
+      });
+    }
+  };
+
+  const handleLeaveFamily = async () => {
+    if (!selectedFamilyId || !familyDetail) return;
+    if (!confirm(`確定要退出「${familyDetail.name}」嗎？退出後您將無法再存取該家庭空間。`)) return;
+    setFamilyMessage(null);
+    try {
+      const res = await fetch(`${baseUrl}/api/families/${selectedFamilyId}/leave`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+      });
+      const data = (await res.json()) as { message?: string };
+      if (!res.ok) {
+        throw new Error(data.message ?? '退出家庭失敗');
+      }
+      setFamilyMessage({ type: 'success', text: `已成功退出「${familyDetail.name}」` });
+      setSelectedFamilyId(null);
+      await fetchFamilies();
+    } catch (err: unknown) {
+      setFamilyMessage({
+        type: 'error',
+        text: err instanceof Error ? err.message : '退出家庭失敗',
+      });
+    }
+  };
+
+  const handleAcceptInvite = async (invitationId: string) => {
+    setFamilyMessage(null);
+    try {
+      const res = await fetch(`${baseUrl}/api/invitations/${invitationId}/accept`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+      });
+      const data = (await res.json()) as { familyId?: string; message?: string };
+      if (!res.ok) {
+        throw new Error(data.message ?? '接受邀請失敗');
+      }
+      setFamilyMessage({ type: 'success', text: '已加入家庭！' });
+      await fetchPendingInvitations();
+      await fetchFamilies(data.familyId);
+    } catch (err: unknown) {
+      setFamilyMessage({
+        type: 'error',
+        text: err instanceof Error ? err.message : '接受邀請失敗',
+      });
+    }
+  };
+
+  const handleRejectInvite = async (invitationId: string) => {
+    setFamilyMessage(null);
+    try {
+      const res = await fetch(`${baseUrl}/api/invitations/${invitationId}/reject`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+      });
+      const data = (await res.json()) as { message?: string };
+      if (!res.ok) {
+        throw new Error(data.message ?? '拒絕邀請失敗');
+      }
+      setFamilyMessage({ type: 'success', text: '已拒絕家庭邀請' });
+      await fetchPendingInvitations();
+    } catch (err: unknown) {
+      setFamilyMessage({
+        type: 'error',
+        text: err instanceof Error ? err.message : '拒絕邀請失敗',
+      });
+    }
+  };
+
   const currentUser = identityState?.currentUser ?? null;
+  const isAdmin = familyDetail?.myRole === 'admin';
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
@@ -184,7 +549,7 @@ export function App() {
               BillCalendar — 生活行事曆 Demo
             </h1>
             <p className="text-xs text-slate-500">
-              高密度月曆與家庭協作示範應用（目前階段：P1 測試身份模擬與系統骨架）
+              高密度月曆與家庭協作示範應用（階段：P1 測試身份模擬與家庭模型／成員邀請）
             </p>
           </div>
 
@@ -207,6 +572,386 @@ export function App() {
       </header>
 
       <main className="mx-auto max-w-5xl space-y-6 px-6 py-8">
+        {/* Global Action Message */}
+        {familyMessage && (
+          <div
+            role="alert"
+            className={`flex items-center justify-between rounded-lg border px-4 py-3 text-sm font-medium ${
+              familyMessage.type === 'success'
+                ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+                : 'border-red-200 bg-red-50 text-red-700'
+            }`}
+          >
+            <span>{familyMessage.text}</span>
+            <button
+              type="button"
+              onClick={() => setFamilyMessage(null)}
+              className="text-xs underline hover:no-underline"
+            >
+              關閉
+            </button>
+          </div>
+        )}
+
+        {/* Pending Invitations Banner (Issue #3) */}
+        {currentUser && pendingInvitations.length > 0 && (
+          <section className="rounded-xl border border-indigo-200 bg-indigo-50/80 p-5 shadow-xs">
+            <div className="flex items-center gap-2">
+              <span className="inline-flex h-2.5 w-2.5 rounded-full bg-indigo-600 animate-pulse" />
+              <h2 className="text-sm font-bold text-indigo-950">
+                待接受的家庭邀請（{pendingInvitations.length} 則）
+              </h2>
+            </div>
+            <div className="mt-3 space-y-3">
+              {pendingInvitations.map((inv) => (
+                <div
+                  key={inv.id}
+                  className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-indigo-100 bg-white p-3 shadow-xs"
+                >
+                  <div>
+                    <p className="text-sm font-semibold text-slate-900">
+                      「{inv.familyName}」邀請您加入
+                    </p>
+                    <p className="text-xs text-slate-600">
+                      邀請人：{inv.invitedByDisplayName} ｜ 指派角色：
+                      <span className="font-semibold text-slate-800">
+                        {inv.role === 'admin' ? '管理員 (admin)' : '成員 (member)'}
+                      </span>
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => void handleAcceptInvite(inv.id)}
+                      className="rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-indigo-700"
+                    >
+                      接受加入
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void handleRejectInvite(inv.id)}
+                      className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                    >
+                      拒絕
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
+
+        {/* Family Model & Collaboration Section (Issue #3) */}
+        {currentUser && (
+          <section className="rounded-xl border border-slate-200 bg-white p-6 shadow-xs">
+            <div className="flex flex-wrap items-start justify-between gap-4 border-b border-slate-150 pb-4">
+              <div>
+                <h2 className="text-base font-semibold text-slate-900">
+                  家庭模型、成員與示範邀請（Issue #3）
+                </h2>
+                <p className="mt-1 text-sm text-slate-600">
+                  支援單一使用者加入多個家庭空間、成員角色（admin / member）權限邊界、站內邀請與最後管理員退出防護。
+                </p>
+              </div>
+
+              {/* Create new family form inline */}
+              <form onSubmit={handleCreateFamily} className="flex items-center gap-2">
+                <input
+                  type="text"
+                  placeholder="輸入新家庭名稱..."
+                  value={newFamilyName}
+                  onChange={(e) => setNewFamilyName(e.target.value)}
+                  className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs text-slate-900 focus:border-indigo-600 focus:outline-hidden"
+                />
+                <button
+                  type="submit"
+                  disabled={!newFamilyName.trim()}
+                  className="rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-indigo-700 disabled:opacity-50"
+                >
+                  + 建立家庭
+                </button>
+              </form>
+            </div>
+
+            {/* Families Tabs / Switcher */}
+            <div className="mt-5">
+              <div className="flex items-center justify-between">
+                <h3 className="text-xs font-semibold tracking-wider text-slate-500 uppercase">
+                  我的家庭空間（點選切換）
+                </h3>
+                {familyLoading && <span className="text-xs text-slate-400">更新中...</span>}
+              </div>
+
+              {families.length === 0 ? (
+                <div className="mt-3 rounded-lg border border-dashed border-slate-300 p-6 text-center text-sm text-slate-500">
+                  您目前尚未加入任何家庭。請在上方建立新家庭，或由其他成員透過虛構 Email 發送邀請！
+                </div>
+              ) : (
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {families.map((fam) => {
+                    const isSelected = selectedFamilyId === fam.id;
+                    return (
+                      <button
+                        key={fam.id}
+                        type="button"
+                        onClick={() => setSelectedFamilyId(fam.id)}
+                        className={`flex items-center gap-2 rounded-lg border px-3.5 py-2 text-xs font-medium transition ${
+                          isSelected
+                            ? 'border-indigo-600 bg-indigo-50 text-indigo-900 ring-1 ring-indigo-600'
+                            : 'border-slate-200 bg-white text-slate-700 hover:border-slate-300 hover:bg-slate-50'
+                        }`}
+                      >
+                        <span className="font-semibold">{fam.name}</span>
+                        <span
+                          className={`rounded-sm px-1.5 py-0.5 text-[10px] font-semibold ${
+                            fam.myRole === 'admin'
+                              ? 'bg-purple-100 text-purple-800'
+                              : 'bg-slate-100 text-slate-700'
+                          }`}
+                        >
+                          {fam.myRole === 'admin' ? '管理員' : '成員'}
+                        </span>
+                        <span className="text-[11px] text-slate-400">({fam.memberCount} 人)</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {/* Selected Family Detail Workspace */}
+            {familyDetail && (
+              <div className="mt-6 rounded-xl border border-slate-200 bg-slate-50/60 p-5">
+                <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-200 pb-4">
+                  <div className="flex items-center gap-3">
+                    {isEditingName && isAdmin ? (
+                      <form onSubmit={handleRenameFamily} className="flex items-center gap-2">
+                        <input
+                          type="text"
+                          value={renameInput}
+                          onChange={(e) => setRenameInput(e.target.value)}
+                          className="rounded-md border border-slate-300 bg-white px-2.5 py-1 text-sm font-semibold text-slate-900 focus:border-indigo-600 focus:outline-hidden"
+                        />
+                        <button
+                          type="submit"
+                          className="rounded-md bg-slate-900 px-2.5 py-1 text-xs font-semibold text-white hover:bg-slate-800"
+                        >
+                          儲存
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setIsEditingName(false);
+                            setRenameInput(familyDetail.name);
+                          }}
+                          className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs text-slate-700 hover:bg-slate-50"
+                        >
+                          取消
+                        </button>
+                      </form>
+                    ) : (
+                      <div className="flex items-center gap-2">
+                        <h3 className="text-base font-bold text-slate-900">{familyDetail.name}</h3>
+                        {isAdmin && (
+                          <button
+                            type="button"
+                            onClick={() => setIsEditingName(true)}
+                            className="text-xs text-slate-500 hover:text-indigo-600 underline"
+                          >
+                            修改名稱
+                          </button>
+                        )}
+                      </div>
+                    )}
+
+                    <span
+                      className={`rounded-sm px-2 py-0.5 text-xs font-semibold ${
+                        familyDetail.myRole === 'admin'
+                          ? 'bg-purple-100 text-purple-800'
+                          : 'bg-slate-200 text-slate-800'
+                      }`}
+                    >
+                      您的角色：{familyDetail.myRole === 'admin' ? '管理員 (admin)' : '一般成員 (member)'}
+                    </span>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => void handleLeaveFamily()}
+                    className="rounded-lg border border-red-200 bg-white px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50"
+                  >
+                    退出該家庭
+                  </button>
+                </div>
+
+                {/* Family Members List */}
+                <div className="mt-5">
+                  <h4 className="text-xs font-semibold tracking-wider text-slate-500 uppercase">
+                    現有成員列表（{familyDetail.members.length} 人）
+                  </h4>
+                  <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                    {familyDetail.members.map((m) => {
+                      const isMe = m.userId === currentUser.id;
+                      return (
+                        <div
+                          key={m.id}
+                          className="flex items-center justify-between rounded-lg border border-slate-200 bg-white p-3 shadow-2xs"
+                        >
+                          <div>
+                            <div className="flex items-center gap-2">
+                              <span className="text-sm font-semibold text-slate-900">
+                                {m.displayName}
+                              </span>
+                              {isMe && (
+                                <span className="rounded-sm bg-indigo-50 px-1.5 py-0.2 text-[10px] font-bold text-indigo-700">
+                                  本人
+                                </span>
+                              )}
+                            </div>
+                            <p className="font-mono text-xs text-slate-500">{m.emailNormalized}</p>
+                            <span
+                              className={`mt-1 inline-block rounded-xs px-1.5 py-0.5 text-[10px] font-medium ${
+                                m.role === 'admin'
+                                  ? 'bg-purple-50 text-purple-700'
+                                  : 'bg-slate-100 text-slate-600'
+                              }`}
+                            >
+                              {m.role === 'admin' ? '管理員' : '一般成員'}
+                            </span>
+                          </div>
+
+                          {isAdmin && !isMe && (
+                            <div className="flex items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  void handleUpdateMemberRole(
+                                    m.userId,
+                                    m.role === 'admin' ? 'member' : 'admin',
+                                    m.displayName,
+                                  )
+                                }
+                                className="rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-50"
+                              >
+                                {m.role === 'admin' ? '降為成員' : '升為管理員'}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => void handleRemoveMember(m.userId, m.displayName)}
+                                className="rounded-md border border-slate-200 px-2 py-1 text-[11px] font-medium text-red-600 hover:border-red-300 hover:bg-red-50"
+                              >
+                                移除
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Admin-only Invitation Management */}
+                {isAdmin ? (
+                  <div className="mt-6 border-t border-slate-200 pt-5">
+                    <h4 className="text-xs font-semibold tracking-wider text-slate-500 uppercase">
+                      發送新成員邀請（限管理員）
+                    </h4>
+                    <form onSubmit={handleSendInvite} className="mt-3 space-y-3">
+                      <div className="flex flex-wrap items-center gap-3">
+                        <div className="flex-1 min-w-[240px]">
+                          <input
+                            type="email"
+                            required
+                            placeholder="輸入受邀者 Email（限 *.test，例如 bob.demo@billcalendar.test）"
+                            value={inviteEmailInput}
+                            onChange={(e) => setInviteEmailInput(e.target.value)}
+                            className="w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs text-slate-900 focus:border-indigo-600 focus:outline-hidden"
+                          />
+                        </div>
+                        <select
+                          value={inviteRoleInput}
+                          onChange={(e) =>
+                            setInviteRoleInput(e.target.value as 'admin' | 'member')
+                          }
+                          className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs text-slate-900 focus:border-indigo-600 focus:outline-hidden"
+                        >
+                          <option value="member">指派角色：一般成員 (member)</option>
+                          <option value="admin">指派角色：管理員 (admin)</option>
+                        </select>
+                        <button
+                          type="submit"
+                          disabled={!inviteEmailInput.trim()}
+                          className="rounded-lg bg-slate-900 px-4 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-50"
+                        >
+                          發送邀請
+                        </button>
+                      </div>
+
+                      {/* Quick preset invite buttons */}
+                      <div className="flex flex-wrap items-center gap-2 pt-1 text-xs text-slate-500">
+                        <span>快速帶入示範預設：</span>
+                        {SYNTHETIC_IDENTITY_PRESETS.filter(
+                          (p) => p.email !== currentUser.emailNormalized,
+                        ).map((preset) => (
+                          <button
+                            key={preset.email}
+                            type="button"
+                            onClick={() => setInviteEmailInput(preset.email)}
+                            className="rounded-md border border-slate-300 bg-white px-2 py-0.5 text-[11px] text-slate-700 hover:bg-slate-50"
+                          >
+                            + {preset.displayName} ({preset.email})
+                          </button>
+                        ))}
+                      </div>
+                    </form>
+
+                    {/* Pending sent invitations */}
+                    {familyDetail.pendingInvitations &&
+                      familyDetail.pendingInvitations.length > 0 && (
+                        <div className="mt-5">
+                          <h5 className="text-xs font-semibold text-slate-600">
+                            已發出且待接受的邀請（
+                            {familyDetail.pendingInvitations.length} 筆）
+                          </h5>
+                          <div className="mt-2 space-y-2">
+                            {familyDetail.pendingInvitations.map((inv) => (
+                              <div
+                                key={inv.id}
+                                className="flex items-center justify-between rounded-lg border border-amber-200 bg-amber-50/50 p-2.5 text-xs"
+                              >
+                                <div>
+                                  <span className="font-semibold text-slate-900">
+                                    {inv.invitedEmail}
+                                  </span>
+                                  <span className="ml-2 text-slate-500">
+                                    （{inv.role === 'admin' ? '管理員' : '一般成員'}，邀請於{' '}
+                                    {new Date(inv.createdAt).toLocaleTimeString()}）
+                                  </span>
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={() => void handleRevokeInvite(inv.id)}
+                                  className="rounded-md border border-amber-300 bg-white px-2 py-1 text-[11px] font-medium text-amber-900 hover:bg-amber-100"
+                                >
+                                  撤銷邀請
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                  </div>
+                ) : (
+                  <div className="mt-6 border-t border-slate-200 pt-4 text-xs text-slate-500">
+                    ℹ️ 一般成員僅能檢視家庭成員與退出家庭，成員管理與發送邀請權限僅限管理員。
+                  </div>
+                )}
+              </div>
+            )}
+          </section>
+        )}
+
+        {/* Synthetic Identity Picker Section (Issue #2) */}
         <section className="rounded-xl border border-slate-200 bg-white p-6 shadow-xs">
           <div className="flex flex-wrap items-start justify-between gap-4">
             <div>
@@ -406,6 +1151,7 @@ export function App() {
           )}
         </section>
 
+        {/* Project Scaffold & Health Status (Issue #1) */}
         <section className="rounded-xl border border-slate-200 bg-white p-6 shadow-xs">
           <h2 className="text-base font-semibold text-slate-900">
             專案骨架與系統狀態（Issue #1）
