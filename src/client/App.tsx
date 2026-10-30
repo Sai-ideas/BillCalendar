@@ -10,9 +10,12 @@ import {
   type FamilyDetail,
   type FamilyInvitationSummary,
   type FamilySummary,
+  createInitialCalendarNavigationState,
+  type CalendarNavigationState,
   type HealthResponse,
   type TestIdentityStateResponse,
 } from '../shared';
+import { CalendarWorkspace } from './components/CalendarWorkspace';
 
 const SESSION_STORAGE_KEY = 'bc_test_session_id';
 
@@ -36,6 +39,11 @@ export function App() {
   const [familyLoading, setFamilyLoading] = useState<boolean>(false);
   const [pendingInvitations, setPendingInvitations] = useState<FamilyInvitationSummary[]>([]);
   const [spaceOverview, setSpaceOverview] = useState<AuthorizedSpaceOverview | null>(null);
+
+  // Calendar & Right Panel Tabs state (Issue #5)
+  const [calendarNavState, setCalendarNavState] = useState<CalendarNavigationState>(() =>
+    createInitialCalendarNavigationState(),
+  );
 
   // Family form states
   const [newFamilyName, setNewFamilyName] = useState<string>('');
@@ -597,7 +605,14 @@ export function App() {
         </div>
       </header>
 
-      <main className="mx-auto max-w-5xl space-y-6 px-6 py-8">
+      <main className="mx-auto max-w-6xl space-y-6 px-4 py-6 sm:px-6">
+        {/* Main Calendar Layout & Right-Hand Function Tabs (Issue #5) */}
+        <CalendarWorkspace
+          navState={calendarNavState}
+          onChangeNavState={setCalendarNavState}
+          families={families}
+          onSelectFamilySpace={(fid) => setSelectedFamilyId(fid)}
+        />
         {/* Global Action Message */}
         {familyMessage && (
           <div
