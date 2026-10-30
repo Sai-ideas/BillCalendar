@@ -1,9 +1,27 @@
-import type { Context } from 'hono';
+import type { Context, MiddlewareHandler } from 'hono';
 import { eq } from 'drizzle-orm';
-import type { SimulatedUser } from '../shared';
+import {
+  DATA_OWNERSHIP_SECURITY_NOTICE,
+  type FamilyRole,
+  type SimulatedUser,
+} from '../shared';
 import { createDb, type AppDatabase } from './db/client';
 import { testSessions, users } from './db/schema';
 import type { Env } from './index';
+
+export interface AuthVariables {
+  currentUser: SimulatedUser;
+  db: AppDatabase;
+  familyMembership?: {
+    familyId: string;
+    role: FamilyRole;
+  };
+}
+
+export type AuthAppEnv = {
+  Bindings: Env;
+  Variables: AuthVariables;
+};
 
 /**
  * Fail-closed gate for synthetic Email identity simulation.
@@ -101,3 +119,72 @@ export async function getAuthenticatedUser(
   }
   return null;
 }
+
+/**
+ * Unified middleware that attaches test-mode security headers and disables caching on API responses.
+ */
+export const testIdentitySecurityHeadersMiddleware: MiddlewareHandler<{ Bindings: Env }> = async (
+  c,
+  next,
+) => {
+  await next();
+  c.header('X-Identity-Mode', 'unverified-test-simulation');
+  c.header(
+    'X-Security-Warning',
+    'Test identity simulation only verifies logical isolation and provides no real authentication security.',
+  );
+  c.header('Cache-Control', 'no-store');
+};
+
+/**
+ * Unified authentication middleware (Issue #4).
+ * Enforces the fail-closed test identity environment gate, resolves the current synthetic user,
+ * and populates `currentUser` and `db` on the Hono context.
+ */
+export const requireAuthMiddleware: MiddlewareHandler<AuthAppEnv> = async (c, next) => {
+  if (!isTestIdentityEnabled(c.env)) {
+    return c.json(
+      {
+        error: 'TEST_IDENTITY_DISABLED',
+        simulationMode: true,
+        isAuthenticatedSecurity: false,
+        securityNotice: DATA_OWNERSHIP_SECURITY_NOTICE,
+        message: '公開／正式部署已禁用測試 Email 身份模擬；此機制非正式安全驗證。',
+      },
+      403,
+    );
+  }
+
+  if (!c.env?.DB) {
+    return c.json(
+      {
+        error: 'DB_NOT_CONFIGURED',
+        simulationMode: true,
+        isAuthenticatedSecurity: false,
+        securityNotice: DATA_OWNERSHIP_SECURITY_NOTICE,
+        message: 'D1 database binding is missing',
+      },
+      503,
+    );
+  }
+
+  const db = createDb(c.env.DB);
+  const sessionHeader = c.req.header('X-Test-Session-Id');
+  const { currentUser } = await resolveSession(db, sessionHeader);
+  if (!currentUser) {
+    return c.json(
+      {
+        error: 'UNAUTHORIZED',
+        simulationMode: true,
+        isAuthenticatedSecurity: false,
+        securityNotice: DATA_OWNERSHIP_SECURITY_NOTICE,
+        message: '請先選擇或切換測試身份',
+      },
+      401,
+    );
+  }
+
+  c.set('currentUser', currentUser);
+  c.set('db', db);
+  await next();
+};
