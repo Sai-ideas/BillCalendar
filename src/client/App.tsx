@@ -11,6 +11,8 @@ import {
   type FamilyInvitationSummary,
   type FamilySummary,
   createInitialCalendarNavigationState,
+  reconcileCalendarSelectedSpace,
+  resetCalendarSelectedSpaceToPersonal,
   type CalendarNavigationState,
   type HealthResponse,
   type TestIdentityStateResponse,
@@ -40,7 +42,7 @@ export function App() {
   const [pendingInvitations, setPendingInvitations] = useState<FamilyInvitationSummary[]>([]);
   const [spaceOverview, setSpaceOverview] = useState<AuthorizedSpaceOverview | null>(null);
 
-  // Calendar & Right Panel Tabs state (Issue #5)
+  // Calendar & Right Panel Tabs state (Issue #5 & #6)
   const [calendarNavState, setCalendarNavState] = useState<CalendarNavigationState>(() =>
     createInitialCalendarNavigationState(),
   );
@@ -83,6 +85,7 @@ export function App() {
       setIdentityError(null);
       if (!parsed.data.sessionId) {
         window.localStorage.removeItem(SESSION_STORAGE_KEY);
+        setCalendarNavState((prev) => resetCalendarSelectedSpaceToPersonal(prev));
       }
     } catch (err: unknown) {
       setIdentityError(err instanceof Error ? err.message : '無法讀取測試身份狀態');
@@ -119,6 +122,7 @@ export function App() {
         setFamilies([]);
         setSelectedFamilyId(null);
         setFamilyDetail(null);
+        setCalendarNavState((prev) => resetCalendarSelectedSpaceToPersonal(prev));
         return;
       }
       setFamilyLoading(true);
@@ -129,6 +133,13 @@ export function App() {
         if (res.ok) {
           const data = (await res.json()) as FamilySummary[];
           setFamilies(data);
+          // Reconcile calendarNavState.selectedSpace against authorized family IDs (PR #25 Follow-up #1)
+          setCalendarNavState((prev) =>
+            reconcileCalendarSelectedSpace(
+              prev,
+              data.map((f) => f.id),
+            ),
+          );
           const targetId = selectIdAfterFetch ?? selectedFamilyId ?? data[0]?.id ?? null;
           if (targetId && data.some((f) => f.id === targetId)) {
             setSelectedFamilyId(targetId);
@@ -142,9 +153,11 @@ export function App() {
           setFamilies([]);
           setSelectedFamilyId(null);
           setFamilyDetail(null);
+          setCalendarNavState((prev) => resetCalendarSelectedSpaceToPersonal(prev));
         }
       } catch {
         setFamilies([]);
+        setCalendarNavState((prev) => resetCalendarSelectedSpaceToPersonal(prev));
       } finally {
         setFamilyLoading(false);
       }
@@ -237,6 +250,7 @@ export function App() {
       setFamilyDetail(null);
       setPendingInvitations([]);
       setSpaceOverview(null);
+      setCalendarNavState((prev) => resetCalendarSelectedSpaceToPersonal(prev));
     }
   }, [identityState?.currentUser, fetchFamilies, fetchPendingInvitations, fetchSpaceOverview]);
 
@@ -281,6 +295,8 @@ export function App() {
       setEmailInput('');
       setDisplayNameInput('');
       setSelectedFamilyId(null);
+      // Synchronously reset calendarNavState.selectedSpace to personal on identity switch (PR #25 Follow-up #1)
+      setCalendarNavState((prev) => resetCalendarSelectedSpaceToPersonal(prev));
     } catch (err: unknown) {
       setIdentityError(err instanceof Error ? err.message : '切換測試身份失敗');
     } finally {
@@ -312,6 +328,7 @@ export function App() {
       setSelectedFamilyId(null);
       setFamilyDetail(null);
       setPendingInvitations([]);
+      setCalendarNavState((prev) => resetCalendarSelectedSpaceToPersonal(prev));
     } catch (err: unknown) {
       setIdentityError(err instanceof Error ? err.message : '清除測試身份失敗');
     } finally {
@@ -493,10 +510,11 @@ export function App() {
 
   const handleLeaveFamily = async () => {
     if (!selectedFamilyId || !familyDetail) return;
+    const leavingFamilyId = selectedFamilyId;
     if (!confirm(`確定要退出「${familyDetail.name}」嗎？退出後您將無法再存取該家庭空間。`)) return;
     setFamilyMessage(null);
     try {
-      const res = await fetch(`${baseUrl}/api/families/${selectedFamilyId}/leave`, {
+      const res = await fetch(`${baseUrl}/api/families/${leavingFamilyId}/leave`, {
         method: 'POST',
         headers: getAuthHeaders(),
       });
@@ -506,6 +524,12 @@ export function App() {
       }
       setFamilyMessage({ type: 'success', text: `已成功退出「${familyDetail.name}」` });
       setSelectedFamilyId(null);
+      setCalendarNavState((prev) =>
+        reconcileCalendarSelectedSpace(
+          prev,
+          families.filter((f) => f.id !== leavingFamilyId).map((f) => f.id),
+        ),
+      );
       await fetchFamilies();
     } catch (err: unknown) {
       setFamilyMessage({
@@ -560,6 +584,7 @@ export function App() {
 
   const currentUser = identityState?.currentUser ?? null;
   const isAdmin = familyDetail?.myRole === 'admin';
+  const activeTimezone = currentUser?.defaultTimezone ?? health?.timezone ?? DEFAULT_TIMEZONE;
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
@@ -583,13 +608,13 @@ export function App() {
               BillCalendar — 生活行事曆 Demo
             </h1>
             <p className="text-xs text-slate-500">
-              高密度月曆與家庭協作示範應用（階段：P1 資料擁有權與權限中介層／家庭模型／測試身份模擬）
+              高密度月曆與家庭協作示範應用（階段：P2 月曆版面、農曆節氣對照與日期時區規則）
             </p>
           </div>
 
           <div className="flex flex-wrap items-center gap-3">
             <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-700">
-              預設時區：{health?.timezone ?? DEFAULT_TIMEZONE}
+              預設時區：{activeTimezone}
             </span>
             {currentUser ? (
               <div className="flex items-center gap-2 rounded-full border border-indigo-200 bg-indigo-50 px-3 py-1 text-xs">
@@ -606,11 +631,12 @@ export function App() {
       </header>
 
       <main className="mx-auto max-w-6xl space-y-6 px-4 py-6 sm:px-6">
-        {/* Main Calendar Layout & Right-Hand Function Tabs (Issue #5) */}
+        {/* Main Calendar Layout & Right-Hand Function Tabs (Issue #5 & #6) */}
         <CalendarWorkspace
           navState={calendarNavState}
           onChangeNavState={setCalendarNavState}
           families={families}
+          timezone={activeTimezone}
           onSelectFamilySpace={(fid) => setSelectedFamilyId(fid)}
         />
         {/* Global Action Message */}
