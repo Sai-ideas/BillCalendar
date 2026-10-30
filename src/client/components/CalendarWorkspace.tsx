@@ -1,23 +1,45 @@
-import { useCallback, useEffect, useMemo } from 'react';
+import { type FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import {
+  CreateEventRequestSchema,
   DEFAULT_TIMEZONE,
   LUNAR_AND_HOLIDAY_PROVENANCE,
+  MAX_CALENDAR_YEAR,
+  MAX_VISIBLE_EVENTS_PER_CELL,
+  MIN_CALENDAR_YEAR,
   RIGHT_PANEL_TABS,
+  UpdateEventRequestSchema,
   WEEKDAY_LABELS_ZH,
+  buildCalendarEventsByDateMap,
   buildMonthCalendarGrid,
+  canNavigateCalendarMonth,
+  clearSelectedCalendarEvent,
+  convertLocalDateTimeInTimezoneToUtcIso,
+  formatInstantToLocalDate,
+  formatInstantToLocalDateTimeInput,
+  formatInstantToLocalTimeLabel,
   formatYearMonthLabel,
+  getCellEventsDisplaySlice,
   getLunarDateInfo,
   getTodayLocalDate,
+  isValidIanaTimezone,
+  isValidLocalDateString,
+  isValidUtcIsoTimestamp,
   jumpCalendarToDate,
   navigateCalendarMonth,
+  normalizeToUtcIsoTimestamp,
   refreshCalendarTodayDate,
+  resolveEventCalendarDates,
   selectCalendarDateBlank,
+  selectCalendarEventFromCell,
   selectCalendarSpace,
   switchRightPanelTab,
   type CalendarNavigationState,
+  type CreateEventRequest,
+  type EventDetail,
   type FamilySummary,
   type RightPanelTab,
   type SelectedSpace,
+  type UpdateEventRequest,
 } from '../../shared';
 
 export interface CalendarWorkspaceProps {
@@ -27,6 +49,14 @@ export interface CalendarWorkspaceProps {
   onSelectFamilySpace?: (familyId: string) => void;
   timezone?: string;
   getNow?: () => Date;
+  events?: EventDetail[];
+  initialEvents?: EventDetail[];
+  eventsLoading?: boolean;
+  eventsError?: string | null;
+  onCreateEvent?: (payload: CreateEventRequest) => Promise<EventDetail>;
+  onUpdateEvent?: (eventId: string, payload: UpdateEventRequest) => Promise<EventDetail>;
+  onDeleteEvent?: (eventId: string) => Promise<void>;
+  maxVisibleEventsPerCell?: number;
 }
 
 export function CalendarWorkspace({
@@ -36,6 +66,14 @@ export function CalendarWorkspace({
   onSelectFamilySpace,
   timezone = DEFAULT_TIMEZONE,
   getNow,
+  events: controlledEvents,
+  initialEvents = [],
+  eventsLoading = false,
+  eventsError = null,
+  onCreateEvent,
+  onUpdateEvent,
+  onDeleteEvent,
+  maxVisibleEventsPerCell = MAX_VISIBLE_EVENTS_PER_CELL,
 }: CalendarWorkspaceProps) {
   const {
     todayDate,
@@ -45,7 +83,27 @@ export function CalendarWorkspace({
     selectedSpace,
     mobileView,
     diaryAutoSwitchedToPersonal,
+    selectedEventId = null,
   } = navState;
+
+  // Local fallback state when rendered standalone in component tests without controlled `events`
+  const [localEvents, setLocalEvents] = useState<EventDetail[]>(() => initialEvents);
+  const allEvents = controlledEvents ?? localEvents;
+
+  // Track which date cells have expanded overflow event lists (`+N 更多`)
+  const [expandedOverflowCells, setExpandedOverflowCells] = useState<Record<string, boolean>>({});
+
+  // Event CRUD form state ('create' | 'edit' | null)
+  const [formMode, setFormMode] = useState<'create' | 'edit' | null>(null);
+  const [editingEventId, setEditingEventId] = useState<string | null>(null);
+  const [formTitle, setFormTitle] = useState<string>('');
+  const [formDescription, setFormDescription] = useState<string>('');
+  const [formAllDay, setFormAllDay] = useState<boolean>(true);
+  const [formStartsAt, setFormStartsAt] = useState<string>(selectedDate);
+  const [formEndsAt, setFormEndsAt] = useState<string>(selectedDate);
+  const [formTimezone, setFormTimezone] = useState<string>(timezone);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [formSubmitting, setFormSubmitting] = useState<boolean>(false);
 
   // Automatically refresh `todayDate` on midnight rollover, window focus, or visibilitychange (PR #25 Follow-up #2)
   const syncTodayDateIfNeeded = useCallback(() => {
@@ -99,7 +157,92 @@ export function CalendarWorkspace({
         ? `家庭：${selectedFamily.name}`
         : '家庭空間';
 
+  // Strictly isolate events by the active `selectedSpace` (Personal vs selected Family)
+  const spaceScopedEvents = useMemo(() => {
+    return allEvents.filter((ev) => {
+      if (selectedSpace.kind === 'personal') {
+        return ev.scope === 'personal';
+      }
+      return ev.scope === 'family' && ev.familyId === selectedSpace.familyId;
+    });
+  }, [allEvents, selectedSpace]);
+
+  // Map space-scoped events onto calendar date cells via `resolveEventCalendarDates`
+  const eventsByDateMap = useMemo(
+    () => buildCalendarEventsByDateMap(spaceScopedEvents),
+    [spaceScopedEvents],
+  );
+
+  const selectedDateEventBars = useMemo(
+    () => eventsByDateMap[selectedDate] ?? [],
+    [eventsByDateMap, selectedDate],
+  );
+
+  const selectedEvent = useMemo(() => {
+    if (!selectedEventId) return null;
+    return spaceScopedEvents.find((ev) => ev.id === selectedEventId) ?? null;
+  }, [spaceScopedEvents, selectedEventId]);
+
+  const canGoPrevMonth = canNavigateCalendarMonth(displayedMonth, -1);
+  const canGoNextMonth = canNavigateCalendarMonth(displayedMonth, 1);
+
+  const openCreateFormForDate = (targetDate: string = selectedDate) => {
+    setFormMode('create');
+    setEditingEventId(null);
+    setFormTitle('');
+    setFormDescription('');
+    setFormAllDay(true);
+    setFormStartsAt(targetDate);
+    setFormEndsAt(targetDate);
+    setFormTimezone(timezone);
+    setFormError(null);
+  };
+
+  const openEditFormForEvent = (ev: EventDetail) => {
+    setFormMode('edit');
+    setEditingEventId(ev.id);
+    setFormTitle(ev.title);
+    setFormDescription(ev.description ?? '');
+    setFormAllDay(ev.allDay);
+    const effectiveTz = ev.timezone || timezone;
+    setFormTimezone(effectiveTz);
+    if (ev.allDay) {
+      setFormStartsAt(ev.startsAt.slice(0, 10));
+      setFormEndsAt(ev.endsAt.slice(0, 10));
+    } else {
+      setFormStartsAt(formatInstantToLocalDateTimeInput(ev.startsAt, effectiveTz));
+      setFormEndsAt(formatInstantToLocalDateTimeInput(ev.endsAt, effectiveTz));
+    }
+    setFormError(null);
+  };
+
+  const handleToggleAllDayInForm = (nextAllDay: boolean) => {
+    setFormAllDay(nextAllDay);
+    setFormError(null);
+    if (nextAllDay) {
+      const startDay = isValidLocalDateString(formStartsAt.slice(0, 10))
+        ? formStartsAt.slice(0, 10)
+        : selectedDate;
+      const endDay = isValidLocalDateString(formEndsAt.slice(0, 10))
+        ? formEndsAt.slice(0, 10)
+        : startDay;
+      setFormStartsAt(startDay);
+      setFormEndsAt(endDay < startDay ? startDay : endDay);
+    } else {
+      const baseStartDay = isValidLocalDateString(formStartsAt.slice(0, 10))
+        ? formStartsAt.slice(0, 10)
+        : selectedDate;
+      const baseEndDay = isValidLocalDateString(formEndsAt.slice(0, 10))
+        ? formEndsAt.slice(0, 10)
+        : baseStartDay;
+      setFormStartsAt(`${baseStartDay}T09:00`);
+      setFormEndsAt(`${baseEndDay}T10:00`);
+    }
+  };
+
   const handleSelectSpace = (space: SelectedSpace) => {
+    setFormMode(null);
+    setFormError(null);
     onChangeNavState(selectCalendarSpace(navState, space));
     if (space.kind === 'family' && onSelectFamilySpace) {
       onSelectFamilySpace(space.familyId);
@@ -122,16 +265,270 @@ export function CalendarWorkspace({
   };
 
   const handleCellBlankClick = (dateStr: string, openMobilePanel: boolean) => {
+    setFormMode(null);
+    setFormError(null);
     onChangeNavState(
       selectCalendarDateBlank(navState, dateStr, { openMobilePanel }),
     );
   };
 
+  const handleEventBarClick = (eventId: string, cellDateStr: string) => {
+    setFormMode(null);
+    setFormError(null);
+    onChangeNavState(
+      selectCalendarEventFromCell(navState, eventId, cellDateStr, {
+        openMobilePanel: true,
+      }),
+    );
+  };
+
+  const handleToggleCellOverflow = (dateStr: string) => {
+    setExpandedOverflowCells((prev) => ({
+      ...prev,
+      [dateStr]: !prev[dateStr],
+    }));
+  };
+
   const handleTabClick = (tab: RightPanelTab) => {
+    setFormMode(null);
+    setFormError(null);
     onChangeNavState({
       ...switchRightPanelTab(navState, tab),
       mobileView: 'panel',
     });
+  };
+
+  const handleJumpToSourceMessage = (ev: EventDetail) => {
+    if (ev.sourceStatus !== 'accessible' || !ev.sourceMessage) return;
+    const targetTab: RightPanelTab =
+      ev.sourceMessage.roomKind === 'personal' ? 'mood' : 'chat';
+    let nextState = jumpCalendarToDate(navState, ev.sourceMessage.localDate);
+    nextState = switchRightPanelTab(nextState, targetTab);
+    onChangeNavState({
+      ...nextState,
+      selectedEventId: null,
+      mobileView: 'panel',
+    });
+  };
+
+  const resolveFormTimestamps = ():
+    | { ok: true; startsAt: string; endsAt: string; timezone: string }
+    | { ok: false; message: string } => {
+    const trimmedTz = formTimezone.trim() || DEFAULT_TIMEZONE;
+    if (!isValidIanaTimezone(trimmedTz)) {
+      return { ok: false, message: '無效的 IANA 時區設定' };
+    }
+
+    if (formAllDay) {
+      const startPure = formStartsAt.trim();
+      const endPure = formEndsAt.trim();
+      if (!isValidLocalDateString(startPure)) {
+        return {
+          ok: false,
+          message: '全天事件開始日期必須為有效的 YYYY-MM-DD 純日期字串（不做 UTC 換日）',
+        };
+      }
+      if (!isValidLocalDateString(endPure)) {
+        return {
+          ok: false,
+          message: '全天事件結束日期必須為有效的 YYYY-MM-DD 純日期字串（不做 UTC 換日）',
+        };
+      }
+      if (endPure < startPure) {
+        return { ok: false, message: '全天事件結束日期不可早於開始日期' };
+      }
+      return { ok: true, startsAt: startPure, endsAt: endPure, timezone: trimmedTz };
+    }
+
+    let startIso: string;
+    let endIso: string;
+    try {
+      startIso = isValidUtcIsoTimestamp(formStartsAt)
+        ? normalizeToUtcIsoTimestamp(formStartsAt)
+        : convertLocalDateTimeInTimezoneToUtcIso(formStartsAt, trimmedTz);
+    } catch {
+      return {
+        ok: false,
+        message: '具時間事件開始時間格式無效（請提供 YYYY-MM-DDTHH:mm 或 ISO 8601 時間戳）',
+      };
+    }
+
+    try {
+      endIso = isValidUtcIsoTimestamp(formEndsAt)
+        ? normalizeToUtcIsoTimestamp(formEndsAt)
+        : convertLocalDateTimeInTimezoneToUtcIso(formEndsAt, trimmedTz);
+    } catch {
+      return {
+        ok: false,
+        message: '具時間事件結束時間格式無效（請提供 YYYY-MM-DDTHH:mm 或 ISO 8601 時間戳）',
+      };
+    }
+
+    if (Date.parse(endIso) < Date.parse(startIso)) {
+      return { ok: false, message: '具時間事件結束時間不可早於開始時間' };
+    }
+
+    return { ok: true, startsAt: startIso, endsAt: endIso, timezone: trimmedTz };
+  };
+
+  const handleSubmitEventForm = async (e: FormEvent) => {
+    e.preventDefault();
+    setFormError(null);
+
+    const resolvedTime = resolveFormTimestamps();
+    if (!resolvedTime.ok) {
+      setFormError(resolvedTime.message);
+      return;
+    }
+
+    if (formMode === 'create') {
+      const candidate: CreateEventRequest = {
+        scope: selectedSpace.kind,
+        ...(selectedSpace.kind === 'family' ? { familyId: selectedSpace.familyId } : {}),
+        title: formTitle,
+        description: formDescription.trim() ? formDescription.trim() : null,
+        startsAt: resolvedTime.startsAt,
+        endsAt: resolvedTime.endsAt,
+        allDay: formAllDay,
+        timezone: resolvedTime.timezone,
+      };
+
+      const parsed = CreateEventRequestSchema.safeParse(candidate);
+      if (!parsed.success) {
+        setFormError(parsed.error.issues[0]?.message ?? '事件資料驗證失敗');
+        return;
+      }
+
+      setFormSubmitting(true);
+      try {
+        let createdEvent: EventDetail;
+        if (onCreateEvent) {
+          createdEvent = await onCreateEvent(parsed.data);
+        } else {
+          const nowIso = new Date().toISOString();
+          createdEvent = {
+            id: `evt_local_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+            calendarId:
+              selectedSpace.kind === 'personal'
+                ? 'cal_personal_local'
+                : `cal_family_${selectedSpace.familyId}`,
+            scope: parsed.data.scope,
+            ownerUserId: parsed.data.scope === 'personal' ? 'usr_local' : null,
+            familyId: parsed.data.scope === 'family' ? parsed.data.familyId! : null,
+            title: parsed.data.title,
+            description: parsed.data.description ?? null,
+            startsAt: parsed.data.startsAt,
+            endsAt: parsed.data.endsAt,
+            allDay: parsed.data.allDay,
+            timezone: parsed.data.timezone,
+            sourceMessageId: parsed.data.sourceMessageId ?? null,
+            sourceStatus: 'none',
+            sourceMessage: null,
+            createdBy: 'usr_local',
+            createdAt: nowIso,
+            updatedAt: nowIso,
+          };
+          setLocalEvents((prev) => [...prev, createdEvent]);
+        }
+
+        const occupied = resolveEventCalendarDates(
+          createdEvent,
+          createdEvent.timezone || timezone,
+        );
+        const firstDate = occupied[0] ?? selectedDate;
+        setFormMode(null);
+        onChangeNavState(
+          selectCalendarEventFromCell(navState, createdEvent.id, firstDate),
+        );
+      } catch (err: unknown) {
+        setFormError(err instanceof Error ? err.message : '建立事件失敗');
+      } finally {
+        setFormSubmitting(false);
+      }
+      return;
+    }
+
+    if (formMode === 'edit' && editingEventId) {
+      const updateCandidate: UpdateEventRequest = {
+        title: formTitle,
+        description: formDescription.trim() ? formDescription.trim() : null,
+        startsAt: resolvedTime.startsAt,
+        endsAt: resolvedTime.endsAt,
+        allDay: formAllDay,
+        timezone: resolvedTime.timezone,
+      };
+
+      const parsed = UpdateEventRequestSchema.safeParse(updateCandidate);
+      if (!parsed.success) {
+        setFormError(parsed.error.issues[0]?.message ?? '更新事件資料驗證失敗');
+        return;
+      }
+
+      setFormSubmitting(true);
+      try {
+        let updatedEvent: EventDetail;
+        if (onUpdateEvent) {
+          updatedEvent = await onUpdateEvent(editingEventId, parsed.data);
+        } else {
+          const existing = allEvents.find((item) => item.id === editingEventId);
+          if (!existing) {
+            throw new Error('找不到要更新的事件');
+          }
+          updatedEvent = {
+            ...existing,
+            title: parsed.data.title ?? existing.title,
+            description:
+              parsed.data.description !== undefined
+                ? parsed.data.description
+                : existing.description,
+            startsAt: parsed.data.startsAt ?? existing.startsAt,
+            endsAt: parsed.data.endsAt ?? existing.endsAt,
+            allDay: parsed.data.allDay ?? existing.allDay,
+            timezone: parsed.data.timezone ?? existing.timezone,
+            updatedAt: new Date().toISOString(),
+          };
+          setLocalEvents((prev) =>
+            prev.map((item) => (item.id === editingEventId ? updatedEvent : item)),
+          );
+        }
+
+        const occupied = resolveEventCalendarDates(
+          updatedEvent,
+          updatedEvent.timezone || timezone,
+        );
+        const targetDate = occupied.includes(selectedDate)
+          ? selectedDate
+          : (occupied[0] ?? selectedDate);
+        setFormMode(null);
+        setEditingEventId(null);
+        onChangeNavState(
+          selectCalendarEventFromCell(navState, updatedEvent.id, targetDate),
+        );
+      } catch (err: unknown) {
+        setFormError(err instanceof Error ? err.message : '更新事件失敗');
+      } finally {
+        setFormSubmitting(false);
+      }
+    }
+  };
+
+  const handleDeleteEvent = async (eventId: string) => {
+    setFormError(null);
+    setFormSubmitting(true);
+    try {
+      if (onDeleteEvent) {
+        await onDeleteEvent(eventId);
+      } else {
+        setLocalEvents((prev) => prev.filter((item) => item.id !== eventId));
+      }
+      setFormMode(null);
+      setEditingEventId(null);
+      onChangeNavState(clearSelectedCalendarEvent(navState));
+    } catch (err: unknown) {
+      setFormError(err instanceof Error ? err.message : '刪除事件失敗');
+    } finally {
+      setFormSubmitting(false);
+    }
   };
 
   const activeTabMeta =
@@ -193,15 +590,16 @@ export function CalendarWorkspace({
             })}
           </div>
 
-          {/* Month Navigation Controls */}
+          {/* Month Navigation Controls (guarded within 1900–2100 supported lunar range) */}
           <div className="flex flex-wrap items-center gap-2">
             <div className="flex items-center rounded-lg border border-slate-300 bg-white shadow-2xs">
               <button
                 type="button"
                 data-testid="calendar-prev-month"
                 aria-label="上個月"
+                disabled={!canGoPrevMonth}
                 onClick={handlePrevMonth}
-                className="px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-100 rounded-l-lg"
+                className="px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-100 rounded-l-lg disabled:opacity-40"
               >
                 ◀ 上月
               </button>
@@ -215,8 +613,9 @@ export function CalendarWorkspace({
                 type="button"
                 data-testid="calendar-next-month"
                 aria-label="下個月"
+                disabled={!canGoNextMonth}
                 onClick={handleNextMonth}
-                className="px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-100 rounded-r-lg"
+                className="px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-100 rounded-r-lg disabled:opacity-40"
               >
                 下月 ▶
               </button>
@@ -229,6 +628,22 @@ export function CalendarWorkspace({
               className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-100"
             >
               回到今日
+            </button>
+
+            <button
+              type="button"
+              data-testid="top-open-create-event-btn"
+              onClick={() => {
+                onChangeNavState({
+                  ...switchRightPanelTab(navState, 'summary'),
+                  selectedEventId: null,
+                  mobileView: 'panel',
+                });
+                openCreateFormForDate(selectedDate);
+              }}
+              className="rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-indigo-700 shadow-2xs"
+            >
+              + 新增事件
             </button>
           </div>
         </div>
@@ -341,7 +756,7 @@ export function CalendarWorkspace({
             ))}
           </div>
 
-          {/* 6-week High-Density Month Grid (Solar + Lunar + 24 Solar Terms + Holidays) */}
+          {/* 6-week High-Density Month Grid (Solar + Lunar + 24 Solar Terms + Holidays + Event Bars) */}
           <div
             role="grid"
             aria-label={`${formatYearMonthLabel(displayedMonth)} 月曆格`}
@@ -357,6 +772,12 @@ export function CalendarWorkspace({
                 dayOfWeek,
                 lunar,
               } = cell;
+
+              const cellEvents = eventsByDateMap[dateStr] ?? [];
+              const cellSlice = getCellEventsDisplaySlice(cellEvents, {
+                maxVisible: maxVisibleEventsPerCell,
+                isExpanded: Boolean(expandedOverflowCells[dateStr]),
+              });
 
               const lunarTextClass =
                 lunar.cellHighlightKind === 'festival'
@@ -376,18 +797,29 @@ export function CalendarWorkspace({
                         : 'text-slate-400';
 
               return (
-                <button
+                <div
                   key={dateStr}
-                  type="button"
+                  role="gridcell"
+                  tabIndex={0}
                   data-testid={`calendar-cell-${dateStr}`}
                   data-current-month={isCurrentMonth ? 'true' : 'false'}
                   data-is-today={isToday ? 'true' : 'false'}
                   data-is-selected={isSelected ? 'true' : 'false'}
                   data-is-leap-month={lunar.isLeapMonth ? 'true' : 'false'}
+                  data-event-count={String(cellSlice.totalCount)}
                   aria-label={`選擇日期 ${dateStr} 農曆${lunar.lunarMonthLabel}${lunar.lunarDayLabel}${lunar.cellDisplayText !== lunar.lunarDayLabel ? ` (${lunar.cellDisplayText})` : ''}${isToday ? ' (今日)' : ''}${isSelected ? ' (已選取)' : ''}`}
                   aria-selected={isSelected}
                   onClick={() => handleCellBlankClick(dateStr, false)}
-                  className={`group relative flex min-h-[78px] flex-col items-start justify-between rounded-lg border p-1.5 text-left transition sm:min-h-[90px] sm:p-2 ${
+                  onKeyDown={(e) => {
+                    if (
+                      e.target === e.currentTarget &&
+                      (e.key === 'Enter' || e.key === ' ')
+                    ) {
+                      e.preventDefault();
+                      handleCellBlankClick(dateStr, false);
+                    }
+                  }}
+                  className={`group relative flex min-h-[88px] cursor-pointer flex-col items-start justify-between rounded-lg border p-1.5 text-left transition sm:min-h-[104px] sm:p-2 ${
                     isSelected
                       ? 'border-indigo-600 bg-indigo-50/75 ring-2 ring-indigo-600/30'
                       : isToday
@@ -434,13 +866,13 @@ export function CalendarWorkspace({
                     </div>
                   </div>
 
-                  {/* Middle/Bottom Slot: Lunar Date / Leap Month / 24 Solar Term / Festival (Issue #6) */}
-                  <div className="mt-1 w-full space-y-0.5">
+                  {/* Lunar Date / Leap Month / 24 Solar Term / Festival Row (Issue #6) */}
+                  <div className="mt-0.5 w-full">
                     <div className="flex items-center justify-between gap-1">
                       <span
                         data-testid={`calendar-cell-lunar-${dateStr}`}
                         data-lunar-highlight={lunar.cellHighlightKind}
-                        className={`truncate text-[11px] leading-tight ${lunarTextClass}`}
+                        className={`truncate text-[10px] leading-tight ${lunarTextClass}`}
                       >
                         {lunar.cellDisplayText}
                       </span>
@@ -453,25 +885,111 @@ export function CalendarWorkspace({
                         </span>
                       )}
                     </div>
-                    <div className="truncate text-[10px] text-slate-400">
-                      {lunar.solarTerm && lunar.cellDisplayText !== lunar.solarTerm
-                        ? `節氣：${lunar.solarTerm}`
-                        : `${lunar.lunarMonthLabel}${lunar.lunarDayLabel}`}
-                    </div>
                   </div>
-                </button>
+
+                  {/* Event Bars Slot (Issue #7: single-day, multi-day, all-day + overflow collapse) */}
+                  <div className="mt-1 flex w-full flex-col gap-0.5">
+                    {cellSlice.visibleEvents.map((bar) => {
+                      const isEventSelected = selectedEventId === bar.event.id;
+                      const isFamilyEvent = bar.event.scope === 'family';
+                      const spanRoundingClass =
+                        bar.spanPosition === 'start'
+                          ? 'rounded-l-md rounded-r-xs border-l-2'
+                          : bar.spanPosition === 'middle'
+                            ? 'rounded-xs'
+                            : bar.spanPosition === 'end'
+                              ? 'rounded-l-xs rounded-r-md border-r-2'
+                              : 'rounded-md';
+
+                      const barToneClass = isEventSelected
+                        ? 'bg-indigo-700 text-white ring-1 ring-indigo-900'
+                        : bar.event.allDay
+                          ? isFamilyEvent
+                            ? 'bg-teal-600 text-white hover:bg-teal-700'
+                            : 'bg-indigo-600 text-white hover:bg-indigo-700'
+                          : isFamilyEvent
+                            ? 'border border-teal-300 bg-teal-50 text-teal-900 hover:bg-teal-100'
+                            : 'border border-indigo-200 bg-indigo-50 text-indigo-900 hover:bg-indigo-100';
+
+                      return (
+                        <button
+                          key={`${dateStr}-${bar.event.id}`}
+                          type="button"
+                          data-testid={`calendar-cell-event-${dateStr}-${bar.event.id}`}
+                          data-event-id={bar.event.id}
+                          data-all-day={bar.event.allDay ? 'true' : 'false'}
+                          data-span-position={bar.spanPosition}
+                          data-is-multi-day={bar.isMultiDay ? 'true' : 'false'}
+                          title={`${bar.event.title} (${bar.timeLabel})`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleEventBarClick(bar.event.id, dateStr);
+                          }}
+                          className={`flex w-full items-center justify-between gap-1 px-1.5 py-0.5 text-left text-[10px] leading-tight font-medium transition ${spanRoundingClass} ${barToneClass}`}
+                        >
+                          <span className="truncate font-semibold">
+                            {bar.event.title}
+                          </span>
+                          <span className="shrink-0 text-[9px] opacity-90">
+                            {bar.timeLabel}
+                          </span>
+                        </button>
+                      );
+                    })}
+
+                    {cellSlice.hasOverflow && !cellSlice.isExpanded && (
+                      <button
+                        type="button"
+                        data-testid={`calendar-cell-more-events-${dateStr}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleToggleCellOverflow(dateStr);
+                        }}
+                        className="w-full rounded-xs bg-slate-100 px-1 py-0.5 text-center text-[10px] font-semibold text-slate-700 hover:bg-slate-200"
+                      >
+                        +{cellSlice.hiddenCount} 更多
+                      </button>
+                    )}
+
+                    {cellSlice.hasOverflow && cellSlice.isExpanded && (
+                      <button
+                        type="button"
+                        data-testid={`calendar-cell-collapse-events-${dateStr}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleToggleCellOverflow(dateStr);
+                        }}
+                        className="w-full rounded-xs bg-slate-200/80 px-1 py-0.5 text-center text-[10px] font-semibold text-slate-700 hover:bg-slate-300"
+                      >
+                        收合 ({cellSlice.totalCount} 筆)
+                      </button>
+                    )}
+                  </div>
+                </div>
               );
             })}
           </div>
 
-          {/* Lunar & Holiday Disclaimer Footer under Month Grid (Review D5 / UX.md) */}
+          {/* Lunar & Holiday Disclaimer Footer under Month Grid (Review D5 / UX.md / PR #26 Follow-up) */}
           <div
             data-testid="calendar-lunar-disclaimer"
             className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-200/80 bg-slate-50 px-3 py-2 text-[11px] text-slate-600"
           >
             <span>
-              🌕 <strong>農曆與節慶顯示：</strong>
+              🌕 <strong>農曆與節慶顯示（支援西元 {MIN_CALENDAR_YEAR}–{MAX_CALENDAR_YEAR}）：</strong>
               {LUNAR_AND_HOLIDAY_PROVENANCE.officialHolidaySource.disclaimer}
+              （資料版本：
+              <code>{LUNAR_AND_HOLIDAY_PROVENANCE.officialHolidaySource.datasetVersion}</code>
+              ，更新日：{LUNAR_AND_HOLIDAY_PROVENANCE.officialHolidaySource.lastUpdatedDate}，
+              <a
+                href={LUNAR_AND_HOLIDAY_PROVENANCE.officialHolidaySource.referenceUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-indigo-700 underline hover:no-underline"
+              >
+                行政院人事行政總處參考來源
+              </a>
+              ）
             </span>
             <span className="font-medium text-amber-800">
               ⚠️ {LUNAR_AND_HOLIDAY_PROVENANCE.mvpScopeBoundary.nonGoalNotice}
@@ -643,11 +1161,384 @@ export function CalendarWorkspace({
               >
                 {activeTab === 'summary' && (
                   <div className="space-y-3">
-                    <div className="rounded-lg border border-slate-200 bg-slate-50 p-3.5 text-xs text-slate-700">
-                      <p className="font-semibold text-slate-900">
-                        📌 {selectedDate} 單日摘要（{currentSpaceLabel}）
-                      </p>
-                      <p className="mt-1 text-slate-600">
+                    {eventsError && (
+                      <div
+                        role="alert"
+                        data-testid="events-api-error"
+                        className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs font-medium text-red-700"
+                      >
+                        {eventsError}
+                      </div>
+                    )}
+
+                    {/* Issue #7 Requirement #3: Direct Event Detail Inspector when an event bar is clicked */}
+                    {selectedEvent && formMode === null && (
+                      <div
+                        data-testid="event-detail-panel"
+                        data-event-id={selectedEvent.id}
+                        className="rounded-xl border-2 border-indigo-600 bg-indigo-50/40 p-3.5 text-xs shadow-2xs space-y-2.5"
+                      >
+                        <div className="flex flex-wrap items-start justify-between gap-2 border-b border-indigo-200/80 pb-2">
+                          <div>
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <span className="rounded-xs bg-indigo-600 px-1.5 py-0.5 text-[10px] font-bold text-white">
+                                事件詳情
+                              </span>
+                              <span
+                                data-testid="event-detail-scope-badge"
+                                className="rounded-xs bg-white px-1.5 py-0.5 text-[10px] font-semibold text-indigo-900 border border-indigo-200"
+                              >
+                                {selectedEvent.scope === 'personal'
+                                  ? '個人空間'
+                                  : currentSpaceLabel}
+                              </span>
+                              <span
+                                data-testid="event-detail-all-day-badge"
+                                className="rounded-xs bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold text-slate-700"
+                              >
+                                {selectedEvent.allDay ? '全天事件 (純日期)' : '具時間事件 (UTC + 時區)'}
+                              </span>
+                            </div>
+                            <h4
+                              data-testid="event-detail-title"
+                              className="mt-1.5 text-sm font-bold text-slate-900"
+                            >
+                              {selectedEvent.title}
+                            </h4>
+                          </div>
+
+                          <button
+                            type="button"
+                            data-testid="event-detail-close-btn"
+                            onClick={() =>
+                              onChangeNavState(clearSelectedCalendarEvent(navState))
+                            }
+                            className="rounded-md border border-slate-300 bg-white px-2 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-50"
+                          >
+                            ✕ 返回當日摘要
+                          </button>
+                        </div>
+
+                        <dl className="space-y-1.5 text-slate-700">
+                          <div>
+                            <dt className="inline font-semibold text-slate-600">
+                              時間安排：
+                            </dt>
+                            <dd
+                              data-testid="event-detail-time-range"
+                              className="inline font-mono"
+                            >
+                              {selectedEvent.allDay
+                                ? `${selectedEvent.startsAt} ～ ${selectedEvent.endsAt}`
+                                : `${formatInstantToLocalDate(selectedEvent.startsAt, selectedEvent.timezone)} ${formatInstantToLocalTimeLabel(selectedEvent.startsAt, selectedEvent.timezone)} ～ ${formatInstantToLocalDate(selectedEvent.endsAt, selectedEvent.timezone)} ${formatInstantToLocalTimeLabel(selectedEvent.endsAt, selectedEvent.timezone)} (${selectedEvent.timezone})`}
+                            </dd>
+                          </div>
+
+                          <div>
+                            <dt className="inline font-semibold text-slate-600">
+                              對應月曆日期格：
+                            </dt>
+                            <dd
+                              data-testid="event-detail-occupied-dates"
+                              className="inline font-mono text-indigo-900"
+                            >
+                              {resolveEventCalendarDates(
+                                selectedEvent,
+                                selectedEvent.timezone || timezone,
+                              ).join('、')}
+                            </dd>
+                          </div>
+
+                          <div>
+                            <dt className="inline font-semibold text-slate-600">
+                              事件說明：
+                            </dt>
+                            <dd
+                              data-testid="event-detail-description"
+                              className="inline text-slate-800"
+                            >
+                              {selectedEvent.description || '（無說明）'}
+                            </dd>
+                          </div>
+                        </dl>
+
+                        {/* Issue #7 Requirement #4: Source Message Status (`none` / `accessible` / `deleted` / `inaccessible`) */}
+                        <div
+                          data-testid="event-detail-source-section"
+                          data-source-status={selectedEvent.sourceStatus}
+                          className="rounded-lg border border-slate-200 bg-white p-2.5 text-[11px]"
+                        >
+                          <div className="font-semibold text-slate-700">
+                            💬 來源聊天訊息關聯（<code>source_message_id</code>）：
+                          </div>
+
+                          {selectedEvent.sourceStatus === 'none' && (
+                            <p
+                              data-testid="event-detail-source-none"
+                              className="mt-1 text-slate-500"
+                            >
+                              無來源訊息（直接於行事曆建立）
+                            </p>
+                          )}
+
+                          {selectedEvent.sourceStatus === 'accessible' &&
+                            selectedEvent.sourceMessage && (
+                              <div
+                                data-testid="event-detail-source-accessible"
+                                className="mt-1.5 space-y-1.5"
+                              >
+                                <p className="rounded-md bg-slate-50 p-2 text-slate-800 border border-slate-100">
+                                  「{selectedEvent.sourceMessage.body}」
+                                  <span className="ml-2 font-mono text-[10px] text-slate-500">
+                                    ({selectedEvent.sourceMessage.localDate})
+                                  </span>
+                                </p>
+                                <button
+                                  type="button"
+                                  data-testid="event-detail-jump-source-btn"
+                                  onClick={() => handleJumpToSourceMessage(selectedEvent)}
+                                  className="rounded-md bg-indigo-600 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-indigo-700"
+                                >
+                                  查看來源聊天 ➔
+                                </button>
+                              </div>
+                            )}
+
+                          {selectedEvent.sourceStatus === 'deleted' && (
+                            <p
+                              data-testid="event-detail-source-deleted"
+                              className="mt-1 font-medium text-amber-800"
+                            >
+                              ⚠️ 原訊息已移除（來源訊息軟刪除不影響本事件獨立存在）
+                            </p>
+                          )}
+
+                          {selectedEvent.sourceStatus === 'inaccessible' && (
+                            <p
+                              data-testid="event-detail-source-inaccessible"
+                              className="mt-1 font-medium text-rose-700"
+                            >
+                              🔒 無權限存取來源訊息（您可能非該聊天空間成員或已退出）
+                            </p>
+                          )}
+                        </div>
+
+                        <div className="flex flex-wrap items-center justify-end gap-2 pt-1">
+                          <button
+                            type="button"
+                            data-testid="event-detail-edit-btn"
+                            disabled={formSubmitting}
+                            onClick={() => openEditFormForEvent(selectedEvent)}
+                            className="rounded-lg border border-indigo-300 bg-white px-3 py-1.5 text-xs font-semibold text-indigo-700 hover:bg-indigo-50"
+                          >
+                            ✏️ 編輯事件
+                          </button>
+                          <button
+                            type="button"
+                            data-testid="event-detail-delete-btn"
+                            disabled={formSubmitting}
+                            onClick={() => void handleDeleteEvent(selectedEvent.id)}
+                            className="rounded-lg border border-rose-200 bg-white px-3 py-1.5 text-xs font-semibold text-rose-600 hover:bg-rose-50"
+                          >
+                            🗑️ 刪除事件
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Create / Edit Event Form (Issue #7 Requirement #1 & #4) */}
+                    {formMode !== null && (
+                      <form
+                        data-testid="event-crud-form"
+                        onSubmit={(e) => void handleSubmitEventForm(e)}
+                        className="rounded-xl border border-indigo-200 bg-white p-3.5 text-xs shadow-2xs space-y-3"
+                      >
+                        <div className="flex items-center justify-between border-b border-slate-100 pb-2">
+                          <h4 className="font-bold text-slate-900">
+                            {formMode === 'create'
+                              ? `➕ 新增行事曆事件（${currentSpaceLabel}）`
+                              : `✏️ 編輯行事曆事件（${currentSpaceLabel}）`}
+                          </h4>
+                          <button
+                            type="button"
+                            data-testid="event-form-cancel-btn"
+                            onClick={() => {
+                              setFormMode(null);
+                              setEditingEventId(null);
+                              setFormError(null);
+                            }}
+                            className="text-slate-500 hover:text-slate-800"
+                          >
+                            取消
+                          </button>
+                        </div>
+
+                        {formError && (
+                          <div
+                            role="alert"
+                            data-testid="event-form-error"
+                            className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs font-medium text-red-700"
+                          >
+                            {formError}
+                          </div>
+                        )}
+
+                        <div>
+                          <label
+                            htmlFor="event-form-title"
+                            className="block font-semibold text-slate-700"
+                          >
+                            事件標題 *
+                          </label>
+                          <input
+                            id="event-form-title"
+                            type="text"
+                            data-testid="event-form-title-input"
+                            placeholder="例如：家庭聚餐、繳水電費、牙醫預約..."
+                            value={formTitle}
+                            onChange={(e) => setFormTitle(e.target.value)}
+                            className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs text-slate-900 focus:border-indigo-600 focus:outline-hidden"
+                          />
+                        </div>
+
+                        <div>
+                          <label
+                            htmlFor="event-form-description"
+                            className="block font-semibold text-slate-700"
+                          >
+                            說明（選填）
+                          </label>
+                          <textarea
+                            id="event-form-description"
+                            rows={2}
+                            data-testid="event-form-description-input"
+                            placeholder="輸入補充備註或地點..."
+                            value={formDescription}
+                            onChange={(e) => setFormDescription(e.target.value)}
+                            className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs text-slate-900 focus:border-indigo-600 focus:outline-hidden"
+                          />
+                        </div>
+
+                        <div className="flex items-center gap-2">
+                          <input
+                            id="event-form-all-day"
+                            type="checkbox"
+                            data-testid="event-form-all-day-checkbox"
+                            checked={formAllDay}
+                            onChange={(e) => handleToggleAllDayInForm(e.target.checked)}
+                            className="h-4 w-4 rounded border-slate-300 text-indigo-600"
+                          />
+                          <label
+                            htmlFor="event-form-all-day"
+                            className="font-semibold text-slate-700"
+                          >
+                            全天事件（<code>all_day = true</code>，以純日期 YYYY-MM-DD 保存，不做 UTC 換日）
+                          </label>
+                        </div>
+
+                        <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+                          <div>
+                            <label
+                              htmlFor="event-form-starts-at"
+                              className="block font-semibold text-slate-700"
+                            >
+                              {formAllDay ? '開始日期 (YYYY-MM-DD)' : '開始時間'}
+                            </label>
+                            <input
+                              id="event-form-starts-at"
+                              type="text"
+                              data-testid="event-form-starts-at-input"
+                              placeholder={
+                                formAllDay ? '2026-10-30' : '2026-10-30T09:00'
+                              }
+                              value={formStartsAt}
+                              onChange={(e) => setFormStartsAt(e.target.value)}
+                              className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-600 focus:outline-hidden"
+                            />
+                          </div>
+
+                          <div>
+                            <label
+                              htmlFor="event-form-ends-at"
+                              className="block font-semibold text-slate-700"
+                            >
+                              {formAllDay ? '結束日期 (YYYY-MM-DD)' : '結束時間'}
+                            </label>
+                            <input
+                              id="event-form-ends-at"
+                              type="text"
+                              data-testid="event-form-ends-at-input"
+                              placeholder={
+                                formAllDay ? '2026-10-30' : '2026-10-30T10:00'
+                              }
+                              value={formEndsAt}
+                              onChange={(e) => setFormEndsAt(e.target.value)}
+                              className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-600 focus:outline-hidden"
+                            />
+                          </div>
+                        </div>
+
+                        {!formAllDay && (
+                          <div>
+                            <label
+                              htmlFor="event-form-timezone"
+                              className="block font-semibold text-slate-700"
+                            >
+                              事件時區 (IANA Timezone)
+                            </label>
+                            <input
+                              id="event-form-timezone"
+                              type="text"
+                              data-testid="event-form-timezone-input"
+                              value={formTimezone}
+                              onChange={(e) => setFormTimezone(e.target.value)}
+                              placeholder="Asia/Taipei"
+                              className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 font-mono text-xs text-slate-900 focus:border-indigo-600 focus:outline-hidden"
+                            />
+                          </div>
+                        )}
+
+                        <div className="flex items-center justify-end gap-2 pt-1">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setFormMode(null);
+                              setEditingEventId(null);
+                              setFormError(null);
+                            }}
+                            className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                          >
+                            取消
+                          </button>
+                          <button
+                            type="submit"
+                            data-testid="event-form-submit-btn"
+                            disabled={formSubmitting}
+                            className="rounded-lg bg-indigo-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-indigo-700 disabled:opacity-50"
+                          >
+                            {formMode === 'create' ? '儲存新事件' : '儲存變更'}
+                          </button>
+                        </div>
+                      </form>
+                    )}
+
+                    {/* Selected Date Summary & Events List */}
+                    <div className="rounded-lg border border-slate-200 bg-slate-50 p-3.5 text-xs text-slate-700 space-y-2.5">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <p className="font-semibold text-slate-900">
+                          📌 {selectedDate} 單日摘要（{currentSpaceLabel}）
+                        </p>
+                        <button
+                          type="button"
+                          data-testid="open-create-event-form-btn"
+                          onClick={() => openCreateFormForDate(selectedDate)}
+                          className="rounded-md bg-indigo-600 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-indigo-700"
+                        >
+                          + 新增當日事件
+                        </button>
+                      </div>
+
+                      <p className="text-slate-600">
                         農曆對照：
                         <strong className="text-slate-900">
                           {selectedDateLunar.fullLunarLabel}
@@ -657,10 +1548,67 @@ export function CalendarWorkspace({
                           ? `，本農曆年含閏${selectedDateLunar.leapMonthOfYear}月`
                           : ''}
                         ）。點擊左側月曆任意日期空白處，即更新全域{' '}
-                        <code>selectedDate</code> 並開啟本摘要面板；
-                        <code>selectedDate</code> ({selectedDate}) 與系統今日{' '}
-                        <code>today</code> ({todayDate}) 狀態彼此獨立。
+                        <code>selectedDate</code> 並開啟本摘要面板；點選月曆格內的事件條則直接開啟該事件詳情。
                       </p>
+
+                      {/* Day Events List in Summary */}
+                      <div
+                        data-testid="selected-date-events-list"
+                        className="border-t border-slate-200/80 pt-2.5 space-y-1.5"
+                      >
+                        <div className="flex items-center justify-between">
+                          <span className="font-semibold text-slate-800">
+                            📅 當日行程事件（{selectedDateEventBars.length} 筆）
+                          </span>
+                          {eventsLoading && (
+                            <span className="text-[11px] text-slate-400">載入中...</span>
+                          )}
+                        </div>
+
+                        {selectedDateEventBars.length === 0 ? (
+                          <p
+                            data-testid="selected-date-no-events"
+                            className="text-[11px] text-slate-500"
+                          >
+                            當日尚無行程事件。可點選右上角「+ 新增當日事件」建立個人或家庭行程。
+                          </p>
+                        ) : (
+                          <div className="space-y-1.5">
+                            {selectedDateEventBars.map((bar) => {
+                              const isSelectedBar = selectedEventId === bar.event.id;
+                              return (
+                                <button
+                                  key={`summary-item-${bar.event.id}`}
+                                  type="button"
+                                  data-testid={`summary-event-item-${bar.event.id}`}
+                                  onClick={() =>
+                                    handleEventBarClick(bar.event.id, selectedDate)
+                                  }
+                                  className={`flex w-full items-center justify-between rounded-lg border px-2.5 py-1.5 text-left transition ${
+                                    isSelectedBar
+                                      ? 'border-indigo-600 bg-indigo-50 text-indigo-950'
+                                      : 'border-slate-200 bg-white text-slate-800 hover:border-indigo-300'
+                                  }`}
+                                >
+                                  <div className="min-w-0 flex-1">
+                                    <span className="font-semibold">
+                                      {bar.event.title}
+                                    </span>
+                                    {bar.event.description && (
+                                      <span className="ml-2 text-[11px] text-slate-500">
+                                        — {bar.event.description}
+                                      </span>
+                                    )}
+                                  </div>
+                                  <span className="ml-2 shrink-0 rounded-xs bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] font-medium text-slate-700">
+                                    {bar.timeLabel}
+                                  </span>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
                     </div>
 
                     {/* Issue #6 Date/Timezone Strategy & Lunar Data Provenance Card */}
@@ -691,9 +1639,10 @@ export function CalendarWorkspace({
                             {LUNAR_AND_HOLIDAY_PROVENANCE.lunarEngine.version} (
                             {LUNAR_AND_HOLIDAY_PROVENANCE.lunarEngine.license})
                           </code>
-                          ；國定假日採{' '}
-                          {LUNAR_AND_HOLIDAY_PROVENANCE.officialHolidaySource.authority}
-                          。{LUNAR_AND_HOLIDAY_PROVENANCE.mvpScopeBoundary.nonGoalNotice}
+                          （支援西元 {MIN_CALENDAR_YEAR}–{MAX_CALENDAR_YEAR}）；國定假日採{' '}
+                          {LUNAR_AND_HOLIDAY_PROVENANCE.officialHolidaySource.authority}（版本{' '}
+                          <code>{LUNAR_AND_HOLIDAY_PROVENANCE.officialHolidaySource.datasetVersion}</code>
+                          ）。{LUNAR_AND_HOLIDAY_PROVENANCE.mvpScopeBoundary.nonGoalNotice}
                         </li>
                       </ul>
                     </div>

@@ -1233,4 +1233,303 @@ describe('Issue #4 Data Ownership and Authorization Middleware', () => {
 
     sqlite.close();
   });
+
+  it('Issue #7 acceptance: supports full personal & family Event CRUD, date/month query filters, time/timezone validation, and source_message_id survival on soft-delete', async () => {
+    const { sqlite, db } = createMigratedSqliteD1();
+    const app = createApp();
+    const devEnv = {
+      DB: db,
+      APP_ENV: 'development',
+      ALLOW_TEST_IDENTITY: 'true',
+      DEFAULT_TIMEZONE: 'Asia/Taipei',
+    };
+
+    const users = await setupTestUsers(app, devEnv);
+    const familyId = await createSharedFamily(
+      app,
+      devEnv,
+      users.alice.session,
+      users.bob.email,
+      users.bob.session,
+      '行事曆事件測試家庭',
+    );
+
+    // 1. Create a personal all-day multi-day event without source_message_id
+    const createAllDayRes = await app.request(
+      '/api/events',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Test-Session-Id': users.alice.session,
+        },
+        body: JSON.stringify({
+          scope: 'personal',
+          title: '個人花東三日遊',
+          description: '純日期全天跨日事件',
+          startsAt: '2026-10-20',
+          endsAt: '2026-10-22',
+          allDay: true,
+        }),
+      },
+      devEnv,
+    );
+    expect(createAllDayRes.status).toBe(201);
+    const personalAllDay = EventDetailSchema.parse(await createAllDayRes.json());
+    expect(personalAllDay.allDay).toBe(true);
+    expect(personalAllDay.startsAt).toBe('2026-10-20');
+    expect(personalAllDay.endsAt).toBe('2026-10-22');
+    expect(personalAllDay.sourceMessageId).toBeNull();
+    expect(personalAllDay.sourceStatus).toBe('none');
+
+    // 2. Event time validation: reject endsAt < startsAt, invalid allDay timestamp, invalid timed format, invalid timezone
+    const invalidOrderRes = await app.request(
+      '/api/events',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Test-Session-Id': users.alice.session,
+        },
+        body: JSON.stringify({
+          scope: 'personal',
+          title: '時間順序錯誤事件',
+          startsAt: '2026-10-25',
+          endsAt: '2026-10-24',
+          allDay: true,
+        }),
+      },
+      devEnv,
+    );
+    expect(invalidOrderRes.status).toBe(400);
+
+    const invalidTimedOrderRes = await app.request(
+      '/api/events',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Test-Session-Id': users.alice.session,
+        },
+        body: JSON.stringify({
+          scope: 'personal',
+          title: '具時間順序錯誤事件',
+          startsAt: '2026-10-25T12:00:00.000Z',
+          endsAt: '2026-10-25T10:00:00.000Z',
+          allDay: false,
+          timezone: 'Asia/Taipei',
+        }),
+      },
+      devEnv,
+    );
+    expect(invalidTimedOrderRes.status).toBe(400);
+
+    const invalidTzRes = await app.request(
+      '/api/events',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Test-Session-Id': users.alice.session,
+        },
+        body: JSON.stringify({
+          scope: 'personal',
+          title: '無效時區事件',
+          startsAt: '2026-10-25T10:00:00.000Z',
+          endsAt: '2026-10-25T11:00:00.000Z',
+          allDay: false,
+          timezone: 'Invalid/Timezone_Name',
+        }),
+      },
+      devEnv,
+    );
+    expect(invalidTzRes.status).toBe(400);
+
+    // 3. Query personal events by ?date=2026-10-21 (middle day of 3-day event) and ?year=2026&month=10
+    const byDateRes = await app.request(
+      '/api/events?scope=personal&date=2026-10-21',
+      { headers: { 'X-Test-Session-Id': users.alice.session } },
+      devEnv,
+    );
+    expect(byDateRes.status).toBe(200);
+    const byDateEvents = (await byDateRes.json()) as Array<{ id: string }>;
+    expect(byDateEvents.map((e) => e.id)).toEqual([personalAllDay.id]);
+
+    const byOtherDateRes = await app.request(
+      '/api/events?scope=personal&date=2026-10-25',
+      { headers: { 'X-Test-Session-Id': users.alice.session } },
+      devEnv,
+    );
+    expect(byOtherDateRes.status).toBe(200);
+    expect(await byOtherDateRes.json()).toEqual([]);
+
+    const byMonthRes = await app.request(
+      '/api/events?scope=personal&year=2026&month=10',
+      { headers: { 'X-Test-Session-Id': users.alice.session } },
+      devEnv,
+    );
+    expect(byMonthRes.status).toBe(200);
+    expect(((await byMonthRes.json()) as Array<{ id: string }>).map((e) => e.id)).toEqual([
+      personalAllDay.id,
+    ]);
+
+    // 4. PATCH /api/events/:id updates personal event and rejects space/source tampering
+    const patchEventRes = await app.request(
+      `/api/events/${personalAllDay.id}`,
+      {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Test-Session-Id': users.alice.session,
+        },
+        body: JSON.stringify({
+          title: '個人花東四日遊（延長一天）',
+          endsAt: '2026-10-23',
+        }),
+      },
+      devEnv,
+    );
+    expect(patchEventRes.status).toBe(200);
+    const patchedEvent = EventDetailSchema.parse(await patchEventRes.json());
+    expect(patchedEvent.title).toBe('個人花東四日遊（延長一天）');
+    expect(patchedEvent.endsAt).toBe('2026-10-23');
+
+    const tamperScopeRes = await app.request(
+      `/api/events/${personalAllDay.id}`,
+      {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Test-Session-Id': users.alice.session,
+        },
+        body: JSON.stringify({
+          scope: 'family',
+          familyId,
+        }),
+      },
+      devEnv,
+    );
+    expect(tamperScopeRes.status).toBe(403);
+
+    // 5. Family Event CRUD with source_message_id and soft-delete survival
+    const famSpaceRes = await app.request(
+      `/api/spaces/families/${familyId}`,
+      { headers: { 'X-Test-Session-Id': users.alice.session } },
+      devEnv,
+    );
+    const { chatRoomId: familyRoomId } = (await famSpaceRes.json()) as { chatRoomId: string };
+
+    const postMsgRes = await app.request(
+      `/api/chat-rooms/${familyRoomId}/messages`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Test-Session-Id': users.bob.session,
+        },
+        body: JSON.stringify({
+          body: '下週六晚上六點全家人去吃牛排慶生！',
+          localDate: '2026-10-30',
+        }),
+      },
+      devEnv,
+    );
+    expect(postMsgRes.status).toBe(201);
+    const sourceMsg = MessageWithAuthorizedDerivedSchema.parse(await postMsgRes.json());
+
+    const createFamEventRes = await app.request(
+      '/api/events',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Test-Session-Id': users.alice.session,
+        },
+        body: JSON.stringify({
+          scope: 'family',
+          familyId,
+          title: '家庭牛排慶生聚餐',
+          description: '已訂位 6 人桌',
+          startsAt: '2026-11-07T10:00:00.000Z', // 18:00 Asia/Taipei
+          endsAt: '2026-11-07T12:00:00.000Z', // 20:00 Asia/Taipei
+          allDay: false,
+          timezone: 'Asia/Taipei',
+          sourceMessageId: sourceMsg.id,
+        }),
+      },
+      devEnv,
+    );
+    expect(createFamEventRes.status).toBe(201);
+    const famEvent = EventDetailSchema.parse(await createFamEventRes.json());
+    expect(famEvent.sourceMessageId).toBe(sourceMsg.id);
+    expect(famEvent.sourceStatus).toBe('accessible');
+    expect(famEvent.sourceMessage?.body).toBe('下週六晚上六點全家人去吃牛排慶生！');
+
+    // Bob soft-deletes the source message -> famEvent survives with sourceStatus: 'deleted'
+    const deleteMsgRes = await app.request(
+      `/api/messages/${sourceMsg.id}`,
+      {
+        method: 'DELETE',
+        headers: { 'X-Test-Session-Id': users.bob.session },
+      },
+      devEnv,
+    );
+    expect(deleteMsgRes.status).toBe(200);
+
+    const getFamEventAfterMsgDelete = await app.request(
+      `/api/events/${famEvent.id}`,
+      { headers: { 'X-Test-Session-Id': users.alice.session } },
+      devEnv,
+    );
+    expect(getFamEventAfterMsgDelete.status).toBe(200);
+    const survivedFamEvent = EventDetailSchema.parse(await getFamEventAfterMsgDelete.json());
+    expect(survivedFamEvent.title).toBe('家庭牛排慶生聚餐');
+    expect(survivedFamEvent.sourceMessageId).toBe(sourceMsg.id);
+    expect(survivedFamEvent.sourceStatus).toBe('deleted');
+    expect(survivedFamEvent.sourceMessage).toBeNull();
+
+    // Bob (family member) can update and delete the family event, while Charlie (non-member) gets 404
+    const charliePatchFamEvent = await app.request(
+      `/api/events/${famEvent.id}`,
+      {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Test-Session-Id': users.charlie.session,
+        },
+        body: JSON.stringify({ title: 'Charlie 越權修改' }),
+      },
+      devEnv,
+    );
+    expect(charliePatchFamEvent.status).toBe(404);
+
+    const charlieDeleteFamEvent = await app.request(
+      `/api/events/${famEvent.id}`,
+      {
+        method: 'DELETE',
+        headers: { 'X-Test-Session-Id': users.charlie.session },
+      },
+      devEnv,
+    );
+    expect(charlieDeleteFamEvent.status).toBe(404);
+
+    const bobDeleteFamEvent = await app.request(
+      `/api/events/${famEvent.id}`,
+      {
+        method: 'DELETE',
+        headers: { 'X-Test-Session-Id': users.bob.session },
+      },
+      devEnv,
+    );
+    expect(bobDeleteFamEvent.status).toBe(200);
+
+    const verifyDeletedRes = await app.request(
+      `/api/events/${famEvent.id}`,
+      { headers: { 'X-Test-Session-Id': users.alice.session } },
+      devEnv,
+    );
+    expect(verifyDeletedRes.status).toBe(404);
+
+    sqlite.close();
+  });
 });

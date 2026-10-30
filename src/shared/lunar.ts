@@ -1,5 +1,16 @@
 import { LunarMonth, LunarYear, Solar } from 'lunar-javascript';
 
+export const SUPPORTED_SOLAR_YEAR_MIN = 1900 as const;
+export const SUPPORTED_SOLAR_YEAR_MAX = 2100 as const;
+
+export function isSolarYearInLunarSupportedRange(year: number): boolean {
+  return (
+    Number.isInteger(year) &&
+    year >= SUPPORTED_SOLAR_YEAR_MIN &&
+    year <= SUPPORTED_SOLAR_YEAR_MAX
+  );
+}
+
 export interface LunarAndHolidayProvenance {
   readonly lunarEngine: {
     readonly packageName: 'lunar-javascript';
@@ -10,7 +21,11 @@ export interface LunarAndHolidayProvenance {
   };
   readonly officialHolidaySource: {
     readonly authority: string;
+    readonly referenceUrl: string;
+    readonly datasetVersion: string;
+    readonly lastUpdatedDate: string;
     readonly staticCoverageYears: readonly number[];
+    readonly maintenanceNote: string;
     readonly fallbackPolicy: string;
     readonly disclaimer: string;
   };
@@ -25,15 +40,16 @@ export interface LunarAndHolidayProvenance {
 }
 
 /**
- * Explicit data provenance, license verification, and MVP boundary disclosure (Issue #6 / Review D5).
- * Ensures the UI and callers never misrepresent simple lunar calendar display as lunar recurring event scheduling.
+ * Explicit data provenance, license verification, and MVP boundary disclosure (Issue #6 / Review D5 / PR #26 Follow-up).
+ * Ensures the UI and callers never misrepresent simple lunar calendar display as lunar recurring event scheduling,
+ * nor misrepresent the static holiday reference summary as the complete dynamic government work calendar.
  */
 export const LUNAR_AND_HOLIDAY_PROVENANCE: LunarAndHolidayProvenance = {
   lunarEngine: {
     packageName: 'lunar-javascript',
     version: '1.7.7',
     license: 'MIT',
-    supportedSolarYearRange: [1900, 2100],
+    supportedSolarYearRange: [SUPPORTED_SOLAR_YEAR_MIN, SUPPORTED_SOLAR_YEAR_MAX],
     capabilities: [
       '西曆與農曆年月日離線對照（1900–2100）',
       '農曆閏月識別（區分正統月份與閏月，如「六月」與「閏六月」）',
@@ -43,12 +59,17 @@ export const LUNAR_AND_HOLIDAY_PROVENANCE: LunarAndHolidayProvenance = {
   },
   officialHolidaySource: {
     authority:
-      '行政院人事行政總處（DGPA）政府行政機關辦公日曆表及國定紀念日靜態參考資料（2025–2027）',
+      '行政院人事行政總處（DGPA）政府行政機關辦公日曆表及紀念日及節日實施條例靜態參考資料（2025–2027）',
+    referenceUrl: 'https://www.dgpa.gov.tw/information?uid=41',
+    datasetVersion: 'dgpa-static-summary-2025-2027.v1',
+    lastUpdatedDate: '2026-10-30',
     staticCoverageYears: [2025, 2026, 2027],
+    maintenanceNote:
+      '本靜態資料僅摘錄重點國定假日與調整放假摘要，不代表完整官方辦公日曆表（未涵蓋補行上班日或臨時停班停課）；每年應依行政院人事行政總處最新核定公告檢核更新。',
     fallbackPolicy:
-      '超出靜態年份範圍時，僅提供固定陽曆紀念日、二十四節氣（如清明）與農曆傳統節日推算，不涵蓋跨年彈性放假或補行上班公告。',
+      '超出靜態年份範圍時，僅提供固定陽曆紀念日、二十四節氣（如清明）與農曆傳統節日推算，不涵蓋跨年彈性放假或補行上班公告；超出 1900–2100 農曆引擎支援年份時自動安全降級顯示。',
     disclaimer:
-      '節假日與農曆資訊僅供參考，實際放假與補班規定以行政院人事行政總處最新公告為準。',
+      '節假日與農曆資訊僅供參考（非完整官方辦公日曆），實際放假與補班規定以行政院人事行政總處最新公告為準。',
   },
   mvpScopeBoundary: {
     supportsLunarDisplay: true,
@@ -310,6 +331,7 @@ export interface LunarDateInfo {
   isHolidayDayOff: boolean;
   cellDisplayText: string; // Concise label for month grid cell
   cellHighlightKind: LunarCellHighlightKind;
+  isOutOfSupportedRange: boolean; // true when year < 1900 or year > 2100 (safe fallback)
 }
 
 function resolveTraditionalLunarFestival(
@@ -320,9 +342,13 @@ function resolveTraditionalLunarFestival(
 ): string | null {
   // Check if tomorrow is Lunar New Year (正月初一, non-leap) -> Today is New Year's Eve (除夕),
   // regardless of whether the 12th lunar month has 29 days (小月) or 30 days (大月).
-  const nextDayLunar = solar.next(1).getLunar();
-  if (nextDayLunar.getMonth() === 1 && nextDayLunar.getDay() === 1) {
-    return '除夕';
+  try {
+    const nextDayLunar = solar.next(1).getLunar();
+    if (nextDayLunar.getMonth() === 1 && nextDayLunar.getDay() === 1) {
+      return '除夕';
+    }
+  } catch {
+    // At the upper boundary (e.g. 2100-12-31 -> 2101-01-01), solar.next(1) may exceed table bounds
   }
 
   // Traditional lunar festivals are celebrated on the regular lunar month, not on the leap month (閏月).
@@ -378,12 +404,47 @@ function resolveTaiwanOfficialHoliday(
   return null;
 }
 
+function buildOutOfRangeLunarFallback(
+  dateStr: string,
+  year: number,
+  month: number,
+  day: number,
+): LunarDateInfo {
+  const holidayEntry = resolveTaiwanOfficialHoliday(dateStr, null, null);
+  const officialHoliday = holidayEntry ? holidayEntry.name : null;
+  const isHolidayDayOff = holidayEntry ? holidayEntry.isDayOff : false;
+
+  return {
+    dateStr,
+    lunarYear: year,
+    lunarMonth: month,
+    lunarDay: day,
+    isLeapMonth: false,
+    leapMonthOfYear: null,
+    lunarMonthDayCount: 30,
+    ganZhiYear: '—',
+    zodiac: '—',
+    lunarMonthLabel: '超出農曆範圍',
+    lunarDayLabel: `${month}/${day}`,
+    fullLunarLabel: `西元 ${dateStr}（超出 ${SUPPORTED_SOLAR_YEAR_MIN}–${SUPPORTED_SOLAR_YEAR_MAX} 農曆換算支援範圍）`,
+    solarTerm: null,
+    traditionalFestival: null,
+    officialHoliday,
+    isHolidayDayOff,
+    cellDisplayText: officialHoliday ?? '—',
+    cellHighlightKind: officialHoliday ? 'festival' : 'normal',
+    isOutOfSupportedRange: true,
+  };
+}
+
 /**
  * Computes comprehensive Lunar, 24 Solar Term, Traditional Festival, and Taiwan Official Holiday
  * metadata for a pure local date `YYYY-MM-DD`.
+ * Safely degrades without throwing when the year falls outside `lunar-javascript`'s supported range (1900–2100).
  */
 export function getLunarDateInfo(dateStr: string): LunarDateInfo {
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateStr.trim());
+  const trimmed = dateStr.trim();
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(trimmed);
   if (!match) {
     throw new Error(`Invalid local date string: ${dateStr}`);
   }
@@ -391,86 +452,113 @@ export function getLunarDateInfo(dateStr: string): LunarDateInfo {
   const month = Number(match[2]);
   const day = Number(match[3]);
 
-  const solar = Solar.fromYmd(year, month, day);
-  const lunar = solar.getLunar();
-
-  const rawLunarMonth = lunar.getMonth(); // negative when leap month (e.g. -6 for 閏六月)
-  const isLeapMonth = rawLunarMonth < 0;
-  const lunarMonth = Math.abs(rawLunarMonth);
-  const lunarDay = lunar.getDay();
-  const lunarYear = lunar.getYear();
-
-  const lunarYearObj = LunarYear.fromYear(lunarYear);
-  const rawLeapMonthOfYear = lunarYearObj.getLeapMonth();
-  const leapMonthOfYear = rawLeapMonthOfYear > 0 ? rawLeapMonthOfYear : null;
-
-  const lunarMonthObj = LunarMonth.fromYm(lunarYear, rawLunarMonth);
-  const lunarMonthDayCount = lunarMonthObj ? lunarMonthObj.getDayCount() : 30;
-
-  const baseMonthName = LUNAR_MONTH_NAMES_ZH_TW[lunarMonth] ?? `${lunarMonth}月`;
-  const lunarMonthLabel = isLeapMonth ? `閏${baseMonthName}` : baseMonthName;
-  const lunarDayLabel = LUNAR_DAY_NAMES_ZH_TW[lunarDay] ?? String(lunarDay);
-
-  const ganZhiYear = lunar.getYearInGanZhi();
-  const rawZodiac = lunar.getYearShengXiao();
-  const zodiac = ZODIAC_SIMPLIFIED_TO_ZH_TW[rawZodiac] ?? rawZodiac;
-  const fullLunarLabel = `${ganZhiYear}年${lunarMonthLabel}${lunarDayLabel}（${zodiac}年）`;
-
-  const rawJieQi = lunar.getJieQi();
-  const solarTerm = rawJieQi ? (SOLAR_TERMS_ZH_TW_MAP[rawJieQi] ?? rawJieQi) : null;
-
-  const traditionalFestival = resolveTraditionalLunarFestival(
-    solar,
-    lunarMonth,
-    lunarDay,
-    isLeapMonth,
-  );
-
-  const holidayEntry = resolveTaiwanOfficialHoliday(
-    dateStr,
-    solarTerm,
-    traditionalFestival,
-  );
-  const officialHoliday = holidayEntry ? holidayEntry.name : null;
-  const isHolidayDayOff = holidayEntry ? holidayEntry.isDayOff : false;
-
-  // Priority for concise calendar cell label:
-  // 1. Traditional Festival or Official Holiday (e.g., 春節, 除夕, 端午節, 中秋節, 國慶日, 和平紀念日)
-  // 2. 24 Solar Term (e.g., 立春, 驚蟄, 清明, 夏至, 冬至)
-  // 3. First day of a lunar month (lunarDay === 1): show lunarMonthLabel (e.g., 正月, 閏六月, 臘月)
-  // 4. Regular lunar day: show lunarDayLabel (e.g., 初二, 十五, 廿三)
-  let cellDisplayText = lunarDayLabel;
-  let cellHighlightKind: LunarCellHighlightKind = 'normal';
-
-  if (traditionalFestival || officialHoliday) {
-    cellDisplayText = traditionalFestival ?? officialHoliday!;
-    cellHighlightKind = 'festival';
-  } else if (solarTerm) {
-    cellDisplayText = solarTerm;
-    cellHighlightKind = 'solar_term';
-  } else if (lunarDay === 1) {
-    cellDisplayText = lunarMonthLabel;
-    cellHighlightKind = 'lunar_first_day';
+  if (month < 1 || month > 12) {
+    throw new Error(`Out-of-range month in local date string: ${dateStr}`);
+  }
+  const maxDaysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  if (day < 1 || day > maxDaysInMonth) {
+    throw new Error(`Out-of-range local date string: ${dateStr}`);
   }
 
-  return {
-    dateStr,
-    lunarYear,
-    lunarMonth,
-    lunarDay,
-    isLeapMonth,
-    leapMonthOfYear,
-    lunarMonthDayCount,
-    ganZhiYear,
-    zodiac,
-    lunarMonthLabel,
-    lunarDayLabel,
-    fullLunarLabel,
-    solarTerm,
-    traditionalFestival,
-    officialHoliday,
-    isHolidayDayOff,
-    cellDisplayText,
-    cellHighlightKind,
-  };
+  if (!isSolarYearInLunarSupportedRange(year)) {
+    return buildOutOfRangeLunarFallback(trimmed, year, month, day);
+  }
+
+  try {
+    const solar = Solar.fromYmd(year, month, day);
+    const lunar = solar.getLunar();
+
+    const rawLunarMonth = lunar.getMonth(); // negative when leap month (e.g. -6 for 閏六月)
+    const isLeapMonth = rawLunarMonth < 0;
+    const lunarMonth = Math.abs(rawLunarMonth);
+    const lunarDay = lunar.getDay();
+    const lunarYear = lunar.getYear();
+
+    let leapMonthOfYear: number | null = null;
+    try {
+      const lunarYearObj = LunarYear.fromYear(lunarYear);
+      const rawLeapMonthOfYear = lunarYearObj.getLeapMonth();
+      leapMonthOfYear = rawLeapMonthOfYear > 0 ? rawLeapMonthOfYear : null;
+    } catch {
+      leapMonthOfYear = null;
+    }
+
+    let lunarMonthDayCount = 30;
+    try {
+      const lunarMonthObj = LunarMonth.fromYm(lunarYear, rawLunarMonth);
+      lunarMonthDayCount = lunarMonthObj ? lunarMonthObj.getDayCount() : 30;
+    } catch {
+      lunarMonthDayCount = 30;
+    }
+
+    const baseMonthName = LUNAR_MONTH_NAMES_ZH_TW[lunarMonth] ?? `${lunarMonth}月`;
+    const lunarMonthLabel = isLeapMonth ? `閏${baseMonthName}` : baseMonthName;
+    const lunarDayLabel = LUNAR_DAY_NAMES_ZH_TW[lunarDay] ?? String(lunarDay);
+
+    const ganZhiYear = lunar.getYearInGanZhi();
+    const rawZodiac = lunar.getYearShengXiao();
+    const zodiac = ZODIAC_SIMPLIFIED_TO_ZH_TW[rawZodiac] ?? rawZodiac;
+    const fullLunarLabel = `${ganZhiYear}年${lunarMonthLabel}${lunarDayLabel}（${zodiac}年）`;
+
+    const rawJieQi = lunar.getJieQi();
+    const solarTerm = rawJieQi ? (SOLAR_TERMS_ZH_TW_MAP[rawJieQi] ?? rawJieQi) : null;
+
+    const traditionalFestival = resolveTraditionalLunarFestival(
+      solar,
+      lunarMonth,
+      lunarDay,
+      isLeapMonth,
+    );
+
+    const holidayEntry = resolveTaiwanOfficialHoliday(
+      trimmed,
+      solarTerm,
+      traditionalFestival,
+    );
+    const officialHoliday = holidayEntry ? holidayEntry.name : null;
+    const isHolidayDayOff = holidayEntry ? holidayEntry.isDayOff : false;
+
+    // Priority for concise calendar cell label:
+    // 1. Traditional Festival or Official Holiday (e.g., 春節, 除夕, 端午節, 中秋節, 國慶日, 和平紀念日)
+    // 2. 24 Solar Term (e.g., 立春, 驚蟄, 清明, 夏至, 冬至)
+    // 3. First day of a lunar month (lunarDay === 1): show lunarMonthLabel (e.g., 正月, 閏六月, 臘月)
+    // 4. Regular lunar day: show lunarDayLabel (e.g., 初二, 十五, 廿三)
+    let cellDisplayText = lunarDayLabel;
+    let cellHighlightKind: LunarCellHighlightKind = 'normal';
+
+    if (traditionalFestival || officialHoliday) {
+      cellDisplayText = traditionalFestival ?? officialHoliday!;
+      cellHighlightKind = 'festival';
+    } else if (solarTerm) {
+      cellDisplayText = solarTerm;
+      cellHighlightKind = 'solar_term';
+    } else if (lunarDay === 1) {
+      cellDisplayText = lunarMonthLabel;
+      cellHighlightKind = 'lunar_first_day';
+    }
+
+    return {
+      dateStr: trimmed,
+      lunarYear,
+      lunarMonth,
+      lunarDay,
+      isLeapMonth,
+      leapMonthOfYear,
+      lunarMonthDayCount,
+      ganZhiYear,
+      zodiac,
+      lunarMonthLabel,
+      lunarDayLabel,
+      fullLunarLabel,
+      solarTerm,
+      traditionalFestival,
+      officialHoliday,
+      isHolidayDayOff,
+      cellDisplayText,
+      cellHighlightKind,
+      isOutOfSupportedRange: false,
+    };
+  } catch {
+    return buildOutOfRangeLunarFallback(trimmed, year, month, day);
+  }
 }

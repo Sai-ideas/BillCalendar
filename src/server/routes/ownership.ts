@@ -10,9 +10,11 @@ import {
   UpdateDiaryRequestSchema,
   UpdateEventRequestSchema,
   UpdateTaskRequestSchema,
+  buildMonthCalendarGrid,
   isValidLocalDateString,
   isValidUtcIsoTimestamp,
   normalizeToUtcIsoTimestamp,
+  resolveEventCalendarDates,
   type ChatRoomSummary,
   type DiaryEntry,
   type EventDetail,
@@ -1259,8 +1261,75 @@ export function createEventsRouter() {
       return c.json(crossUserForbiddenResponse(), 403);
     }
 
-    const scopeQuery = c.req.query('scope') ?? (c.req.query('familyId') ? 'family' : 'personal');
+    const rawScope = c.req.query('scope');
+    if (rawScope && rawScope !== 'personal' && rawScope !== 'family') {
+      return c.json({ error: 'VALIDATION_ERROR', message: '無效的空間範圍 (scope)' }, 400);
+    }
     const familyId = c.req.query('familyId')?.trim();
+    if (rawScope === 'personal' && familyId) {
+      return c.json(
+        { error: 'VALIDATION_ERROR', message: '個人空間事件查詢不可指定 familyId' },
+        400,
+      );
+    }
+    const scopeQuery = rawScope ?? (familyId ? 'family' : 'personal');
+
+    const dateFilter = c.req.query('date')?.trim();
+    if (dateFilter && !isValidLocalDateString(dateFilter)) {
+      return c.json(
+        { error: 'VALIDATION_ERROR', message: '查詢日期格式必須為有效的 YYYY-MM-DD' },
+        400,
+      );
+    }
+
+    const yearQuery = c.req.query('year')?.trim();
+    const monthQuery = c.req.query('month')?.trim();
+    let monthGridDateSet: Set<string> | null = null;
+    if (yearQuery !== undefined || monthQuery !== undefined) {
+      const parsedYear = Number(yearQuery);
+      const parsedMonth = Number(monthQuery);
+      if (
+        !yearQuery ||
+        !monthQuery ||
+        !Number.isInteger(parsedYear) ||
+        parsedYear < 1900 ||
+        parsedYear > 2100 ||
+        !Number.isInteger(parsedMonth) ||
+        parsedMonth < 1 ||
+        parsedMonth > 12
+      ) {
+        return c.json(
+          {
+            error: 'VALIDATION_ERROR',
+            message: '月份查詢必須同時提供有效的 year (1900–2100) 與 month (1–12)',
+          },
+          400,
+        );
+      }
+      const dummySelected = `${String(parsedYear).padStart(4, '0')}-${String(parsedMonth).padStart(2, '0')}-01`;
+      const gridCells = buildMonthCalendarGrid(
+        { year: parsedYear, month: parsedMonth },
+        dummySelected,
+        dummySelected,
+      );
+      monthGridDateSet = new Set(gridCells.map((cell) => cell.dateStr));
+    }
+
+    const filterEventByDateOrMonth = (ev: EventDetail): boolean => {
+      if (!dateFilter && !monthGridDateSet) return true;
+      try {
+        const occupiedDates = resolveEventCalendarDates(ev, ev.timezone || DEFAULT_TIMEZONE);
+        if (dateFilter && !occupiedDates.includes(dateFilter)) {
+          return false;
+        }
+        if (monthGridDateSet && !occupiedDates.some((d) => monthGridDateSet.has(d))) {
+          return false;
+        }
+        return true;
+      } catch {
+        return false;
+      }
+    };
 
     if (scopeQuery === 'family') {
       if (!familyId) {
@@ -1292,7 +1361,7 @@ export function createEventsRouter() {
           currentUser,
           ev.sourceMessageId,
         );
-        result.push({
+        const detail: EventDetail = {
           id: ev.id,
           calendarId: ev.calendarId,
           scope: 'family',
@@ -1310,7 +1379,10 @@ export function createEventsRouter() {
           createdBy: ev.createdBy,
           createdAt: ev.createdAt,
           updatedAt: ev.updatedAt,
-        });
+        };
+        if (filterEventByDateOrMonth(detail)) {
+          result.push(detail);
+        }
       }
 
       return c.json(result, 200);
@@ -1335,7 +1407,7 @@ export function createEventsRouter() {
         currentUser,
         ev.sourceMessageId,
       );
-      result.push({
+      const detail: EventDetail = {
         id: ev.id,
         calendarId: ev.calendarId,
         scope: 'personal',
@@ -1353,7 +1425,10 @@ export function createEventsRouter() {
         createdBy: ev.createdBy,
         createdAt: ev.createdAt,
         updatedAt: ev.updatedAt,
-      });
+      };
+      if (filterEventByDateOrMonth(detail)) {
+        result.push(detail);
+      }
     }
 
     return c.json(result, 200);
@@ -1616,7 +1691,12 @@ export function createEventsRouter() {
 
     if (typeof rawBody === 'object' && rawBody !== null) {
       const record = rawBody as Record<string, unknown>;
-      if (record.sourceMessageId !== undefined || record.calendarId !== undefined) {
+      if (
+        record.sourceMessageId !== undefined ||
+        record.calendarId !== undefined ||
+        record.scope !== undefined ||
+        record.familyId !== undefined
+      ) {
         return c.json(
           {
             error: 'FORBIDDEN',

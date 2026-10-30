@@ -7,9 +7,12 @@ import {
   TEST_IDENTITY_SECURITY_NOTICE,
   TestIdentityStateResponseSchema,
   type AuthorizedSpaceOverview,
+  type CreateEventRequest,
+  type EventDetail,
   type FamilyDetail,
   type FamilyInvitationSummary,
   type FamilySummary,
+  type UpdateEventRequest,
   createInitialCalendarNavigationState,
   reconcileCalendarSelectedSpace,
   resetCalendarSelectedSpaceToPersonal,
@@ -42,10 +45,13 @@ export function App() {
   const [pendingInvitations, setPendingInvitations] = useState<FamilyInvitationSummary[]>([]);
   const [spaceOverview, setSpaceOverview] = useState<AuthorizedSpaceOverview | null>(null);
 
-  // Calendar & Right Panel Tabs state (Issue #5 & #6)
+  // Calendar & Right Panel Tabs state (Issue #5, #6 & #7)
   const [calendarNavState, setCalendarNavState] = useState<CalendarNavigationState>(() =>
     createInitialCalendarNavigationState(),
   );
+  const [spaceEvents, setSpaceEvents] = useState<EventDetail[]>([]);
+  const [eventsLoading, setEventsLoading] = useState<boolean>(false);
+  const [eventsError, setEventsError] = useState<string | null>(null);
 
   // Family form states
   const [newFamilyName, setNewFamilyName] = useState<string>('');
@@ -239,6 +245,37 @@ export function App() {
     }
   }, [baseUrl]);
 
+  const fetchSpaceEvents = useCallback(async () => {
+    const storedSessionId = window.localStorage.getItem(SESSION_STORAGE_KEY);
+    if (!storedSessionId || !identityState?.currentUser) {
+      setSpaceEvents([]);
+      setEventsError(null);
+      return;
+    }
+    setEventsLoading(true);
+    setEventsError(null);
+    try {
+      const query =
+        calendarNavState.selectedSpace.kind === 'family'
+          ? `?scope=family&familyId=${encodeURIComponent(calendarNavState.selectedSpace.familyId)}`
+          : '?scope=personal';
+      const res = await fetch(`${baseUrl}/api/events${query}`, {
+        headers: getAuthHeaders(),
+      });
+      if (!res.ok) {
+        const errData = (await res.json().catch(() => ({}))) as { message?: string };
+        throw new Error(errData.message ?? '無法載入行程事件');
+      }
+      const data = (await res.json()) as EventDetail[];
+      setSpaceEvents(data);
+    } catch (err: unknown) {
+      setEventsError(err instanceof Error ? err.message : '無法載入行程事件');
+      setSpaceEvents([]);
+    } finally {
+      setEventsLoading(false);
+    }
+  }, [baseUrl, calendarNavState.selectedSpace, identityState?.currentUser]);
+
   useEffect(() => {
     if (identityState?.currentUser) {
       void fetchFamilies();
@@ -250,9 +287,15 @@ export function App() {
       setFamilyDetail(null);
       setPendingInvitations([]);
       setSpaceOverview(null);
+      setSpaceEvents([]);
+      setEventsError(null);
       setCalendarNavState((prev) => resetCalendarSelectedSpaceToPersonal(prev));
     }
   }, [identityState?.currentUser, fetchFamilies, fetchPendingInvitations, fetchSpaceOverview]);
+
+  useEffect(() => {
+    void fetchSpaceEvents();
+  }, [fetchSpaceEvents]);
 
   useEffect(() => {
     if (selectedFamilyId) {
@@ -582,6 +625,55 @@ export function App() {
     }
   };
 
+  const handleCreateEvent = async (payload: CreateEventRequest): Promise<EventDetail> => {
+    const res = await fetch(`${baseUrl}/api/events`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...getAuthHeaders(),
+      },
+      body: JSON.stringify(payload),
+    });
+    const data = (await res.json()) as EventDetail & { message?: string };
+    if (!res.ok) {
+      throw new Error(data.message ?? '建立事件失敗');
+    }
+    setSpaceEvents((prev) => [...prev, data]);
+    return data;
+  };
+
+  const handleUpdateEvent = async (
+    eventId: string,
+    payload: UpdateEventRequest,
+  ): Promise<EventDetail> => {
+    const res = await fetch(`${baseUrl}/api/events/${eventId}`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        ...getAuthHeaders(),
+      },
+      body: JSON.stringify(payload),
+    });
+    const data = (await res.json()) as EventDetail & { message?: string };
+    if (!res.ok) {
+      throw new Error(data.message ?? '更新事件失敗');
+    }
+    setSpaceEvents((prev) => prev.map((ev) => (ev.id === eventId ? data : ev)));
+    return data;
+  };
+
+  const handleDeleteEvent = async (eventId: string): Promise<void> => {
+    const res = await fetch(`${baseUrl}/api/events/${eventId}`, {
+      method: 'DELETE',
+      headers: getAuthHeaders(),
+    });
+    const data = (await res.json().catch(() => ({}))) as { message?: string };
+    if (!res.ok) {
+      throw new Error(data.message ?? '刪除事件失敗');
+    }
+    setSpaceEvents((prev) => prev.filter((ev) => ev.id !== eventId));
+  };
+
   const currentUser = identityState?.currentUser ?? null;
   const isAdmin = familyDetail?.myRole === 'admin';
   const activeTimezone = currentUser?.defaultTimezone ?? health?.timezone ?? DEFAULT_TIMEZONE;
@@ -608,7 +700,7 @@ export function App() {
               BillCalendar — 生活行事曆 Demo
             </h1>
             <p className="text-xs text-slate-500">
-              高密度月曆與家庭協作示範應用（階段：P2 月曆版面、農曆節氣對照與日期時區規則）
+              高密度月曆與家庭協作示範應用（階段：P3 個人／家庭行事曆事件 CRUD 與月曆事件條整合）
             </p>
           </div>
 
@@ -631,13 +723,19 @@ export function App() {
       </header>
 
       <main className="mx-auto max-w-6xl space-y-6 px-4 py-6 sm:px-6">
-        {/* Main Calendar Layout & Right-Hand Function Tabs (Issue #5 & #6) */}
+        {/* Main Calendar Layout & Right-Hand Function Tabs (Issue #5, #6 & #7) */}
         <CalendarWorkspace
           navState={calendarNavState}
           onChangeNavState={setCalendarNavState}
           families={families}
           timezone={activeTimezone}
           onSelectFamilySpace={(fid) => setSelectedFamilyId(fid)}
+          events={currentUser ? spaceEvents : undefined}
+          eventsLoading={eventsLoading}
+          eventsError={eventsError}
+          onCreateEvent={currentUser ? handleCreateEvent : undefined}
+          onUpdateEvent={currentUser ? handleUpdateEvent : undefined}
+          onDeleteEvent={currentUser ? handleDeleteEvent : undefined}
         />
         {/* Global Action Message */}
         {familyMessage && (

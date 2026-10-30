@@ -1,6 +1,15 @@
 import { z } from 'zod';
 import { DEFAULT_TIMEZONE } from './health';
-import { getLunarDateInfo, type LunarDateInfo } from './lunar';
+import {
+  SUPPORTED_SOLAR_YEAR_MAX,
+  SUPPORTED_SOLAR_YEAR_MIN,
+  getLunarDateInfo,
+  type LunarDateInfo,
+} from './lunar';
+
+export const MIN_CALENDAR_YEAR = SUPPORTED_SOLAR_YEAR_MIN;
+export const MAX_CALENDAR_YEAR = SUPPORTED_SOLAR_YEAR_MAX;
+export const MAX_VISIBLE_EVENTS_PER_CELL = 2 as const;
 
 export const RightPanelTabSchema = z.enum([
   'summary',
@@ -103,6 +112,28 @@ export interface CalendarNavigationState {
   selectedSpace: SelectedSpace;
   mobileView: MobileViewMode;
   diaryAutoSwitchedToPersonal?: boolean;
+  selectedEventId?: string | null;
+}
+
+export type EventSpanPosition = 'single' | 'start' | 'middle' | 'end';
+
+export interface CalendarEventLike {
+  id: string;
+  title: string;
+  startsAt: string;
+  endsAt: string;
+  allDay: boolean;
+  timezone?: string | null;
+}
+
+export interface CalendarEventBarItem<T extends CalendarEventLike = CalendarEventLike> {
+  event: T;
+  dateStr: string;
+  spanPosition: EventSpanPosition;
+  spanDayIndex: number;
+  spanTotalDays: number;
+  isMultiDay: boolean;
+  timeLabel: string;
 }
 
 function pad2(num: number): string {
@@ -239,6 +270,113 @@ export function formatInstantToLocalDate(
 }
 
 /**
+ * Formats a UTC ISO 8601 timestamp string or Date into `HH:mm` (24-hour) in the specified IANA timezone.
+ */
+export function formatInstantToLocalTimeLabel(
+  instant: string | Date,
+  timeZone: string = DEFAULT_TIMEZONE,
+): string {
+  const dateObj =
+    instant instanceof Date ? instant : new Date(normalizeToUtcIsoTimestamp(instant));
+  if (Number.isNaN(dateObj.getTime())) {
+    throw new Error(`Invalid instant: ${String(instant)}`);
+  }
+  const targetTz = normalizeTimezone(timeZone);
+  try {
+    const formatter = new Intl.DateTimeFormat('en-GB', {
+      timeZone: targetTz,
+      hour: '2-digit',
+      minute: '2-digit',
+      hourCycle: 'h23',
+    });
+    const parts = formatter.formatToParts(dateObj);
+    const hour = parts.find((p) => p.type === 'hour')?.value;
+    const minute = parts.find((p) => p.type === 'minute')?.value;
+    if (hour && minute) {
+      return `${hour}:${minute}`;
+    }
+  } catch {
+    // Fallback to Asia/Taipei UTC+8
+  }
+  const taipeiMillis = dateObj.getTime() + 8 * 60 * 60 * 1000;
+  const d = new Date(taipeiMillis);
+  return `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}`;
+}
+
+/**
+ * Formats a UTC ISO 8601 timestamp string or Date into `YYYY-MM-DDTHH:mm` in the specified IANA timezone
+ * for populating datetime-local inputs or displaying local wall-clock time.
+ */
+export function formatInstantToLocalDateTimeInput(
+  instant: string | Date,
+  timeZone: string = DEFAULT_TIMEZONE,
+): string {
+  const localDate = formatInstantToLocalDate(instant, timeZone);
+  const localTime = formatInstantToLocalTimeLabel(instant, timeZone);
+  return `${localDate}T${localTime}`;
+}
+
+/**
+ * Converts either a full ISO 8601 timestamp (with `Z` or `±HH:MM`) OR a local wall-clock
+ * datetime string (`YYYY-MM-DDTHH:mm` / `YYYY-MM-DDTHH:mm:ss`) interpreted in `timeZone`
+ * into a canonical UTC ISO 8601 string (`...Z`).
+ */
+export function convertLocalDateTimeInTimezoneToUtcIso(
+  dateTimeOrIso: string,
+  timeZone: string = DEFAULT_TIMEZONE,
+): string {
+  const trimmed = dateTimeOrIso.trim();
+  if (isValidUtcIsoTimestamp(trimmed)) {
+    return normalizeToUtcIsoTimestamp(trimmed);
+  }
+  if (!isValidIanaTimezone(timeZone)) {
+    throw new Error(`Invalid IANA timezone: ${timeZone}`);
+  }
+  const match = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?$/.exec(trimmed);
+  if (!match) {
+    throw new Error(`Invalid datetime format: ${dateTimeOrIso}`);
+  }
+  const { year, month, day } = parseLocalDate(match[1]);
+  const hour = Number(match[2]);
+  const minute = Number(match[3]);
+  const second = match[4] !== undefined ? Number(match[4]) : 0;
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) {
+    throw new Error(`Out-of-range time component in datetime: ${dateTimeOrIso}`);
+  }
+
+  const targetUtcWallMs = Date.UTC(year, month - 1, day, hour, minute, second);
+  let guessMs = targetUtcWallMs;
+
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: timeZone.trim(),
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  });
+
+  for (let i = 0; i < 3; i++) {
+    const parts = formatter.formatToParts(new Date(guessMs));
+    const pYear = Number(parts.find((p) => p.type === 'year')?.value ?? year);
+    const pMonth = Number(parts.find((p) => p.type === 'month')?.value ?? month);
+    const pDay = Number(parts.find((p) => p.type === 'day')?.value ?? day);
+    const pHour = Number(parts.find((p) => p.type === 'hour')?.value ?? hour);
+    const pMinute = Number(parts.find((p) => p.type === 'minute')?.value ?? minute);
+    const pSecond = Number(parts.find((p) => p.type === 'second')?.value ?? second);
+
+    const observedWallMs = Date.UTC(pYear, pMonth - 1, pDay, pHour, pMinute, pSecond);
+    const diffMs = targetUtcWallMs - observedWallMs;
+    if (diffMs === 0) break;
+    guessMs += diffMs;
+  }
+
+  return new Date(guessMs).toISOString();
+}
+
+/**
  * Steps a pure local date `YYYY-MM-DD` by `deltaDays` (positive or negative)
  * using calendar-day arithmetic without host timezone drift.
  */
@@ -307,11 +445,145 @@ export function resolveEventCalendarDates(
   return listInclusiveLocalDates(startLocalDate, endLocalDate);
 }
 
+/**
+ * Maps a list of events onto calendar date cells (`YYYY-MM-DD`) using `resolveEventCalendarDates`
+ * (Issue #7 Requirement #2: supports single-day, multi-day, cross-timezone, and all-day events).
+ */
+export function buildCalendarEventsByDateMap<T extends CalendarEventLike>(
+  events: readonly T[],
+  displayTimezone?: string,
+): Record<string, CalendarEventBarItem<T>[]> {
+  const byDate: Record<string, CalendarEventBarItem<T>[]> = {};
+
+  for (const ev of events) {
+    let occupiedDates: string[];
+    try {
+      const effectiveTz = displayTimezone ?? ev.timezone ?? DEFAULT_TIMEZONE;
+      occupiedDates = resolveEventCalendarDates(ev, effectiveTz);
+    } catch {
+      continue;
+    }
+
+    const spanTotalDays = occupiedDates.length;
+    const isMultiDay = spanTotalDays > 1;
+    const effectiveTz = normalizeTimezone(displayTimezone ?? ev.timezone ?? DEFAULT_TIMEZONE);
+
+    for (let idx = 0; idx < spanTotalDays; idx++) {
+      const dateStr = occupiedDates[idx]!;
+      const spanDayIndex = idx + 1;
+      const spanPosition: EventSpanPosition = !isMultiDay
+        ? 'single'
+        : idx === 0
+          ? 'start'
+          : idx === spanTotalDays - 1
+            ? 'end'
+            : 'middle';
+
+      let timeLabel: string;
+      if (ev.allDay) {
+        timeLabel = isMultiDay ? `全天 (${spanDayIndex}/${spanTotalDays})` : '全天';
+      } else {
+        const startTimeStr = formatInstantToLocalTimeLabel(ev.startsAt, effectiveTz);
+        const endTimeStr = formatInstantToLocalTimeLabel(ev.endsAt, effectiveTz);
+        if (!isMultiDay) {
+          timeLabel = startTimeStr;
+        } else if (spanPosition === 'start') {
+          timeLabel = `${startTimeStr} 起 (${spanDayIndex}/${spanTotalDays})`;
+        } else if (spanPosition === 'end') {
+          timeLabel = `至 ${endTimeStr} (${spanDayIndex}/${spanTotalDays})`;
+        } else {
+          timeLabel = `跨日 (${spanDayIndex}/${spanTotalDays})`;
+        }
+      }
+
+      if (!byDate[dateStr]) {
+        byDate[dateStr] = [];
+      }
+      byDate[dateStr]!.push({
+        event: ev,
+        dateStr,
+        spanPosition,
+        spanDayIndex,
+        spanTotalDays,
+        isMultiDay,
+        timeLabel,
+      });
+    }
+  }
+
+  for (const dateStr of Object.keys(byDate)) {
+    byDate[dateStr]!.sort((a, b) => {
+      if (a.event.allDay !== b.event.allDay) {
+        return a.event.allDay ? -1 : 1;
+      }
+      if (a.isMultiDay !== b.isMultiDay) {
+        return a.isMultiDay ? -1 : 1;
+      }
+      const startCmp = a.event.startsAt.localeCompare(b.event.startsAt);
+      if (startCmp !== 0) return startCmp;
+      return a.event.id.localeCompare(b.event.id);
+    });
+  }
+
+  return byDate;
+}
+
+/**
+ * Computes visible event bars and overflow metadata for a single calendar cell
+ * (UX.md & Issue #7 Requirement #2: 月曆格過多事件時的收合呈現).
+ */
+export function getCellEventsDisplaySlice<T extends CalendarEventLike>(
+  cellEvents: readonly CalendarEventBarItem<T>[],
+  options?: { maxVisible?: number; isExpanded?: boolean },
+): {
+  visibleEvents: readonly CalendarEventBarItem<T>[];
+  totalCount: number;
+  hiddenCount: number;
+  hasOverflow: boolean;
+  isExpanded: boolean;
+} {
+  const maxVisible = options?.maxVisible ?? MAX_VISIBLE_EVENTS_PER_CELL;
+  const isExpanded = Boolean(options?.isExpanded);
+  const totalCount = cellEvents.length;
+  const hasOverflow = totalCount > maxVisible;
+  const hiddenCount = hasOverflow ? totalCount - maxVisible : 0;
+  const visibleEvents =
+    isExpanded || !hasOverflow ? cellEvents : cellEvents.slice(0, maxVisible);
+
+  return {
+    visibleEvents,
+    totalCount,
+    hiddenCount,
+    hasOverflow,
+    isExpanded,
+  };
+}
+
 export function shiftYearMonth(ym: YearMonth, deltaMonths: number): YearMonth {
   const zeroBasedMonth = ym.year * 12 + (ym.month - 1) + deltaMonths;
   const nextYear = Math.floor(zeroBasedMonth / 12);
   const nextMonth = (((zeroBasedMonth % 12) + 12) % 12) + 1;
   return { year: nextYear, month: nextMonth };
+}
+
+/**
+ * Clamps a `YearMonth` into the supported calendar navigation range (`1900-01` .. `2100-12`)
+ * (PR #26 Follow-up #2).
+ */
+export function clampYearMonthToSupportedRange(ym: YearMonth): YearMonth {
+  if (ym.year < MIN_CALENDAR_YEAR) {
+    return { year: MIN_CALENDAR_YEAR, month: 1 };
+  }
+  if (ym.year > MAX_CALENDAR_YEAR) {
+    return { year: MAX_CALENDAR_YEAR, month: 12 };
+  }
+  const clampedMonth = Math.min(12, Math.max(1, ym.month));
+  return { year: ym.year, month: clampedMonth };
+}
+
+export function canNavigateCalendarMonth(ym: YearMonth, deltaMonths: number): boolean {
+  const target = shiftYearMonth(ym, deltaMonths);
+  return target.year >= MIN_CALENDAR_YEAR && target.year <= MAX_CALENDAR_YEAR;
 }
 
 /**
@@ -394,24 +666,31 @@ export function createInitialCalendarNavigationState(
   initialTodayDate: string = getTodayLocalDate(),
 ): CalendarNavigationState {
   const { year, month } = parseLocalDate(initialTodayDate);
+  const clampedYm = clampYearMonthToSupportedRange({ year, month });
+  const effectiveSelectedDate =
+    clampedYm.year === year && clampedYm.month === month
+      ? initialTodayDate
+      : deriveSelectedDateForMonth(initialTodayDate, clampedYm);
   return {
     todayDate: initialTodayDate,
-    selectedDate: initialTodayDate,
-    displayedMonth: { year, month },
+    selectedDate: effectiveSelectedDate,
+    displayedMonth: clampedYm,
     activeTab: 'summary',
     selectedSpace: { kind: 'personal' },
     mobileView: 'calendar',
     diaryAutoSwitchedToPersonal: false,
+    selectedEventId: null,
   };
 }
 
 /**
- * Pure reducer transitions for calendar layout, right-hand tabs & space synchronization (Issue #5 & #6):
- * - Clicking blank area of a date cell selects that date, opens 'summary', and on mobile opens panel if requested.
+ * Pure reducer transitions for calendar layout, right-hand tabs & space synchronization (Issue #5, #6 & #7):
+ * - Clicking blank area of a date cell selects that date, clears `selectedEventId`, opens 'summary', and on mobile opens panel if requested.
+ * - Clicking an event bar inside a date cell selects that event (`selectedEventId`), updates `selectedDate` to the clicked cell date, and opens its Event Detail view.
  * - Switching tabs NEVER alters `selectedDate` or `todayDate`.
  * - Selecting 'diary' (`personalOnly: true`) while in a family space automatically routes `selectedSpace` back to `{ kind: 'personal' }` and flags `diaryAutoSwitchedToPersonal: true`.
  * - Switching to a family space while on the 'diary' tab transitions `activeTab` to `'summary'` so personal diary is never left open in family context.
- * - Navigating months updates `displayedMonth` and clamps `selectedDate` to the same day-of-month in target month without resetting to `todayDate`.
+ * - Navigating months updates `displayedMonth` (clamped within 1900–2100) and clamps `selectedDate` to the same day-of-month in target month without resetting to `todayDate`.
  */
 export function selectCalendarDateBlank(
   state: CalendarNavigationState,
@@ -419,13 +698,57 @@ export function selectCalendarDateBlank(
   options?: { openMobilePanel?: boolean },
 ): CalendarNavigationState {
   const { year, month } = parseLocalDate(targetDateStr);
+  const clampedYm = clampYearMonthToSupportedRange({ year, month });
+  const effectiveDateStr =
+    clampedYm.year === year && clampedYm.month === month
+      ? targetDateStr
+      : deriveSelectedDateForMonth(targetDateStr, clampedYm);
   return {
     ...state,
-    selectedDate: targetDateStr,
-    displayedMonth: { year, month },
+    selectedDate: effectiveDateStr,
+    displayedMonth: clampedYm,
     activeTab: 'summary',
     mobileView: options?.openMobilePanel ? 'panel' : state.mobileView,
     diaryAutoSwitchedToPersonal: false,
+    selectedEventId: null,
+  };
+}
+
+/**
+ * Triggered when clicking an event bar inside a calendar date cell (UX.md: "點日期格事件：開該事件詳情").
+ * Distinct from clicking the cell's blank area (`selectCalendarDateBlank`), this sets `selectedEventId`
+ * so the Right Panel directly displays that event's detail inspector.
+ */
+export function selectCalendarEventFromCell(
+  state: CalendarNavigationState,
+  eventId: string,
+  cellDateStr: string,
+  options?: { openMobilePanel?: boolean },
+): CalendarNavigationState {
+  const { year, month } = parseLocalDate(cellDateStr);
+  const clampedYm = clampYearMonthToSupportedRange({ year, month });
+  const effectiveDateStr =
+    clampedYm.year === year && clampedYm.month === month
+      ? cellDateStr
+      : deriveSelectedDateForMonth(cellDateStr, clampedYm);
+  return {
+    ...state,
+    selectedDate: effectiveDateStr,
+    displayedMonth: clampedYm,
+    activeTab: 'summary',
+    mobileView: options?.openMobilePanel ? 'panel' : state.mobileView,
+    diaryAutoSwitchedToPersonal: false,
+    selectedEventId: eventId,
+  };
+}
+
+export function clearSelectedCalendarEvent(
+  state: CalendarNavigationState,
+): CalendarNavigationState {
+  if (!state.selectedEventId) return state;
+  return {
+    ...state,
+    selectedEventId: null,
   };
 }
 
@@ -442,6 +765,7 @@ export function switchRightPanelTab(
     activeTab: nextTab,
     selectedSpace: autoSwitched ? { kind: 'personal' } : state.selectedSpace,
     diaryAutoSwitchedToPersonal: autoSwitched,
+    selectedEventId: autoSwitched ? null : state.selectedEventId,
     // selectedDate and todayDate are intentionally untouched
   };
 }
@@ -459,6 +783,7 @@ export function selectCalendarSpace(
     selectedSpace: nextSpace,
     activeTab: shouldLeavePersonalOnlyTab ? 'summary' : state.activeTab,
     diaryAutoSwitchedToPersonal: false,
+    selectedEventId: null,
   };
 }
 
@@ -469,13 +794,18 @@ export function selectCalendarSpace(
 export function resetCalendarSelectedSpaceToPersonal(
   state: CalendarNavigationState,
 ): CalendarNavigationState {
-  if (state.selectedSpace.kind === 'personal' && !state.diaryAutoSwitchedToPersonal) {
+  if (
+    state.selectedSpace.kind === 'personal' &&
+    !state.diaryAutoSwitchedToPersonal &&
+    !state.selectedEventId
+  ) {
     return state;
   }
   return {
     ...state,
     selectedSpace: { kind: 'personal' },
     diaryAutoSwitchedToPersonal: false,
+    selectedEventId: null,
   };
 }
 
@@ -494,6 +824,7 @@ export function reconcileCalendarSelectedSpace(
         ...state,
         selectedSpace: { kind: 'personal' },
         diaryAutoSwitchedToPersonal: false,
+        selectedEventId: null,
       };
     }
   }
@@ -523,7 +854,14 @@ export function navigateCalendarMonth(
   state: CalendarNavigationState,
   deltaMonths: number,
 ): CalendarNavigationState {
-  const nextMonth = shiftYearMonth(state.displayedMonth, deltaMonths);
+  const rawNextMonth = shiftYearMonth(state.displayedMonth, deltaMonths);
+  const nextMonth = clampYearMonthToSupportedRange(rawNextMonth);
+  if (
+    nextMonth.year === state.displayedMonth.year &&
+    nextMonth.month === state.displayedMonth.month
+  ) {
+    return state;
+  }
   const nextSelectedDate = deriveSelectedDateForMonth(state.selectedDate, nextMonth);
   return {
     ...state,
@@ -537,9 +875,14 @@ export function jumpCalendarToDate(
   targetDateStr: string,
 ): CalendarNavigationState {
   const { year, month } = parseLocalDate(targetDateStr);
+  const clampedYm = clampYearMonthToSupportedRange({ year, month });
+  const effectiveDateStr =
+    clampedYm.year === year && clampedYm.month === month
+      ? targetDateStr
+      : deriveSelectedDateForMonth(targetDateStr, clampedYm);
   return {
     ...state,
-    selectedDate: targetDateStr,
-    displayedMonth: { year, month },
+    selectedDate: effectiveDateStr,
+    displayedMonth: clampedYm,
   };
 }
