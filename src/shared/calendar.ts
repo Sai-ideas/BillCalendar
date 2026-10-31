@@ -906,6 +906,110 @@ export function navigateCalendarToEventSourceMessage(
   };
 }
 
+/**
+ * Issue #11: Pure state transition for navigating from a message's derived task badge to the task panel.
+ * - If the task belongs to personal scope (`scope === 'personal'`), switches `selectedSpace` to `{ kind: 'personal' }`.
+ * - If the task belongs to family scope (`scope === 'family'`), switches `selectedSpace` to `{ kind: 'family', familyId }`.
+ * - Opens the `'tasks'` tab.
+ * - If `task.dueDate` is present, jumps the calendar to that date; otherwise preserves the current `selectedDate`.
+ * - If familyId is unauthorized, returns `state` unchanged.
+ */
+export function navigateCalendarToDerivedTask(
+  state: CalendarNavigationState,
+  task: {
+    id: string;
+    scope: 'personal' | 'family';
+    familyId?: string | null;
+    dueDate?: string | null;
+  },
+  authorizedFamilyIds?: readonly string[],
+): CalendarNavigationState {
+  let targetSpace: SelectedSpace;
+  if (task.scope === 'personal') {
+    targetSpace = { kind: 'personal' };
+  } else if (task.scope === 'family' && task.familyId) {
+    if (authorizedFamilyIds && !authorizedFamilyIds.includes(task.familyId)) {
+      return state;
+    }
+    targetSpace = { kind: 'family', familyId: task.familyId };
+  } else {
+    return state;
+  }
+
+  let baseState = state;
+  if (task.dueDate && isValidLocalDateString(task.dueDate)) {
+    baseState = jumpCalendarToDate(state, task.dueDate);
+  }
+
+  return {
+    ...baseState,
+    selectedSpace: targetSpace,
+    activeTab: 'tasks',
+    selectedEventId: null,
+    highlightedSourceMessageId: null,
+    diaryAutoSwitchedToPersonal: false,
+    mobileView: 'panel',
+  };
+}
+
+/**
+ * Issue #11: Pure state transition for navigating from a message's derived event badge to the calendar / event inspector.
+ * - If the event belongs to personal scope (`scope === 'personal'`), switches `selectedSpace` to `{ kind: 'personal' }`.
+ * - If the event belongs to family scope (`scope === 'family'`), switches `selectedSpace` to `{ kind: 'family', familyId }`.
+ * - Opens the `'summary'` tab and focuses the event (`selectedEventId: event.id`).
+ * - Resolves the event's local start date and jumps the calendar to that date.
+ * - If familyId is unauthorized, returns `state` unchanged.
+ */
+export function navigateCalendarToDerivedEvent(
+  state: CalendarNavigationState,
+  event: {
+    id: string;
+    scope: 'personal' | 'family';
+    familyId?: string | null;
+    startsAt: string;
+    allDay?: boolean;
+  },
+  authorizedFamilyIds?: readonly string[],
+  timezone: string = DEFAULT_TIMEZONE,
+): CalendarNavigationState {
+  let targetSpace: SelectedSpace;
+  if (event.scope === 'personal') {
+    targetSpace = { kind: 'personal' };
+  } else if (event.scope === 'family' && event.familyId) {
+    if (authorizedFamilyIds && !authorizedFamilyIds.includes(event.familyId)) {
+      return state;
+    }
+    targetSpace = { kind: 'family', familyId: event.familyId };
+  } else {
+    return state;
+  }
+
+  let eventLocalDate: string | null = null;
+  if (event.allDay && isValidLocalDateString(event.startsAt)) {
+    eventLocalDate = event.startsAt;
+  } else if (isValidUtcIsoTimestamp(event.startsAt)) {
+    eventLocalDate = formatInstantToLocalDate(event.startsAt, timezone);
+  } else if (isValidLocalDateString(event.startsAt)) {
+    eventLocalDate = event.startsAt;
+  }
+
+  let baseState = state;
+  if (eventLocalDate && isValidLocalDateString(eventLocalDate)) {
+    baseState = jumpCalendarToDate(state, eventLocalDate);
+  }
+
+  return {
+    ...baseState,
+    selectedSpace: targetSpace,
+    activeTab: 'summary',
+    selectedEventId: event.id,
+    highlightedSourceMessageId: null,
+    diaryAutoSwitchedToPersonal: false,
+    mobileView: 'panel',
+  };
+}
+
+
 export function switchRightPanelTab(
   state: CalendarNavigationState,
   nextTab: RightPanelTab,

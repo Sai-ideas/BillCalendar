@@ -1,9 +1,17 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import {
+  DEFAULT_TIMEZONE,
   LocalDateStringSchema,
   formatChatDateDivider,
+  isValidLocalDateString,
   sortMessagesStably,
+  type CreateEventRequest,
+  type CreateTaskRequest,
+  type DerivedEventSummary,
+  type DerivedTaskSummary,
+  type EventDetail,
   type MessageWithAuthorizedDerived,
+  type TaskDetail,
 } from '../../shared';
 
 export interface ChatPanelProps {
@@ -27,6 +35,20 @@ export interface ChatPanelProps {
   onLoadLater?: () => Promise<void>;
   onSendMessage: (payload: { body: string; recordDate?: string | null }) => Promise<void>;
   onDeleteMessage: (messageId: string) => Promise<void>;
+  /** Issue #11: Callback to create an event derived from a message */
+  onCreateEventFromMessage?: (
+    message: MessageWithAuthorizedDerived,
+    payload: CreateEventRequest,
+  ) => Promise<EventDetail | void>;
+  /** Issue #11: Callback to create a task derived from a message */
+  onCreateTaskFromMessage?: (
+    message: MessageWithAuthorizedDerived,
+    payload: CreateTaskRequest,
+  ) => Promise<TaskDetail | void>;
+  /** Issue #11: Callback to navigate to a derived task */
+  onNavigateToDerivedTask?: (task: DerivedTaskSummary) => void;
+  /** Issue #11: Callback to navigate to a derived event */
+  onNavigateToDerivedEvent?: (event: DerivedEventSummary) => void;
 }
 
 const COMMON_EMOJIS = ['😊', '❤️', '🎉', '👍', '☕', '💡', '🎂', '🛒', '🌧️', '🌟', '🍜', '🚀'];
@@ -43,6 +65,17 @@ function formatTime(isoString: string): string {
   } catch {
     return '';
   }
+}
+
+interface ConvertFormState {
+  message: MessageWithAuthorizedDerived;
+  type: 'event' | 'task';
+  title: string;
+  scope: 'personal' | 'family';
+  dueDate: string;
+  allDay: boolean;
+  startsAt: string;
+  endsAt: string;
 }
 
 export function ChatPanel({
@@ -65,6 +98,10 @@ export function ChatPanel({
   onLoadLater,
   onSendMessage,
   onDeleteMessage,
+  onCreateEventFromMessage,
+  onCreateTaskFromMessage,
+  onNavigateToDerivedTask,
+  onNavigateToDerivedEvent,
 }: ChatPanelProps) {
   const [draftText, setDraftText] = useState('');
   const [draftRecordDate, setDraftRecordDate] = useState('');
@@ -72,6 +109,11 @@ export function ChatPanel({
   const [formError, setFormError] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [dismissedFallbackAlert, setDismissedFallbackAlert] = useState(false);
+
+  // Issue #11: Convert Message to Event / Task modal state
+  const [convertState, setConvertState] = useState<ConvertFormState | null>(null);
+  const [convertSubmitting, setConvertSubmitting] = useState(false);
+  const [convertError, setConvertError] = useState<string | null>(null);
 
   useEffect(() => {
     setDismissedFallbackAlert(false);
@@ -82,6 +124,7 @@ export function ChatPanel({
     setDraftText('');
     setDraftRecordDate('');
     setFormError(null);
+    setConvertState(null);
   }, [roomId, roomKind, familyDisplayName]);
 
   // Issue #28: Smooth scroll into view when highlightedMessageId is present and message exists
@@ -151,6 +194,149 @@ export function ChatPanel({
       setFormError(err instanceof Error ? err.message : '刪除訊息失敗');
     } finally {
       setDeletingId(null);
+    }
+  };
+
+  // Issue #11: Open convert dialog pre-filled with message body, date, and scope
+  const handleOpenConvert = (msg: MessageWithAuthorizedDerived, type: 'event' | 'task') => {
+    const defaultDate = msg.recordDate || msg.localDate || selectedDate;
+    setConvertError(null);
+    setConvertState({
+      message: msg,
+      type,
+      title: msg.body,
+      scope: roomKind === 'family' ? 'family' : 'personal',
+      dueDate: defaultDate,
+      allDay: true,
+      startsAt: defaultDate,
+      endsAt: defaultDate,
+    });
+  };
+
+  const handleCloseConvert = () => {
+    setConvertState(null);
+    setConvertError(null);
+    setConvertSubmitting(false);
+  };
+
+  // Issue #11: Submit convert form to create derived Event or Task
+  const handleConvertSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!convertState) return;
+    setConvertError(null);
+
+    const title = convertState.title.trim();
+    if (!title) {
+      setConvertError(convertState.type === 'event' ? '行程標題不可為空' : '待辦標題不可為空');
+      return;
+    }
+    if (title.length > 200) {
+      setConvertError('標題不可超過 200 字元');
+      return;
+    }
+
+    setConvertSubmitting(true);
+    try {
+      if (convertState.type === 'task') {
+        const dueRaw = convertState.dueDate.trim();
+        let dueDate: string | null = null;
+        if (dueRaw) {
+          const parsed = LocalDateStringSchema.safeParse(dueRaw);
+          if (!parsed.success) {
+            setConvertError('截止日期格式無效 (需為 YYYY-MM-DD)');
+            setConvertSubmitting(false);
+            return;
+          }
+          dueDate = parsed.data;
+        }
+
+        const payload: CreateTaskRequest = {
+          scope: convertState.scope,
+          familyId:
+            convertState.scope === 'family'
+              ? (convertState.message.familyId ?? roomId)
+              : undefined,
+          title,
+          dueDate,
+          sourceMessageId: convertState.message.id,
+        };
+
+        if (onCreateTaskFromMessage) {
+          await onCreateTaskFromMessage(convertState.message, payload);
+        }
+      } else {
+        // Event
+        if (convertState.allDay) {
+          const starts = convertState.startsAt.trim();
+          const ends = convertState.endsAt.trim();
+          if (!isValidLocalDateString(starts)) {
+            setConvertError('全天事件開始日期必須為 YYYY-MM-DD');
+            setConvertSubmitting(false);
+            return;
+          }
+          if (!isValidLocalDateString(ends)) {
+            setConvertError('全天事件結束日期必須為 YYYY-MM-DD');
+            setConvertSubmitting(false);
+            return;
+          }
+          if (ends < starts) {
+            setConvertError('全天事件結束日期不可早於開始日期');
+            setConvertSubmitting(false);
+            return;
+          }
+
+          const payload: CreateEventRequest = {
+            scope: convertState.scope,
+            familyId:
+              convertState.scope === 'family'
+                ? (convertState.message.familyId ?? roomId)
+                : undefined,
+            title,
+            allDay: true,
+            startsAt: starts,
+            endsAt: ends,
+            timezone: DEFAULT_TIMEZONE,
+            sourceMessageId: convertState.message.id,
+          };
+
+          if (onCreateEventFromMessage) {
+            await onCreateEventFromMessage(convertState.message, payload);
+          }
+        } else {
+          // Non-all-day event
+          const starts = convertState.startsAt.trim();
+          const ends = convertState.endsAt.trim();
+          if (!starts || !ends) {
+            setConvertError('請輸入開始與結束時間');
+            setConvertSubmitting(false);
+            return;
+          }
+
+          const payload: CreateEventRequest = {
+            scope: convertState.scope,
+            familyId:
+              convertState.scope === 'family'
+                ? (convertState.message.familyId ?? roomId)
+                : undefined,
+            title,
+            allDay: false,
+            startsAt: starts,
+            endsAt: ends,
+            timezone: DEFAULT_TIMEZONE,
+            sourceMessageId: convertState.message.id,
+          };
+
+          if (onCreateEventFromMessage) {
+            await onCreateEventFromMessage(convertState.message, payload);
+          }
+        }
+      }
+
+      handleCloseConvert();
+    } catch (err: unknown) {
+      setConvertError(err instanceof Error ? err.message : '建立衍生項目失敗');
+    } finally {
+      setConvertSubmitting(false);
     }
   };
 
@@ -355,7 +541,30 @@ export function ChatPanel({
                   {msg.body}
                 </div>
 
-                {/* Badges: recordDate and derived tasks/events */}
+                {/* Issue #11: Actions toolbar - Convert to Event / Task */}
+                <div className="mt-2 flex flex-wrap items-center gap-1.5 pt-1.5 border-t border-slate-150/60">
+                  <span className="text-[10px] text-slate-400 font-medium">轉為紀錄：</span>
+                  <button
+                    type="button"
+                    data-testid={`chat-convert-event-button-${msg.id}`}
+                    onClick={() => handleOpenConvert(msg, 'event')}
+                    className="rounded border border-indigo-200 bg-indigo-50/70 hover:bg-indigo-100 px-2 py-0.5 text-[10px] font-semibold text-indigo-700 transition-colors cursor-pointer"
+                    title="將此訊息轉為日曆行程 (原訊息不修改)"
+                  >
+                    + 行程
+                  </button>
+                  <button
+                    type="button"
+                    data-testid={`chat-convert-task-button-${msg.id}`}
+                    onClick={() => handleOpenConvert(msg, 'task')}
+                    className="rounded border border-emerald-200 bg-emerald-50/70 hover:bg-emerald-100 px-2 py-0.5 text-[10px] font-semibold text-emerald-700 transition-colors cursor-pointer"
+                    title="將此訊息轉為待辦事項 (原訊息不修改)"
+                  >
+                    + 待辦
+                  </button>
+                </div>
+
+                {/* Badges: recordDate and clickable derived tasks/events */}
                 <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[10px]">
                   {msg.recordDate && (
                     <span
@@ -366,20 +575,28 @@ export function ChatPanel({
                     </span>
                   )}
                   {msg.derivedTasks?.map((t) => (
-                    <span
+                    <button
                       key={t.id}
-                      className="inline-flex items-center gap-1 rounded bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 text-emerald-800 font-medium"
+                      type="button"
+                      data-testid={`chat-derived-task-${t.id}`}
+                      onClick={() => onNavigateToDerivedTask?.(t)}
+                      className="inline-flex items-center gap-1 rounded bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 text-emerald-800 font-medium hover:bg-emerald-100 hover:border-emerald-300 transition-colors cursor-pointer"
+                      title={`點擊查看衍生待辦：${t.title}`}
                     >
                       ✓ 待辦：{t.title}
-                    </span>
+                    </button>
                   ))}
                   {msg.derivedEvents?.map((ev) => (
-                    <span
+                    <button
                       key={ev.id}
-                      className="inline-flex items-center gap-1 rounded bg-blue-50 border border-blue-200 px-1.5 py-0.5 text-blue-800 font-medium"
+                      type="button"
+                      data-testid={`chat-derived-event-${ev.id}`}
+                      onClick={() => onNavigateToDerivedEvent?.(ev)}
+                      className="inline-flex items-center gap-1 rounded bg-blue-50 border border-blue-200 px-1.5 py-0.5 text-blue-800 font-medium hover:bg-blue-100 hover:border-blue-300 transition-colors cursor-pointer"
+                      title={`點擊查看衍生行程：${ev.title}`}
                     >
                       📅 行程：{ev.title}
-                    </span>
+                    </button>
                   ))}
                 </div>
               </div>
@@ -481,6 +698,260 @@ export function ChatPanel({
           </div>
         )}
       </form>
+
+      {/* Issue #11: Modal Dialog for converting message to Event / Task */}
+      {convertState && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          data-testid="chat-convert-modal"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-xs p-4"
+        >
+          <div className="w-full max-w-md rounded-xl border border-slate-200 bg-white p-5 shadow-xl space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-200 pb-2">
+              <h3
+                data-testid="convert-modal-title"
+                className="text-sm font-bold text-slate-900"
+              >
+                {convertState.type === 'event' ? '📅 訊息轉為行程' : '✓ 訊息轉為待辦'}
+              </h3>
+              <button
+                type="button"
+                data-testid="convert-modal-close-btn"
+                onClick={handleCloseConvert}
+                className="text-slate-400 hover:text-slate-600 text-base font-semibold leading-none cursor-pointer"
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Immutability & provenance notice */}
+            <div className="rounded-md border border-indigo-100 bg-indigo-50/60 p-2.5 text-[11px] text-indigo-900 space-y-1">
+              <p className="font-medium">
+                💬 來源訊息：
+                <span className="font-normal text-indigo-800 line-clamp-2">
+                  「{convertState.message.body}」
+                </span>
+              </p>
+              <p className="text-[10px] text-indigo-700">
+                ℹ️ 建立後原訊息本文完整保留不變；同一則訊息允許重複衍生多筆行程或待辦。
+              </p>
+            </div>
+
+            <form
+              data-testid="convert-modal-form"
+              onSubmit={(e) => void handleConvertSubmit(e)}
+              className="space-y-3 text-xs"
+            >
+              {/* Title Input */}
+              <div className="space-y-1">
+                <label
+                  htmlFor="convert-title-input"
+                  className="block font-semibold text-slate-700"
+                >
+                  {convertState.type === 'event' ? '行程標題' : '待辦標題'}{' '}
+                  <span className="text-rose-500">*</span>
+                </label>
+                <input
+                  id="convert-title-input"
+                  data-testid="convert-title-input"
+                  type="text"
+                  maxLength={200}
+                  value={convertState.title}
+                  onChange={(e) =>
+                    setConvertState((prev) => (prev ? { ...prev, title: e.target.value } : null))
+                  }
+                  placeholder="請輸入標題..."
+                  className="w-full rounded-md border border-slate-300 px-3 py-1.5 text-xs text-slate-900 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                />
+              </div>
+
+              {/* Target Space Selection */}
+              <div className="space-y-1">
+                <label
+                  htmlFor="convert-scope-select"
+                  className="block font-semibold text-slate-700"
+                >
+                  建立空間範圍
+                </label>
+                {roomKind === 'family' ? (
+                  <select
+                    id="convert-scope-select"
+                    data-testid="convert-scope-select"
+                    value={convertState.scope}
+                    onChange={(e) =>
+                      setConvertState((prev) =>
+                        prev
+                          ? { ...prev, scope: e.target.value as 'personal' | 'family' }
+                          : null,
+                      )
+                    }
+                    className="w-full rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs text-slate-800 focus:border-indigo-500 focus:outline-none"
+                  >
+                    <option value="family">
+                      🏠 家庭空間（{familyDisplayName || '此家庭'}）
+                    </option>
+                    <option value="personal">🔒 個人私人空間（僅自己可見）</option>
+                  </select>
+                ) : (
+                  <div className="rounded border border-slate-200 bg-slate-50 px-3 py-1.5 text-slate-600">
+                    🔒 個人私人空間（personal）
+                  </div>
+                )}
+              </div>
+
+              {/* Task Fields */}
+              {convertState.type === 'task' && (
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between">
+                    <label
+                      htmlFor="convert-due-date-input"
+                      className="block font-semibold text-slate-700"
+                    >
+                      截止日期（選填）
+                    </label>
+                    {convertState.dueDate && (
+                      <button
+                        type="button"
+                        data-testid="convert-clear-due-date-btn"
+                        onClick={() =>
+                          setConvertState((prev) => (prev ? { ...prev, dueDate: '' } : null))
+                        }
+                        className="text-[10px] text-slate-500 hover:text-slate-800 underline cursor-pointer"
+                      >
+                        清除日期
+                      </button>
+                    )}
+                  </div>
+                  <input
+                    id="convert-due-date-input"
+                    data-testid="convert-due-date-input"
+                    type="date"
+                    value={convertState.dueDate}
+                    onChange={(e) =>
+                      setConvertState((prev) => (prev ? { ...prev, dueDate: e.target.value } : null))
+                    }
+                    className="w-full rounded-md border border-slate-300 px-3 py-1.5 text-xs text-slate-800 focus:border-indigo-500 focus:outline-none"
+                  />
+                </div>
+              )}
+
+              {/* Event Fields */}
+              {convertState.type === 'event' && (
+                <div className="space-y-2.5">
+                  <div className="flex items-center gap-2">
+                    <input
+                      id="convert-allday-input"
+                      data-testid="convert-allday-input"
+                      type="checkbox"
+                      checked={convertState.allDay}
+                      onChange={(e) => {
+                        const checked = e.target.checked;
+                        const defaultDate =
+                          convertState.message.recordDate ||
+                          convertState.message.localDate ||
+                          selectedDate;
+                        setConvertState((prev) =>
+                          prev
+                            ? {
+                                ...prev,
+                                allDay: checked,
+                                startsAt: checked ? defaultDate : `${defaultDate}T09:00`,
+                                endsAt: checked ? defaultDate : `${defaultDate}T10:00`,
+                              }
+                            : null,
+                        );
+                      }}
+                      className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                    />
+                    <label
+                      htmlFor="convert-allday-input"
+                      className="text-xs font-semibold text-slate-700 cursor-pointer"
+                    >
+                      全天行程（不經時區換日）
+                    </label>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2">
+                    <div className="space-y-1">
+                      <label
+                        htmlFor="convert-starts-at-input"
+                        className="block text-[11px] font-semibold text-slate-700"
+                      >
+                        開始時間 / 日期 <span className="text-rose-500">*</span>
+                      </label>
+                      <input
+                        id="convert-starts-at-input"
+                        data-testid="convert-starts-at-input"
+                        type={convertState.allDay ? 'date' : 'datetime-local'}
+                        value={convertState.startsAt}
+                        onChange={(e) =>
+                          setConvertState((prev) =>
+                            prev ? { ...prev, startsAt: e.target.value } : null,
+                          )
+                        }
+                        className="w-full rounded-md border border-slate-300 px-2.5 py-1 text-xs text-slate-800 focus:border-indigo-500 focus:outline-none"
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <label
+                        htmlFor="convert-ends-at-input"
+                        className="block text-[11px] font-semibold text-slate-700"
+                      >
+                        結束時間 / 日期 <span className="text-rose-500">*</span>
+                      </label>
+                      <input
+                        id="convert-ends-at-input"
+                        data-testid="convert-ends-at-input"
+                        type={convertState.allDay ? 'date' : 'datetime-local'}
+                        value={convertState.endsAt}
+                        onChange={(e) =>
+                          setConvertState((prev) =>
+                            prev ? { ...prev, endsAt: e.target.value } : null,
+                          )
+                        }
+                        className="w-full rounded-md border border-slate-300 px-2.5 py-1 text-xs text-slate-800 focus:border-indigo-500 focus:outline-none"
+                      />
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Error Alert */}
+              {convertError && (
+                <div
+                  role="alert"
+                  data-testid="convert-error"
+                  className="rounded-md border border-rose-200 bg-rose-50 p-2 text-[11px] font-medium text-rose-700"
+                >
+                  {convertError}
+                </div>
+              )}
+
+              {/* Footer Buttons */}
+              <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-200">
+                <button
+                  type="button"
+                  data-testid="convert-cancel-button"
+                  disabled={convertSubmitting}
+                  onClick={handleCloseConvert}
+                  className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 transition-colors"
+                >
+                  取消
+                </button>
+                <button
+                  type="submit"
+                  data-testid="convert-submit-button"
+                  disabled={convertSubmitting || !convertState.title.trim()}
+                  className="rounded-md bg-indigo-600 px-4 py-1.5 text-xs font-semibold text-white shadow-xs hover:bg-indigo-700 disabled:opacity-50 transition-colors"
+                >
+                  {convertSubmitting ? '建立中...' : '確認建立'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -99,7 +99,14 @@ function eventFixture(
 function taskFixture(
   title: string,
   scope: 'personal' | 'family',
-  opts: { ownerUserId?: string | null; familyId?: string | null; dueDate?: string | null } = {},
+  opts: {
+    ownerUserId?: string | null;
+    familyId?: string | null;
+    dueDate?: string | null;
+    sourceMessageId?: string | null;
+    sourceStatus?: 'none' | 'accessible' | 'deleted' | 'inaccessible';
+    sourceMessage?: any;
+  } = {},
 ) {
   return {
     id: `task_${title}`,
@@ -110,9 +117,9 @@ function taskFixture(
     title,
     dueDate: opts.dueDate === undefined ? TODAY : opts.dueDate,
     completedAt: null,
-    sourceMessageId: null,
-    sourceStatus: 'none',
-    sourceMessage: null,
+    sourceMessageId: opts.sourceMessageId ?? null,
+    sourceStatus: opts.sourceStatus ?? (opts.sourceMessageId ? 'accessible' : 'none'),
+    sourceMessage: opts.sourceMessage ?? null,
     createdBy: 'usr_alice',
     createdAt: NOW,
     updatedAt: NOW,
@@ -319,6 +326,7 @@ function installFakeApi(initialSession: SessionId | null): FakeApi {
               ownerUserId: USERS[session as SessionId].id,
               familyId: body.familyId ?? null,
               dueDate: body.dueDate ?? null,
+              sourceMessageId: body.sourceMessageId ?? null,
             });
             return json(created, 201);
           }
@@ -1279,4 +1287,131 @@ describe('Issue #8 <App /> task CRUD against the API', () => {
     expect(screen.getByTestId('chat-source-missing-alert').textContent).toContain('來源訊息已遭移除、不存在或無存取權限');
   });
 
+
+  it('Issue #11 <App />: clicking "查看來源聊天" on a task jumps to source message, switches to mood room, and focuses locator', async () => {
+    const api = installFakeApi('sess_alice');
+    const scrollMock = vi.fn();
+    Element.prototype.scrollIntoView = scrollMock;
+
+    const sourceMsgId = 'msg_src_task_e2e';
+    const sourceMsg = {
+      id: sourceMsgId,
+      roomId: 'room_personal',
+      roomKind: 'personal' as const,
+      familyId: null,
+      senderUserId: 'usr_alice',
+      senderDisplayName: '愛麗絲',
+      body: '生活筆記：記得繳電費 ⚡',
+      localDate: '2026-10-26',
+      recordDate: null,
+      createdAt: '2026-10-26T08:00:00.000Z',
+      updatedAt: '2026-10-26T08:00:00.000Z',
+      derivedTasks: [],
+      derivedEvents: [],
+      derivedCount: 1,
+    };
+    api.chatStore = [sourceMsg];
+
+    const electricTask = {
+      id: 'task_electric',
+      listId: 'list_personal',
+      scope: 'personal' as const,
+      ownerUserId: 'usr_alice',
+      familyId: null,
+      title: '繳電費 ⚡',
+      dueDate: TODAY,
+      completedAt: null,
+      sourceMessageId: sourceMsgId,
+      sourceStatus: 'accessible' as const,
+      sourceMessage: {
+        id: sourceMsgId,
+        roomId: 'room_personal',
+        roomKind: 'personal' as const,
+        familyId: null,
+        localDate: '2026-10-26',
+        body: '生活筆記：記得繳電費 ⚡',
+      },
+      createdBy: 'usr_alice',
+      createdAt: NOW,
+      updatedAt: NOW,
+    };
+    api.data.set('tasks:sess_alice:personal', [electricTask]);
+
+    render(<App />);
+
+    // Go to tasks tab
+    fireEvent.click(await screen.findByTestId('right-tab-tasks'));
+    expect(await screen.findByTestId('task-source-task_electric')).toBeTruthy();
+
+    // Click "查看來源聊天 ➔"
+    const jumpBtn = screen.getByTestId('task-jump-source-task_electric');
+    fireEvent.click(jumpBtn);
+
+    // Navigates to mood tab, sets date to 2026-10-26 and locates source message
+    await waitFor(() => {
+      expect(screen.getByTestId('chat-panel-source-message-locator')).toBeTruthy();
+      expect(screen.getByTestId(`chat-message-${sourceMsgId}`)).toBeTruthy();
+    });
+
+    const msgEl = screen.getByTestId(`chat-message-${sourceMsgId}`);
+    expect(msgEl.getAttribute('data-highlighted')).toBe('true');
+  });
+
+  it('Issue #11 <App />: converts a message to a task via modal, updates derived badge immediately, and badge click navigates to task', async () => {
+    const api = installFakeApi('sess_alice');
+
+    const sourceMsgId = 'msg_convert_app_test';
+    const sourceMsg = {
+      id: sourceMsgId,
+      roomId: 'room_personal',
+      roomKind: 'personal' as const,
+      familyId: null,
+      senderUserId: 'usr_alice',
+      senderDisplayName: '愛麗絲',
+      body: '待辦提醒：寄送週報與請款單',
+      localDate: TODAY,
+      recordDate: null,
+      createdAt: NOW,
+      updatedAt: NOW,
+      derivedTasks: [],
+      derivedEvents: [],
+      derivedCount: 0,
+    };
+    api.chatStore = [sourceMsg];
+
+    render(<App />);
+
+    // Go to mood tab
+    fireEvent.click(await screen.findByTestId('right-tab-mood'));
+    expect(await screen.findByTestId(`chat-message-${sourceMsgId}`)).toBeTruthy();
+
+    // Click "+ 待辦"
+    fireEvent.click(screen.getByTestId(`chat-convert-task-button-${sourceMsgId}`));
+
+    // Verify modal is open and prefilled
+    expect(screen.getByTestId('chat-convert-modal')).toBeTruthy();
+    expect((screen.getByTestId('convert-title-input') as HTMLInputElement).value).toBe('待辦提醒：寄送週報與請款單');
+
+    // Submit convert form
+    fireEvent.click(screen.getByTestId('convert-submit-button'));
+
+    // Modal closes
+    await waitFor(() => {
+      expect(screen.queryByTestId('chat-convert-modal')).toBeNull();
+    });
+
+    // Badge appears on message card!
+    await waitFor(() => {
+      expect(screen.getByText(/✓ 待辦：待辦提醒：寄送週報與請款單/)).toBeTruthy();
+    });
+
+    // Click derived task badge to navigate to tasks tab
+    const badge = screen.getByText(/✓ 待辦：待辦提醒：寄送週報與請款單/);
+    fireEvent.click(badge);
+
+    // Navigates to tasks tab
+    await waitFor(() => {
+      expect(screen.getByTestId('right-tab-tasks').getAttribute('aria-selected')).toBe('true');
+    });
+  });
 });

@@ -30,6 +30,10 @@ import {
   jumpCalendarToDate,
   navigateCalendarMonth,
   navigateCalendarToEventSourceMessage,
+  navigateCalendarToDerivedTask,
+  navigateCalendarToDerivedEvent,
+  type DerivedEventSummary,
+  type DerivedTaskSummary,
   normalizeToUtcIsoTimestamp,
   openCalendarTasksForDate,
   refreshCalendarTodayDate,
@@ -450,6 +454,178 @@ export function CalendarWorkspace({
       ...switchRightPanelTab(navState, tab),
       mobileView: 'panel',
     });
+  };
+
+  // Issue #11: Handlers for creating events and tasks derived from a message
+  const handleCreateEventFromMessage = async (
+    msg: MessageWithAuthorizedDerived,
+    payload: CreateEventRequest,
+  ): Promise<EventDetail | void> => {
+    let created: EventDetail;
+    if (onCreateEvent) {
+      created = await onCreateEvent(payload);
+    } else {
+      const nowIso = new Date().toISOString();
+      created = {
+        id: `evt_local_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        calendarId:
+          payload.scope === 'family' && payload.familyId
+            ? `cal_fam_${payload.familyId}`
+            : `cal_user_${currentUserId ?? 'default'}`,
+        scope: payload.scope,
+        ownerUserId: payload.scope === 'personal' ? (currentUserId ?? null) : null,
+        familyId: payload.scope === 'family' ? payload.familyId ?? null : null,
+        title: payload.title,
+        description: payload.description ?? null,
+        startsAt: payload.startsAt,
+        endsAt: payload.endsAt,
+        allDay: payload.allDay ?? false,
+        timezone: payload.timezone ?? timezone,
+        sourceMessageId: msg.id,
+        sourceStatus: 'accessible',
+        sourceMessage: {
+          id: msg.id,
+          roomId: msg.roomId,
+          roomKind: msg.roomKind,
+          familyId: msg.familyId,
+          localDate: msg.localDate,
+          recordDate: msg.recordDate,
+          body: msg.body,
+          senderUserId: msg.senderUserId,
+          senderDisplayName: msg.senderDisplayName,
+          createdAt: msg.createdAt,
+        },
+        createdBy: currentUserId ?? 'usr_local',
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+      setLocalEvents((prev) => [...prev, created]);
+    }
+
+    const derivedEv: DerivedEventSummary = {
+      id: created.id,
+      scope: created.scope,
+      ownerUserId: created.createdBy,
+      familyId: created.familyId,
+      title: created.title,
+      startsAt: created.startsAt,
+      endsAt: created.endsAt,
+      allDay: created.allDay,
+      createdAt: created.createdAt,
+    };
+    setLocalChatMessages((prev) =>
+      prev.map((m) =>
+        m.id === msg.id
+          ? {
+              ...m,
+              derivedEvents: [...(m.derivedEvents || []), derivedEv],
+              derivedCount: (m.derivedCount || 0) + 1,
+            }
+          : m,
+      ),
+    );
+    return created;
+  };
+
+  const handleCreateTaskFromMessage = async (
+    msg: MessageWithAuthorizedDerived,
+    payload: CreateTaskRequest,
+  ): Promise<TaskDetail | void> => {
+    let created: TaskDetail;
+    if (onCreateTask) {
+      created = await onCreateTask(payload);
+    } else {
+      const nowIso = new Date().toISOString();
+      created = {
+        id: `task_local_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        listId:
+          payload.scope === 'family' && payload.familyId
+            ? `list_fam_${payload.familyId}`
+            : `list_user_${currentUserId ?? 'default'}`,
+        scope: payload.scope,
+        ownerUserId: payload.scope === 'personal' ? (currentUserId ?? null) : null,
+        familyId: payload.scope === 'family' ? payload.familyId ?? null : null,
+        title: payload.title,
+        dueDate: payload.dueDate ?? null,
+        completedAt: null,
+        sourceMessageId: msg.id,
+        sourceStatus: 'accessible',
+        sourceMessage: {
+          id: msg.id,
+          roomId: msg.roomId,
+          roomKind: msg.roomKind,
+          familyId: msg.familyId,
+          localDate: msg.localDate,
+          recordDate: msg.recordDate,
+          body: msg.body,
+          senderUserId: msg.senderUserId,
+          senderDisplayName: msg.senderDisplayName,
+          createdAt: msg.createdAt,
+        },
+        createdBy: currentUserId ?? 'usr_local',
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+      setLocalTasks((prev) => [...prev, created]);
+    }
+
+    const derivedT: DerivedTaskSummary = {
+      id: created.id,
+      scope: created.scope,
+      ownerUserId: created.createdBy,
+      familyId: created.familyId,
+      title: created.title,
+      dueDate: created.dueDate,
+      completedAt: created.completedAt,
+      createdAt: created.createdAt,
+    };
+    setLocalChatMessages((prev) =>
+      prev.map((m) =>
+        m.id === msg.id
+          ? {
+              ...m,
+              derivedTasks: [...(m.derivedTasks || []), derivedT],
+              derivedCount: (m.derivedCount || 0) + 1,
+            }
+          : m,
+      ),
+    );
+    return created;
+  };
+
+  const handleNavigateToDerivedTask = (task: DerivedTaskSummary) => {
+    const authorizedFamilyIds = families.map((f) => f.id);
+    const nextState = navigateCalendarToDerivedTask(
+      navState,
+      task,
+      authorizedFamilyIds,
+    );
+    if (nextState === navState) return;
+    onChangeNavState(nextState);
+    if (
+      nextState.selectedSpace.kind === 'family' &&
+      onSelectFamilySpace
+    ) {
+      onSelectFamilySpace(nextState.selectedSpace.familyId);
+    }
+  };
+
+  const handleNavigateToDerivedEvent = (ev: DerivedEventSummary) => {
+    const authorizedFamilyIds = families.map((f) => f.id);
+    const nextState = navigateCalendarToDerivedEvent(
+      navState,
+      ev,
+      authorizedFamilyIds,
+      timezone,
+    );
+    if (nextState === navState) return;
+    onChangeNavState(nextState);
+    if (
+      nextState.selectedSpace.kind === 'family' &&
+      onSelectFamilySpace
+    ) {
+      onSelectFamilySpace(nextState.selectedSpace.familyId);
+    }
   };
 
   const handleJumpToSourceMessage = (ev: Pick<EventDetail, 'sourceStatus' | 'sourceMessage'>) => {
@@ -2049,6 +2225,10 @@ export function CalendarWorkspace({
                     onLoadLater={onChatLoadLater}
                     onSendMessage={handleSendChatMessage}
                     onDeleteMessage={handleDeleteChatMessage}
+                    onCreateEventFromMessage={handleCreateEventFromMessage}
+                    onCreateTaskFromMessage={handleCreateTaskFromMessage}
+                    onNavigateToDerivedTask={handleNavigateToDerivedTask}
+                    onNavigateToDerivedEvent={handleNavigateToDerivedEvent}
                   />
                 )}
 
@@ -2076,6 +2256,10 @@ export function CalendarWorkspace({
                       onLoadLater={onChatLoadLater}
                       onSendMessage={handleSendChatMessage}
                       onDeleteMessage={handleDeleteChatMessage}
+                      onCreateEventFromMessage={handleCreateEventFromMessage}
+                      onCreateTaskFromMessage={handleCreateTaskFromMessage}
+                      onNavigateToDerivedTask={handleNavigateToDerivedTask}
+                      onNavigateToDerivedEvent={handleNavigateToDerivedEvent}
                     />
                   ) : (
                     <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-xs text-slate-700 space-y-2">
