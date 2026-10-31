@@ -10,6 +10,8 @@ import {
   type CreateEventRequest,
   type CreateTaskRequest,
   type EventDetail,
+  type DerivedEventSummary,
+  type DerivedTaskSummary,
   type FamilyDetail,
   type FamilyInvitationSummary,
   type FamilySummary,
@@ -1209,7 +1211,38 @@ export function App() {
       throw new Error(data.message ?? '建立事件失敗');
     }
     if (epoch === contextEpochRef.current) {
-      setSpaceEvents((prev) => [...prev, data]);
+      const currentSpace = calendarNavState.selectedSpace;
+      const matchesCurrentSpace =
+        (currentSpace.kind === 'personal' && data.scope === 'personal') ||
+        (currentSpace.kind === 'family' && data.scope === 'family' && data.familyId === currentSpace.familyId);
+      if (matchesCurrentSpace) {
+        setSpaceEvents((prev) => [...prev, data]);
+      }
+      if (data.sourceMessageId) {
+        const derivedEv: DerivedEventSummary = {
+          id: data.id,
+          scope: data.scope,
+          ownerUserId: data.createdBy,
+          familyId: data.familyId ?? null,
+          title: data.title,
+          startsAt: data.startsAt,
+          endsAt: data.endsAt,
+          allDay: data.allDay,
+          createdAt: data.createdAt,
+        };
+        setChatState((prev) => ({
+          ...prev,
+          messages: prev.messages.map((m) =>
+            m.id === data.sourceMessageId
+              ? {
+                  ...m,
+                  derivedEvents: [...(m.derivedEvents || []), derivedEv],
+                  derivedCount: (m.derivedCount || 0) + 1,
+                }
+              : m,
+          ),
+        }));
+      }
     }
     return data;
   };
@@ -1268,7 +1301,37 @@ export function App() {
       throw new Error(data.message ?? '建立待辦失敗');
     }
     if (epoch === contextEpochRef.current) {
-      setSpaceTasks((prev) => [...prev, data]);
+      const currentSpace = calendarNavState.selectedSpace;
+      const matchesCurrentSpace =
+        (currentSpace.kind === 'personal' && data.scope === 'personal') ||
+        (currentSpace.kind === 'family' && data.scope === 'family' && data.familyId === currentSpace.familyId);
+      if (matchesCurrentSpace) {
+        setSpaceTasks((prev) => [...prev, data]);
+      }
+      if (data.sourceMessageId) {
+        const derivedT: DerivedTaskSummary = {
+          id: data.id,
+          scope: data.scope,
+          ownerUserId: data.createdBy,
+          familyId: data.familyId ?? null,
+          title: data.title,
+          dueDate: data.dueDate,
+          completedAt: data.completedAt,
+          createdAt: data.createdAt,
+        };
+        setChatState((prev) => ({
+          ...prev,
+          messages: prev.messages.map((m) =>
+            m.id === data.sourceMessageId
+              ? {
+                  ...m,
+                  derivedTasks: [...(m.derivedTasks || []), derivedT],
+                  derivedCount: (m.derivedCount || 0) + 1,
+                }
+              : m,
+          ),
+        }));
+      }
     }
     return data;
   };

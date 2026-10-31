@@ -148,6 +148,8 @@ export {
   navigateCalendarMonth,
   jumpCalendarToDate,
   navigateCalendarToEventSourceMessage,
+  navigateCalendarToDerivedTask,
+  navigateCalendarToDerivedEvent,
   buildTasksByDueDateMap,
   openCalendarTasksForDate,
   createStaleRequestGuard,

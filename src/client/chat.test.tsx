@@ -510,4 +510,359 @@ describe('Issue #9 ChatPanel & CalendarWorkspace Mood/Chat Integration', () => {
       expect(recordInput.value).toBe('');
     });
 
+
+  describe('Issue #11 Chat to Event / Task Links & Bidirectional Navigation', () => {
+    it('opens convert modal for event with pre-filled body and date, allows editing title, creates event with sourceMessageId and preserves original message', async () => {
+      const originalBody = '週六下午兩點去大安森林公園野餐 🧺';
+      const msg = makeMessage({
+        id: 'msg_conv_1',
+        body: originalBody,
+        roomKind: 'personal',
+        localDate: '2026-10-30',
+        recordDate: '2026-10-31', // recordDate takes precedence as default date
+      });
+
+      const handleCreateEvent = vi.fn().mockResolvedValue({
+        id: 'evt_new_1',
+        calendarId: 'cal_user_alice',
+        scope: 'personal',
+        familyId: null,
+        title: '大安森林公園野餐 (修改後)',
+        description: null,
+        startsAt: '2026-10-31',
+        endsAt: '2026-10-31',
+        allDay: true,
+        timezone: 'Asia/Taipei',
+        sourceMessageId: 'msg_conv_1',
+        sourceStatus: 'accessible',
+        createdBy: 'usr_alice',
+        createdAt: '2026-10-30T10:00:00.000Z',
+        updatedAt: '2026-10-30T10:00:00.000Z',
+      });
+
+      render(
+        <ChatPanel
+          roomId="personal"
+          roomKind="personal"
+          roomLabel="個人心情"
+          selectedDate="2026-10-30"
+          messages={[msg]}
+          onSendMessage={async () => {}}
+          onDeleteMessage={async () => {}}
+          onCreateEventFromMessage={handleCreateEvent}
+        />,
+      );
+
+      // Verify convert buttons exist
+      const convertEventBtn = screen.getByTestId('chat-convert-event-button-msg_conv_1');
+      expect(convertEventBtn).toBeTruthy();
+
+      // Click "+ 行程"
+      fireEvent.click(convertEventBtn);
+
+      // Verify modal is open and prefilled
+      expect(screen.getByTestId('chat-convert-modal')).toBeTruthy();
+      expect(screen.getByTestId('convert-modal-title').textContent).toContain('行程');
+      const titleInput = screen.getByTestId('convert-title-input') as HTMLInputElement;
+      expect(titleInput.value).toBe(originalBody);
+
+      const startsAtInput = screen.getByTestId('convert-starts-at-input') as HTMLInputElement;
+      expect(startsAtInput.value).toBe('2026-10-31');
+
+      // Edit title
+      fireEvent.change(titleInput, { target: { value: '大安森林公園野餐 (修改後)' } });
+
+      // Submit
+      fireEvent.click(screen.getByTestId('convert-submit-button'));
+
+      await waitFor(() => {
+        expect(handleCreateEvent).toHaveBeenCalledTimes(1);
+      });
+
+      expect(handleCreateEvent).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'msg_conv_1' }),
+        expect.objectContaining({
+          title: '大安森林公園野餐 (修改後)',
+          startsAt: '2026-10-31',
+          endsAt: '2026-10-31',
+          allDay: true,
+          sourceMessageId: 'msg_conv_1',
+          scope: 'personal',
+        }),
+      );
+
+      // Modal closed
+      await waitFor(() => {
+        expect(screen.queryByTestId('chat-convert-modal')).toBeNull();
+      });
+
+      // Original message text remains completely unchanged
+      expect(screen.getByTestId('chat-message-msg_conv_1').textContent).toContain(originalBody);
+    });
+
+    it('opens convert modal for task in family room, allows choosing family vs personal scope, and creates task with sourceMessageId', async () => {
+      const familyMsg = makeMessage({
+        id: 'msg_fam_task',
+        body: '採買下週食材與清潔用品',
+        roomKind: 'family',
+        familyId: 'fam_01',
+        localDate: '2026-10-30',
+      });
+
+      const handleCreateTask = vi.fn().mockResolvedValue({
+        id: 'task_new_1',
+        listId: 'list_user_alice',
+        scope: 'personal',
+        familyId: null,
+        title: '採買下週食材與清潔用品',
+        dueDate: '2026-11-02',
+        completedAt: null,
+        sourceMessageId: 'msg_fam_task',
+        sourceStatus: 'accessible',
+        createdBy: 'usr_alice',
+        createdAt: '2026-10-30T10:00:00.000Z',
+        updatedAt: '2026-10-30T10:00:00.000Z',
+      });
+
+      render(
+        <ChatPanel
+          roomId="fam_01"
+          roomKind="family"
+          roomLabel="家庭聊天室"
+          familyDisplayName="陳家生活空間"
+          selectedDate="2026-10-30"
+          messages={[familyMsg]}
+          onSendMessage={async () => {}}
+          onDeleteMessage={async () => {}}
+          onCreateTaskFromMessage={handleCreateTask}
+        />,
+      );
+
+      // Click "+ 待辦"
+      fireEvent.click(screen.getByTestId('chat-convert-task-button-msg_fam_task'));
+
+      expect(screen.getByTestId('chat-convert-modal')).toBeTruthy();
+      const scopeSelect = screen.getByTestId('convert-scope-select') as HTMLSelectElement;
+      expect(scopeSelect.value).toBe('family');
+
+      // Change scope to personal
+      fireEvent.change(scopeSelect, { target: { value: 'personal' } });
+      expect(scopeSelect.value).toBe('personal');
+
+      // Change due date
+      const dueInput = screen.getByTestId('convert-due-date-input') as HTMLInputElement;
+      fireEvent.change(dueInput, { target: { value: '2026-11-02' } });
+
+      // Submit
+      fireEvent.click(screen.getByTestId('convert-submit-button'));
+
+      await waitFor(() => {
+        expect(handleCreateTask).toHaveBeenCalledTimes(1);
+      });
+
+      expect(handleCreateTask).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'msg_fam_task' }),
+        expect.objectContaining({
+          title: '採買下週食材與清潔用品',
+          dueDate: '2026-11-02',
+          scope: 'personal',
+          sourceMessageId: 'msg_fam_task',
+        }),
+      );
+    });
+
+    it('allows creating multiple targets (1 event + 2 tasks) from the same message, updating derived badges immediately', async () => {
+      const initialMsg = makeMessage({
+        id: 'msg_multi',
+        body: '合約審閱與週會討論',
+        roomKind: 'personal',
+        localDate: '2026-10-30',
+      });
+
+      render(<ChatWorkspaceHarness initialMessages={[initialMsg]} />);
+
+      // Switch to '心情' tab
+      fireEvent.click(screen.getByTestId('right-tab-mood'));
+
+      // 1. Create first event
+      fireEvent.click(screen.getByTestId('chat-convert-event-button-msg_multi'));
+      expect(screen.getByTestId('chat-convert-modal')).toBeTruthy();
+      fireEvent.change(screen.getByTestId('convert-title-input'), { target: { value: '週會討論行程' } });
+      fireEvent.click(screen.getByTestId('convert-submit-button'));
+
+      await waitFor(() => {
+        expect(screen.queryByTestId('chat-convert-modal')).toBeNull();
+      });
+
+      // Verify event badge is rendered on message card
+      await waitFor(() => {
+        expect(screen.getByText(/📅 行程：週會討論行程/)).toBeTruthy();
+      });
+
+      // 2. Create first task from the same message
+      fireEvent.click(screen.getByTestId('chat-convert-task-button-msg_multi'));
+      expect(screen.getByTestId('chat-convert-modal')).toBeTruthy();
+      fireEvent.change(screen.getByTestId('convert-title-input'), { target: { value: '列印合約' } });
+      fireEvent.click(screen.getByTestId('convert-submit-button'));
+
+      await waitFor(() => {
+        expect(screen.queryByTestId('chat-convert-modal')).toBeNull();
+      });
+
+      await waitFor(() => {
+        expect(screen.getByText(/✓ 待辦：列印合約/)).toBeTruthy();
+      });
+
+      // 3. Create second task from the same message
+      fireEvent.click(screen.getByTestId('chat-convert-task-button-msg_multi'));
+      expect(screen.getByTestId('chat-convert-modal')).toBeTruthy();
+      fireEvent.change(screen.getByTestId('convert-title-input'), { target: { value: '請律師確認用詞' } });
+      fireEvent.click(screen.getByTestId('convert-submit-button'));
+
+      await waitFor(() => {
+        expect(screen.queryByTestId('chat-convert-modal')).toBeNull();
+      });
+
+      await waitFor(() => {
+        expect(screen.getByText(/✓ 待辦：請律師確認用詞/)).toBeTruthy();
+      });
+
+      // All 3 badges co-exist on the message card!
+      expect(screen.getByText(/📅 行程：週會討論行程/)).toBeTruthy();
+      expect(screen.getByText(/✓ 待辦：列印合約/)).toBeTruthy();
+      expect(screen.getByText(/✓ 待辦：請律師確認用詞/)).toBeTruthy();
+
+      // Original message body is still intact
+      expect(screen.getByTestId('chat-message-msg_multi').textContent).toContain('合約審閱與週會討論');
+    });
+
+    it('clicking derived badges triggers navigation callbacks for task and event', async () => {
+      const onNavTask = vi.fn();
+      const onNavEvent = vi.fn();
+
+      const msgWithDerived = makeMessage({
+        id: 'msg_badges',
+        body: '待處理事項與會議',
+        roomKind: 'personal',
+        localDate: '2026-10-30',
+        derivedTasks: [
+          {
+            id: 'task_b1',
+            scope: 'personal',
+            ownerUserId: 'usr_alice',
+            familyId: null,
+            title: '繳水費',
+            dueDate: '2026-11-05',
+            completedAt: null,
+            createdAt: '2026-10-30T10:00:00.000Z',
+          },
+        ],
+        derivedEvents: [
+          {
+            id: 'evt_b1',
+            scope: 'personal',
+            ownerUserId: 'usr_alice',
+            familyId: null,
+            title: '家庭聚餐',
+            startsAt: '2026-11-01',
+            endsAt: '2026-11-01',
+            allDay: true,
+            createdAt: '2026-10-30T10:00:00.000Z',
+          },
+        ],
+        derivedCount: 2,
+      });
+
+      render(
+        <ChatPanel
+          roomId="personal"
+          roomKind="personal"
+          roomLabel="個人心情"
+          selectedDate="2026-10-30"
+          messages={[msgWithDerived]}
+          onSendMessage={async () => {}}
+          onDeleteMessage={async () => {}}
+          onNavigateToDerivedTask={onNavTask}
+          onNavigateToDerivedEvent={onNavEvent}
+        />,
+      );
+
+      // Click task badge
+      const taskBadge = screen.getByTestId('chat-derived-task-task_b1');
+      fireEvent.click(taskBadge);
+      expect(onNavTask).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'task_b1', title: '繳水費' }),
+      );
+
+      // Click event badge
+      const eventBadge = screen.getByTestId('chat-derived-event-evt_b1');
+      fireEvent.click(eventBadge);
+      expect(onNavEvent).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'evt_b1', title: '家庭聚餐' }),
+      );
+    });
+    it('seamlessly navigates in CalendarWorkspace when clicking derived task and event badges', async () => {
+      const msgWithDerived = makeMessage({
+        id: 'msg_nav_workspace',
+        body: '會議與家庭聚會',
+        roomKind: 'personal',
+        localDate: '2026-10-30',
+        derivedTasks: [
+          {
+            id: 'task_nw_1',
+            scope: 'personal',
+            ownerUserId: 'usr_alice',
+            familyId: null,
+            title: '繳電話費',
+            dueDate: '2026-11-15',
+            completedAt: null,
+            createdAt: '2026-10-30T10:00:00.000Z',
+          },
+        ],
+        derivedEvents: [
+          {
+            id: 'evt_nw_1',
+            scope: 'personal',
+            ownerUserId: 'usr_alice',
+            familyId: null,
+            title: '家族旅行',
+            startsAt: '2026-11-20',
+            endsAt: '2026-11-22',
+            allDay: true,
+            createdAt: '2026-10-30T10:00:00.000Z',
+          },
+        ],
+        derivedCount: 2,
+      });
+
+      render(<ChatWorkspaceHarness initialMessages={[msgWithDerived]} />);
+
+      // Switch to mood tab
+      fireEvent.click(screen.getByTestId('right-tab-mood'));
+      expect(screen.getByTestId('right-tab-mood').getAttribute('aria-selected')).toBe('true');
+
+      // Click derived task badge
+      fireEvent.click(screen.getByTestId('chat-derived-task-task_nw_1'));
+
+      // Right tab switches to 'tasks' and selectedDate switches to '2026-11-15'
+      await waitFor(() => {
+        expect(screen.getByTestId('right-tab-tasks').getAttribute('aria-selected')).toBe('true');
+      });
+      expect(screen.getByTestId('status-selected-date').textContent).toContain('2026-11-15');
+
+      // Now switch back to mood tab
+      fireEvent.click(screen.getByTestId('right-tab-mood'));
+      expect(screen.getByTestId('right-tab-mood').getAttribute('aria-selected')).toBe('true');
+
+      // Click derived event badge
+      fireEvent.click(screen.getByTestId('chat-derived-event-evt_nw_1'));
+
+      // Right tab switches to 'summary' and date switches to '2026-11-20'
+      await waitFor(() => {
+        expect(screen.getByTestId('right-tab-summary').getAttribute('aria-selected')).toBe('true');
+      });
+      expect(screen.getByTestId('status-selected-date').textContent).toContain('2026-11-20');
+    });
+
+  });
 });

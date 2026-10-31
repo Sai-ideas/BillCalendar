@@ -299,6 +299,15 @@ describe('Issue #8 Tasks API', () => {
     expect(cross.scope).toBe('personal');
     expect(cross.sourceMessage?.roomKind).toBe('family');
     expect(cross.sourceMessage?.familyId).toBe(familyId);
+    // Issue #11 Privacy requirement: Bob sees 0 derived records and cannot know Alice created a private task from familyMsg
+    const bobViewFamMsg = MessageWithAuthorizedDerivedSchema.parse(
+      await (await call(bob.session, `/api/messages/${familyMsg.id}`)).json(),
+    );
+    expect(bobViewFamMsg.derivedCount).toBe(0);
+    expect(bobViewFamMsg.derivedTasks).toEqual([]);
+    expect(bobViewFamMsg.derivedEvents).toEqual([]);
+    expect(JSON.stringify(bobViewFamMsg)).not.toContain(cross.id);
+    expect(JSON.stringify(bobViewFamMsg)).not.toContain('個人打掃');
 
     // Bob can never reference Alice's personal message, nor a nonexistent one
     const bobSteal = await call(bob.session, '/api/tasks', { method: 'POST', body: { title: '偷看', sourceMessageId: personalMsg.id } });

@@ -375,4 +375,83 @@ describe('Issue #8 Personal & Family Tasks', () => {
       expect(freshTitleInput.value).toBe('');
     });
   });
+
+  describe('Issue #11 Task Source Message Jump & Status Degradation', () => {
+    it('displays source status states (accessible / deleted / inaccessible / none) and jumps to chat when accessible', async () => {
+      const taskWithAccessibleSource: TaskDetail = makeTask({
+        id: 'task_src_1',
+        title: '記得買牛奶',
+        sourceMessageId: 'msg_src_1',
+        sourceStatus: 'accessible',
+        sourceMessage: {
+          id: 'msg_src_1',
+          roomId: 'room_personal',
+          roomKind: 'personal',
+          familyId: null,
+          localDate: '2026-10-25',
+          recordDate: null,
+          body: '冰箱沒牛奶了，下班買一下',
+          senderUserId: 'usr_alice',
+          createdAt: '2026-10-25T08:00:00.000Z',
+        },
+      });
+
+      const taskWithDeletedSource: TaskDetail = makeTask({
+        id: 'task_src_2',
+        title: '繳水費',
+        sourceMessageId: 'msg_del_1',
+        sourceStatus: 'deleted',
+        sourceMessage: null,
+      });
+
+      const taskWithInaccessibleSource: TaskDetail = makeTask({
+        id: 'task_src_3',
+        title: '前家庭重要代辦',
+        sourceMessageId: 'msg_inacc_1',
+        sourceStatus: 'inaccessible',
+        sourceMessage: null,
+      });
+
+      const taskWithNoSource: TaskDetail = makeTask({
+        id: 'task_src_4',
+        title: '一般獨立待辦',
+        sourceMessageId: null,
+        sourceStatus: 'none',
+        sourceMessage: null,
+      });
+
+      render(
+        <Harness
+          initialTasks={[
+            taskWithAccessibleSource,
+            taskWithDeletedSource,
+            taskWithInaccessibleSource,
+            taskWithNoSource,
+          ]}
+        />,
+      );
+
+      // Open tasks tab
+      fireEvent.click(screen.getByTestId('right-tab-tasks'));
+
+      // Check status blocks
+      expect(screen.getByTestId('task-source-task_src_1')).toBeTruthy();
+      expect(screen.getByTestId('task-source-task_src_1').textContent).toContain('冰箱沒牛奶了');
+      expect(screen.getByTestId('task-jump-source-task_src_1')).toBeTruthy();
+
+      expect(screen.getByTestId('task-source-task_src_2').textContent).toContain('原訊息已移除');
+      expect(screen.getByTestId('task-source-task_src_3').textContent).toContain('無權限存取來源訊息');
+      expect(screen.queryByTestId('task-source-task_src_4')).toBeNull();
+
+      // Click "查看來源聊天 ➔"
+      fireEvent.click(screen.getByTestId('task-jump-source-task_src_1'));
+
+      // Navigates to personal mood chat tab, jumps to '2026-10-25' and highlights message
+      await waitFor(() => {
+        expect(screen.getByTestId('right-tab-mood').getAttribute('aria-selected')).toBe('true');
+      });
+      expect(screen.getByTestId('status-selected-date').textContent).toContain('2026-10-25');
+      expect(screen.getByTestId('chat-panel-source-message-locator')).toBeTruthy();
+    });
+  });
 });
