@@ -120,6 +120,13 @@ export function CalendarWorkspace({
   initialChatMessages = [],
   chatLoading = false,
   chatError = null,
+  chatHasMoreBefore = false,
+  chatHasMoreAfter = false,
+  chatLoadingEarlier = false,
+  chatLoadingLater = false,
+  chatTargetMessageFound = null,
+  onChatLoadEarlier,
+  onChatLoadLater,
   onCreateChatMessage,
   onDeleteChatMessage,
   maxVisibleEventsPerCell = MAX_VISIBLE_EVENTS_PER_CELL,
@@ -2033,6 +2040,13 @@ export function CalendarWorkspace({
                     messages={moodMessages}
                     loading={chatLoading}
                     error={chatError}
+                    hasMoreBefore={chatHasMoreBefore}
+                    hasMoreAfter={chatHasMoreAfter}
+                    loadingEarlier={chatLoadingEarlier}
+                    loadingLater={chatLoadingLater}
+                    targetMessageFound={chatTargetMessageFound}
+                    onLoadEarlier={onChatLoadEarlier}
+                    onLoadLater={onChatLoadLater}
                     onSendMessage={handleSendChatMessage}
                     onDeleteMessage={handleDeleteChatMessage}
                   />
@@ -2053,6 +2067,13 @@ export function CalendarWorkspace({
                       messages={familyMessages}
                       loading={chatLoading}
                       error={chatError}
+                      hasMoreBefore={chatHasMoreBefore}
+                      hasMoreAfter={chatHasMoreAfter}
+                      loadingEarlier={chatLoadingEarlier}
+                      loadingLater={chatLoadingLater}
+                      targetMessageFound={chatTargetMessageFound}
+                      onLoadEarlier={onChatLoadEarlier}
+                      onLoadLater={onChatLoadLater}
                       onSendMessage={handleSendChatMessage}
                       onDeleteMessage={handleDeleteChatMessage}
                     />

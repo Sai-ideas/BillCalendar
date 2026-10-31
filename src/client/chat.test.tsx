@@ -454,4 +454,60 @@ describe('Issue #9 ChatPanel & CalendarWorkspace Mood/Chat Integration', () => {
     });
   });
 
+    it('PR #33 Review Non-blocking 2: ChatPanel preserves unsent draft text when selectedDate changes, only resets on room change', () => {
+      const { rerender } = render(
+        <ChatPanel
+          roomId="room_p"
+          roomKind="personal"
+          roomLabel="個人心情"
+          selectedDate="2026-10-30"
+          messages={[]}
+          onSendMessage={async () => {}}
+          onDeleteMessage={async () => {}}
+        />,
+      );
+
+      const input = screen.getByTestId('chat-message-input') as HTMLTextAreaElement;
+      fireEvent.change(input, { target: { value: '這是一段未發送的長篇心情...' } });
+      const recordInput = screen.getByTestId('chat-record-date-input') as HTMLInputElement;
+      fireEvent.change(recordInput, { target: { value: '2026-10-29' } });
+
+      expect(input.value).toBe('這是一段未發送的長篇心情...');
+      expect(recordInput.value).toBe('2026-10-29');
+
+      // User clicks another date on calendar -> selectedDate changes to 2026-10-31
+      rerender(
+        <ChatPanel
+          roomId="room_p"
+          roomKind="personal"
+          roomLabel="個人心情"
+          selectedDate="2026-10-31"
+          messages={[]}
+          onSendMessage={async () => {}}
+          onDeleteMessage={async () => {}}
+        />,
+      );
+
+      // Draft must be preserved!
+      expect(input.value).toBe('這是一段未發送的長篇心情...');
+      expect(recordInput.value).toBe('2026-10-29');
+
+      // Now switch room to family chat -> Draft resets
+      rerender(
+        <ChatPanel
+          roomId="room_fam_01"
+          roomKind="family"
+          roomLabel="家庭聊天室"
+          familyDisplayName="陳家"
+          selectedDate="2026-10-31"
+          messages={[]}
+          onSendMessage={async () => {}}
+          onDeleteMessage={async () => {}}
+        />,
+      );
+
+      expect(input.value).toBe('');
+      expect(recordInput.value).toBe('');
+    });
+
 });

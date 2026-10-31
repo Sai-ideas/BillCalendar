@@ -46,6 +46,7 @@ function formatTime(isoString: string): string {
 }
 
 export function ChatPanel({
+  roomId,
   roomKind,
   familyDisplayName = '',
   selectedDate,
@@ -70,13 +71,18 @@ export function ChatPanel({
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [dismissedFallbackAlert, setDismissedFallbackAlert] = useState(false);
 
-  // Non-blocking 1: Reset unsent draft text, record date and form errors when room context changes
+  useEffect(() => {
+    setDismissedFallbackAlert(false);
+  }, [roomId, selectedDate, highlightedMessageId, targetMessageFound]);
+
+  // Non-blocking 1 & Follow-up: Reset unsent draft text, record date and form errors ONLY when room context changes (not on date clicks)
   useEffect(() => {
     setDraftText('');
     setDraftRecordDate('');
     setFormError(null);
-  }, [roomKind, familyDisplayName, selectedDate]);
+  }, [roomId, roomKind, familyDisplayName]);
 
   // Issue #28: Smooth scroll into view when highlightedMessageId is present and message exists
   useEffect(() => {
@@ -94,9 +100,12 @@ export function ChatPanel({
   const sortedMessages = sortMessagesStably(messages);
   const hasSelectedDateMessages = sortedMessages.some((m) => m.localDate === selectedDate);
   const isSourceMissingOrDeleted =
-    Boolean(highlightedMessageId) &&
+    !dismissedFallbackAlert &&
     (targetMessageFound === false ||
-      (!loading && sortedMessages.length > 0 && !sortedMessages.some((m) => m.id === highlightedMessageId)));
+      (Boolean(highlightedMessageId) &&
+        !loading &&
+        sortedMessages.length > 0 &&
+        !sortedMessages.some((m) => m.id === highlightedMessageId)));
 
   const handleAddEmoji = (emoji: string) => {
     setDraftText((prev) => prev + emoji);
@@ -202,6 +211,14 @@ export function ChatPanel({
               已為您安全切換至接近日期（<code>{selectedDate}</code>）的時間軸瀏覽。
             </p>
           </div>
+          <button
+            type="button"
+            data-testid="chat-source-missing-dismiss-btn"
+            onClick={() => setDismissedFallbackAlert(true)}
+            className="ml-auto text-xs text-amber-800 hover:text-amber-950 underline shrink-0 cursor-pointer"
+          >
+            關閉
+          </button>
         </div>
       )}
 
