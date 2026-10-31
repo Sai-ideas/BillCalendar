@@ -2015,6 +2015,7 @@ export function CalendarWorkspace({
 
                 {activeTab === 'mood' && (
                   <ChatPanel
+                    key="chat-panel-personal"
                     roomId="personal"
                     roomKind="personal"
                     roomLabel="個人心情聊天室"
@@ -2033,6 +2034,7 @@ export function CalendarWorkspace({
                 {activeTab === 'chat' &&
                   (selectedSpace.kind === 'family' && selectedFamily ? (
                     <ChatPanel
+                      key={`chat-panel-family-${selectedSpace.familyId}`}
                       roomId={selectedSpace.familyId}
                       roomKind="family"
                       roomLabel={`家庭聊天室（${selectedFamily.name}）`}

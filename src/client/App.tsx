@@ -31,6 +31,16 @@ import { CalendarWorkspace } from './components/CalendarWorkspace';
 
 const SESSION_STORAGE_KEY = 'bc_test_session_id';
 
+function getActiveChatRoomKey(state: CalendarNavigationState): string | null {
+  if (state.activeTab === 'mood') {
+    return 'personal';
+  }
+  if (state.activeTab === 'chat' && state.selectedSpace.kind === 'family') {
+    return `family:${state.selectedSpace.familyId}`;
+  }
+  return null;
+}
+
 export function App() {
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [healthError, setHealthError] = useState<string | null>(null);
@@ -67,11 +77,18 @@ export function App() {
   const [tasksError, setTasksError] = useState<string | null>(null);
   const tasksRequestGuardRef = useRef(createStaleRequestGuard());
 
-  // Chat state (Issue #9) — guarded for mood and family chat rooms
-  const [chatMessages, setChatMessages] = useState<MessageWithAuthorizedDerived[]>([]);
+  // Chat state (Issue #9 & Review Blocking 1) — scoped to active room identity
+  const [chatState, setChatState] = useState<{
+    roomKey: string | null;
+    messages: MessageWithAuthorizedDerived[];
+  }>(() => ({
+    roomKey: getActiveChatRoomKey(createInitialCalendarNavigationState()),
+    messages: [],
+  }));
   const [chatLoading, setChatLoading] = useState<boolean>(false);
   const [chatError, setChatError] = useState<string | null>(null);
   const chatRequestGuardRef = useRef(createStaleRequestGuard());
+  const chatEpochRef = useRef(0);
 
   // Bumped whenever identity/space context changes so in-flight mutations (POST/PATCH/DELETE)
   // that resolve afterwards never write into a different user's or space's list.
@@ -79,6 +96,7 @@ export function App() {
 
   const clearSpaceDataAndAbort = useCallback(() => {
     contextEpochRef.current += 1;
+    chatEpochRef.current += 1;
     eventsRequestGuardRef.current.invalidate();
     tasksRequestGuardRef.current.invalidate();
     chatRequestGuardRef.current.invalidate();
@@ -88,7 +106,7 @@ export function App() {
     setSpaceTasks([]);
     setTasksError(null);
     setTasksLoading(false);
-    setChatMessages([]);
+    setChatState({ roomKey: null, messages: [] });
     setChatError(null);
     setChatLoading(false);
   }, []);
@@ -106,8 +124,13 @@ export function App() {
           next.selectedSpace.kind === 'family' &&
           prev.selectedSpace.familyId !== next.selectedSpace.familyId);
 
+      const prevRoomKey = getActiveChatRoomKey(prev);
+      const nextRoomKey = getActiveChatRoomKey(next);
+      const roomChanged = prevRoomKey !== nextRoomKey;
+
       if (spaceChanged) {
         contextEpochRef.current += 1;
+        chatEpochRef.current += 1;
         eventsRequestGuardRef.current.invalidate();
         tasksRequestGuardRef.current.invalidate();
         chatRequestGuardRef.current.invalidate();
@@ -115,9 +138,17 @@ export function App() {
         setEventsError(null);
         setSpaceTasks([]);
         setTasksError(null);
-        setChatMessages([]);
+        setChatState({ roomKey: nextRoomKey, messages: [] });
         setChatError(null);
-        setChatLoading(false);
+        setChatLoading(nextRoomKey !== null);
+      } else if (roomChanged) {
+        // Review Blocking 1: Switching mood ↔ family chat within the same space
+        // Synchronously invalidate pending room reads, clear previous room messages, and set loading
+        chatEpochRef.current += 1;
+        chatRequestGuardRef.current.invalidate();
+        setChatState({ roomKey: nextRoomKey, messages: [] });
+        setChatError(null);
+        setChatLoading(nextRoomKey !== null);
       }
 
       setCalendarNavState(next);
@@ -424,24 +455,24 @@ export function App() {
     const storedSessionId = window.localStorage.getItem(SESSION_STORAGE_KEY);
     if (!storedSessionId || !identityState?.currentUser) {
       chatRequestGuardRef.current.invalidate();
-      setChatMessages([]);
+      setChatState({ roomKey: null, messages: [] });
       setChatError(null);
       setChatLoading(false);
       return;
     }
 
-    const activeTab = calendarNavState.activeTab;
-    if (activeTab !== 'mood' && activeTab !== 'chat') {
-      return;
-    }
-
-    const selectedSpace = calendarNavState.selectedSpace;
-    if (activeTab === 'chat' && selectedSpace.kind !== 'family') {
-      setChatMessages([]);
+    const expectedRoomKey = getActiveChatRoomKey(calendarNavStateRef.current);
+    if (!expectedRoomKey) {
+      chatRequestGuardRef.current.invalidate();
+      setChatState({ roomKey: null, messages: [] });
+      setChatError(null);
       setChatLoading(false);
       return;
     }
 
+    const activeTab = calendarNavStateRef.current.activeTab;
+    const selectedSpace = calendarNavStateRef.current.selectedSpace;
+    const captureChatEpoch = chatEpochRef.current;
     const ticket = chatRequestGuardRef.current.begin();
     setChatLoading(true);
     setChatError(null);
@@ -466,7 +497,11 @@ export function App() {
           headers: getAuthHeaders(),
           signal: ticket.signal,
         });
-        if (!chatRequestGuardRef.current.isCurrent(ticket.requestId)) {
+        if (
+          !chatRequestGuardRef.current.isCurrent(ticket.requestId) ||
+          chatEpochRef.current !== captureChatEpoch ||
+          getActiveChatRoomKey(calendarNavStateRef.current) !== expectedRoomKey
+        ) {
           return;
         }
         if (roomRes.ok) {
@@ -484,7 +519,11 @@ export function App() {
         signal: ticket.signal,
       });
 
-      if (!chatRequestGuardRef.current.isCurrent(ticket.requestId)) {
+      if (
+        !chatRequestGuardRef.current.isCurrent(ticket.requestId) ||
+        chatEpochRef.current !== captureChatEpoch ||
+        getActiveChatRoomKey(calendarNavStateRef.current) !== expectedRoomKey
+      ) {
         return;
       }
 
@@ -494,14 +533,25 @@ export function App() {
       }
 
       const data = (await res.json()) as MessageWithAuthorizedDerived[];
-      if (!chatRequestGuardRef.current.isCurrent(ticket.requestId)) {
+      if (
+        !chatRequestGuardRef.current.isCurrent(ticket.requestId) ||
+        chatEpochRef.current !== captureChatEpoch ||
+        getActiveChatRoomKey(calendarNavStateRef.current) !== expectedRoomKey
+      ) {
         return;
       }
 
       const sorted = sortMessagesStably(data);
-      setChatMessages(sorted);
+      setChatState({
+        roomKey: expectedRoomKey,
+        messages: sorted,
+      });
     } catch (err: unknown) {
-      if (!chatRequestGuardRef.current.isCurrent(ticket.requestId)) {
+      if (
+        !chatRequestGuardRef.current.isCurrent(ticket.requestId) ||
+        chatEpochRef.current !== captureChatEpoch ||
+        getActiveChatRoomKey(calendarNavStateRef.current) !== expectedRoomKey
+      ) {
         return;
       }
       if (err instanceof Error && err.name === 'AbortError') {
@@ -509,14 +559,16 @@ export function App() {
       }
       setChatError(err instanceof Error ? err.message : '無法載入聊天室訊息');
     } finally {
-      if (chatRequestGuardRef.current.isCurrent(ticket.requestId)) {
+      if (
+        chatRequestGuardRef.current.isCurrent(ticket.requestId) &&
+        chatEpochRef.current === captureChatEpoch &&
+        getActiveChatRoomKey(calendarNavStateRef.current) === expectedRoomKey
+      ) {
         setChatLoading(false);
       }
     }
   }, [
     baseUrl,
-    calendarNavState.activeTab,
-    calendarNavState.selectedSpace,
     identityState?.currentUser,
     spaceOverview,
   ]);
@@ -1059,7 +1111,8 @@ export function App() {
       throw new Error('找不到可發送的目標聊天室');
     }
 
-    const captureEpoch = contextEpochRef.current;
+    const targetRoomKey = getActiveChatRoomKey(calendarNavStateRef.current);
+    const captureChatEpoch = chatEpochRef.current;
     const res = await fetch(`${baseUrl}/api/chat-rooms/${encodeURIComponent(roomId)}/messages`, {
       method: 'POST',
       headers: {
@@ -1075,19 +1128,27 @@ export function App() {
     }
 
     const created = (await res.json()) as MessageWithAuthorizedDerived;
-    if (contextEpochRef.current === captureEpoch) {
-      setChatMessages((prev) => {
+    if (
+      chatEpochRef.current === captureChatEpoch &&
+      getActiveChatRoomKey(calendarNavStateRef.current) === targetRoomKey
+    ) {
+      setChatState((prev) => {
+        if (prev.roomKey !== targetRoomKey) return prev;
         const map = new Map<string, MessageWithAuthorizedDerived>();
-        for (const m of prev) map.set(m.id, m);
+        for (const m of prev.messages) map.set(m.id, m);
         map.set(created.id, created);
-        return sortMessagesStably(Array.from(map.values()));
+        return {
+          roomKey: prev.roomKey,
+          messages: sortMessagesStably(Array.from(map.values())),
+        };
       });
     }
     return created;
   };
 
   const handleDeleteChatMessage = async (messageId: string): Promise<void> => {
-    const captureEpoch = contextEpochRef.current;
+    const targetRoomKey = getActiveChatRoomKey(calendarNavStateRef.current);
+    const captureChatEpoch = chatEpochRef.current;
     const res = await fetch(`${baseUrl}/api/messages/${encodeURIComponent(messageId)}`, {
       method: 'DELETE',
       headers: getAuthHeaders(),
@@ -1098,8 +1159,17 @@ export function App() {
       throw new Error(errData.message ?? '刪除訊息失敗');
     }
 
-    if (contextEpochRef.current === captureEpoch) {
-      setChatMessages((prev) => prev.filter((m) => m.id !== messageId));
+    if (
+      chatEpochRef.current === captureChatEpoch &&
+      getActiveChatRoomKey(calendarNavStateRef.current) === targetRoomKey
+    ) {
+      setChatState((prev) => {
+        if (prev.roomKey !== targetRoomKey) return prev;
+        return {
+          roomKey: prev.roomKey,
+          messages: prev.messages.filter((m) => m.id !== messageId),
+        };
+      });
     }
   };
 
@@ -1172,7 +1242,11 @@ export function App() {
           onCreateTask={currentUser ? handleCreateTask : undefined}
           onUpdateTask={currentUser ? handleUpdateTask : undefined}
           onDeleteTask={currentUser ? handleDeleteTask : undefined}
-          chatMessages={currentUser ? chatMessages : undefined}
+          chatMessages={
+            currentUser && chatState.roomKey === getActiveChatRoomKey(calendarNavState)
+              ? chatState.messages
+              : []
+          }
           chatLoading={chatLoading}
           chatError={chatError}
           onCreateChatMessage={currentUser ? handleCreateChatMessage : undefined}

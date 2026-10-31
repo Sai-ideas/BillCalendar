@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react';
+import { useEffect, useState, type FormEvent } from 'react';
 import {
   LocalDateStringSchema,
   sortMessagesStably,
@@ -55,6 +55,13 @@ export function ChatPanel({
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+
+  // Non-blocking 1: Reset unsent draft text, record date and form errors when room context changes
+  useEffect(() => {
+    setDraftText('');
+    setDraftRecordDate('');
+    setFormError(null);
+  }, [roomKind, familyDisplayName, selectedDate]);
 
   const sortedMessages = sortMessagesStably(messages);
 
