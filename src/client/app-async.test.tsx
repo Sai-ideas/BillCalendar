@@ -141,6 +141,10 @@ interface FakeApi {
   families: Record<string, unknown[]>;
   taskMutations: { method: string; path: string; body: unknown }[];
   tasksStore: unknown[] | null;
+  chatMutations: { method: string; path: string; body: unknown }[];
+  chatStore: any[];
+  chatData: Map<string, unknown[]>;
+  parkedChat: Map<string, { gate: Deferred<unknown[]>; honorAbort: boolean }>;
 }
 
 function json(body: unknown, status = 200): Response {
@@ -173,6 +177,10 @@ function installFakeApi(initialSession: SessionId | null): FakeApi {
     families: { sess_alice: [FAMILY], sess_bob: [] },
     taskMutations: [],
     tasksStore: null,
+    chatMutations: [],
+    chatStore: [],
+    chatData: new Map(),
+    parkedChat: new Map(),
   };
   if (initialSession) window.localStorage.setItem('bc_test_session_id', initialSession);
 
@@ -220,6 +228,76 @@ function installFakeApi(initialSession: SessionId | null): FakeApi {
       }
       if (path === '/api/invitations') return json([]);
       if (path === '/api/spaces') return json({ message: 'n/a' }, 404);
+      if (path === '/api/chat-rooms') {
+        const scope = url.searchParams.get('scope') ?? 'personal';
+        return json([
+          {
+            id: scope === 'family' ? 'room_fam_01' : 'room_personal',
+            kind: scope,
+            userId: scope === 'personal' ? (USERS[session as SessionId]?.id ?? 'usr_alice') : null,
+            familyId: scope === 'family' ? 'fam_01' : null,
+            timezone: 'Asia/Taipei',
+            createdAt: NOW,
+            updatedAt: NOW,
+          },
+        ]);
+      }
+      if (path.startsWith('/api/chat-rooms/') && path.endsWith('/messages')) {
+        const roomId = url.pathname.split('/')[3];
+        if (method === 'POST') {
+          api.chatMutations.push({ method, path, body });
+          const isFam = roomId.startsWith('room_fam') || roomId === 'fam_01';
+          const created = {
+            id: `msg_${Date.now()}`,
+            roomId,
+            roomKind: isFam ? 'family' : 'personal',
+            familyId: isFam ? 'fam_01' : null,
+            senderUserId: USERS[session as SessionId]?.id ?? 'usr_alice',
+            senderDisplayName: USERS[session as SessionId]?.displayName ?? '愛麗絲',
+            body: body.body,
+            localDate: TODAY,
+            recordDate: body.recordDate ?? null,
+            createdAt: NOW,
+            updatedAt: NOW,
+            derivedTasks: [],
+            derivedEvents: [],
+            derivedCount: 0,
+          };
+          api.chatStore.push(created);
+          return json(created, 201);
+        }
+
+        const chatKey = `${session}:${roomId}`;
+        const park = api.parkedChat.get(chatKey) ?? api.parkedChat.get(roomId);
+        if (park) {
+          api.parkedChat.delete(chatKey);
+          api.parkedChat.delete(roomId);
+          const payload = await new Promise<unknown[]>((resolve, reject) => {
+            park.gate.promise.then(resolve);
+            if (park.honorAbort && signal) {
+              signal.addEventListener('abort', () =>
+                reject(new DOMException('The operation was aborted.', 'AbortError')),
+              );
+            }
+          });
+          return json(payload);
+        }
+
+        if (api.chatData.has(chatKey)) {
+          return json(api.chatData.get(chatKey)!);
+        }
+        if (api.chatData.has(roomId)) {
+          return json(api.chatData.get(roomId)!);
+        }
+
+        return json(api.chatStore);
+      }
+      if (path.startsWith('/api/messages/') && method === 'DELETE') {
+        const id = path.split('/')[3];
+        api.chatMutations.push({ method, path, body: null });
+        api.chatStore = api.chatStore.filter((m: any) => m.id !== id);
+        return json({ success: true, id, deletedAt: NOW });
+      }
 
       if (path === '/api/events' || path === '/api/tasks') {
         const kind = path === '/api/events' ? 'events' : 'tasks';
@@ -645,5 +723,239 @@ describe('Issue #8 <App /> task CRUD against the API', () => {
     render(<App />);
     await waitFor(() => expect(titleCount('正常行程')).toBeGreaterThan(0));
     expect((await screen.findByTestId('summary-tasks-api-error')).textContent).toContain('待辦服務暫時不可用');
+  });
+
+  it('Issue #31 & #9: space switch immediately aborts in-flight requests and clears data synchronously outside state updater', async () => {
+    const api = installFakeApi('sess_alice');
+    api.data.set('events:sess_alice:personal', [
+      eventFixture('Alice 個人事件', 'personal', { ownerUserId: 'usr_alice' }),
+    ]);
+    api.data.set('tasks:sess_alice:personal', [
+      taskFixture('Alice 個人待辦', 'personal', { ownerUserId: 'usr_alice' }),
+    ]);
+
+    render(<App />);
+    await waitFor(() => expect(titleCount('Alice 個人事件')).toBeGreaterThan(0));
+    expect(titleCount('Alice 個人待辦')).toBeGreaterThan(0);
+
+    // Park family events so family space load stays in-flight
+    const familyGate = deferred<unknown[]>();
+    api.parked.set('events:sess_alice:family', { gate: familyGate, honorAbort: true });
+
+    // Switch to family space
+    fireEvent.click(screen.getByTestId('space-switch-family-fam_01'));
+
+    // Synchronously, personal events and tasks are cleared immediately upon space switch
+    expect(titleCount('Alice 個人事件')).toBe(0);
+    expect(titleCount('Alice 個人待辦')).toBe(0);
+
+    // Release gate
+    familyGate.resolve([]);
+  });
+
+  it('Issue #9 <App /> chat CRUD: loads mood messages, posts message with emoji and deletes through API', async () => {
+    const api = installFakeApi('sess_alice');
+    api.chatStore = [
+      {
+        id: 'msg_existing',
+        roomId: 'room_personal',
+        roomKind: 'personal',
+        familyId: null,
+        senderUserId: 'usr_alice',
+        senderDisplayName: '愛麗絲',
+        body: '既有心情筆記 ✨',
+        localDate: TODAY,
+        recordDate: null,
+        createdAt: NOW,
+        updatedAt: NOW,
+        derivedTasks: [],
+        derivedEvents: [],
+        derivedCount: 0,
+      },
+    ];
+
+    api.data.set('events:sess_alice:personal', [
+      eventFixture('Alice 既有行程', 'personal', { ownerUserId: 'usr_alice' }),
+    ]);
+
+    render(<App />);
+    await waitFor(() => expect(titleCount('Alice 既有行程')).toBeGreaterThan(0));
+
+    // Switch to mood tab
+    fireEvent.click(screen.getByTestId('right-tab-mood'));
+    await waitFor(() => expect(screen.getByText('既有心情筆記 ✨')).toBeTruthy());
+
+    // Post a new message
+    fireEvent.change(screen.getByTestId('chat-message-input'), {
+      target: { value: '今日進度大超前 🚀' },
+    });
+    fireEvent.click(screen.getByTestId('emoji-btn-🎉'));
+    fireEvent.click(screen.getByTestId('chat-send-button'));
+
+    await waitFor(() => expect(screen.getByText('今日進度大超前 🚀🎉')).toBeTruthy());
+    expect(api.chatMutations.some((m) => m.method === 'POST')).toBe(true);
+
+    // Delete existing message
+    fireEvent.click(screen.getByTestId('delete-message-msg_existing'));
+    await waitFor(() => expect(screen.queryByText('既有心情筆記 ✨')).toBeNull());
+    expect(api.chatMutations.some((m) => m.method === 'DELETE')).toBe(true);
+  });
+  it('PR #32 Review Blocking 1: mood ↔ family chat tab switch within family space immediately clears previous room messages before next fetch resolves', async () => {
+    const api = installFakeApi('sess_alice');
+
+    const personalMsg = {
+      id: 'msg_personal_secret',
+      roomId: 'room_personal',
+      roomKind: 'personal',
+      familyId: null,
+      senderUserId: 'usr_alice',
+      senderDisplayName: '愛麗絲',
+      body: 'Alice 私人心情小祕密 🤫',
+      localDate: TODAY,
+      recordDate: null,
+      createdAt: NOW,
+      updatedAt: NOW,
+      derivedTasks: [],
+      derivedEvents: [],
+      derivedCount: 0,
+    };
+
+    const familyMsg = {
+      id: 'msg_family_announcement',
+      roomId: 'room_fam_01',
+      roomKind: 'family',
+      familyId: 'fam_01',
+      senderUserId: 'usr_alice',
+      senderDisplayName: '愛麗絲',
+      body: '陳家全體家庭公告 📢',
+      localDate: TODAY,
+      recordDate: null,
+      createdAt: NOW,
+      updatedAt: NOW,
+      derivedTasks: [],
+      derivedEvents: [],
+      derivedCount: 0,
+    };
+
+    api.chatData.set('room_personal', [personalMsg]);
+
+    // Park the family chat message response on a deferred gate
+    const familyChatGate = deferred<unknown[]>();
+    api.parkedChat.set('room_fam_01', { gate: familyChatGate, honorAbort: true });
+
+    render(<App />);
+    const famBtn = await screen.findByTestId('space-switch-family-fam_01');
+    fireEvent.click(famBtn);
+
+    // Switch to mood tab in family space
+    fireEvent.click(screen.getByTestId('right-tab-mood'));
+    await waitFor(() => expect(screen.getByText('Alice 私人心情小祕密 🤫')).toBeTruthy());
+
+    // Switch from mood tab to family chat tab within the SAME family space
+    fireEvent.click(screen.getByTestId('right-tab-chat'));
+
+    // SYNCHRONOUS ASSERTION: Personal mood message must vanish IMMEDIATELY before family fetch resolves
+    expect(screen.queryByText('Alice 私人心情小祕密 🤫')).toBeNull();
+    // Family message is not visible yet because familyChatGate is still pending
+    expect(screen.queryByText('陳家全體家庭公告 📢')).toBeNull();
+
+    // Now resolve family chat gate
+    familyChatGate.resolve([familyMsg]);
+    await waitFor(() => expect(screen.getByText('陳家全體家庭公告 📢')).toBeTruthy());
+
+    // Personal message remains absent in family chat
+    expect(screen.queryByText('Alice 私人心情小祕密 🤫')).toBeNull();
+  });
+
+  it('PR #32 Review Blocking 1: delayed / out-of-order room responses (including ignored abort) never leak across mood and family chat', async () => {
+    const api = installFakeApi('sess_alice');
+
+    const personalMsg = {
+      id: 'msg_personal_1',
+      roomId: 'room_personal',
+      roomKind: 'personal',
+      familyId: null,
+      senderUserId: 'usr_alice',
+      senderDisplayName: '愛麗絲',
+      body: '慢速心情回應 🐢',
+      localDate: TODAY,
+      recordDate: null,
+      createdAt: NOW,
+      updatedAt: NOW,
+      derivedTasks: [],
+      derivedEvents: [],
+      derivedCount: 0,
+    };
+
+    const familyMsg = {
+      id: 'msg_family_1',
+      roomId: 'room_fam_01',
+      roomKind: 'family',
+      familyId: 'fam_01',
+      senderUserId: 'usr_alice',
+      senderDisplayName: '愛麗絲',
+      body: '快速家庭公告 🚀',
+      localDate: TODAY,
+      recordDate: null,
+      createdAt: NOW,
+      updatedAt: NOW,
+      derivedTasks: [],
+      derivedEvents: [],
+      derivedCount: 0,
+    };
+
+    // Park personal room response with honorAbort: false (ignores AbortSignal, mimics delayed stale fetch)
+    const slowMoodGate = deferred<unknown[]>();
+    api.parkedChat.set('room_personal', { gate: slowMoodGate, honorAbort: false });
+    api.chatData.set('room_fam_01', [familyMsg]);
+
+    render(<App />);
+    const famBtn = await screen.findByTestId('space-switch-family-fam_01');
+    fireEvent.click(famBtn);
+
+    // Click mood (fires slowMoodGate)
+    fireEvent.click(screen.getByTestId('right-tab-mood'));
+
+    // Quickly switch to family chat before mood resolves
+    fireEvent.click(screen.getByTestId('right-tab-chat'));
+    await waitFor(() => expect(screen.getByText('快速家庭公告 🚀')).toBeTruthy());
+
+    // Now release the slow mood response which was aborted but ignored signal
+    slowMoodGate.resolve([personalMsg]);
+    await new Promise((r) => setTimeout(r, 60));
+
+    // Stale mood message must NEVER overwrite or leak into family chat!
+    expect(screen.queryByText('慢速心情回應 🐢')).toBeNull();
+    expect(screen.getByText('快速家庭公告 🚀')).toBeTruthy();
+  });
+
+  it('PR #32 Non-blocking 1: switching chat rooms resets unsent draft text and recordDate', async () => {
+    const api = installFakeApi('sess_alice');
+    api.chatStore = [];
+
+    render(<App />);
+    const famBtn = await screen.findByTestId('space-switch-family-fam_01');
+    fireEvent.click(famBtn);
+
+    // Open family chat tab
+    fireEvent.click(screen.getByTestId('right-tab-chat'));
+
+    // Type a draft in family chat
+    const input = screen.getByTestId('chat-message-input') as HTMLInputElement;
+    fireEvent.change(input, { target: { value: '這是一則未發送的家庭草稿' } });
+    const recordDateInput = screen.getByTestId('chat-record-date-input') as HTMLInputElement;
+    fireEvent.change(recordDateInput, { target: { value: '2026-10-25' } });
+
+    expect(input.value).toBe('這是一則未發送的家庭草稿');
+    expect(recordDateInput.value).toBe('2026-10-25');
+
+    // Switch to mood tab
+    fireEvent.click(screen.getByTestId('right-tab-mood'));
+
+    // Draft and recordDate must be cleared/isolated
+    const moodInput = screen.getByTestId('chat-message-input') as HTMLInputElement;
+    const moodRecordDateInput = screen.getByTestId('chat-record-date-input') as HTMLInputElement;
+    expect(moodInput.value).toBe('');
+    expect(moodRecordDateInput.value).toBe('');
   });
 });

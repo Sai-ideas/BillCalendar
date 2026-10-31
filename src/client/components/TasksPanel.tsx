@@ -12,6 +12,8 @@ export interface TasksPanelProps {
   tasks: TaskDetail[];
   selectedDate: string;
   spaceLabel: string;
+  /** Context key representing current user + space (e.g. `userId:spaceId`). Resets drafts on change (Issue #31). */
+  contextKey?: string;
   loading?: boolean;
   error?: string | null;
   onCreate: (input: { title: string; dueDate: string | null }) => Promise<void>;
@@ -86,6 +88,7 @@ export function TasksPanel({
   tasks,
   selectedDate,
   spaceLabel,
+  contextKey,
   loading = false,
   error = null,
   onCreate,
@@ -101,6 +104,17 @@ export function TasksPanel({
   const [submitting, setSubmitting] = useState(false);
   const [pendingIds, setPendingIds] = useState<ReadonlySet<string>>(new Set());
   const [rowError, setRowError] = useState<string | null>(null);
+
+  // Issue #31: Reset all create/edit drafts and error states when switching identity or space
+  useEffect(() => {
+    setFormMode(null);
+    setEditingTaskId(null);
+    setTitle('');
+    setDueDate('');
+    setFormError(null);
+    setRowError(null);
+    setSubmitting(false);
+  }, [contextKey, spaceLabel]);
 
   // Close the edit form if its task vanished (space/identity switch, remote delete).
   useEffect(() => {
