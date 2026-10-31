@@ -143,6 +143,8 @@ export {
   refreshCalendarTodayDate,
   navigateCalendarMonth,
   jumpCalendarToDate,
+  navigateCalendarToEventSourceMessage,
+  createStaleRequestGuard,
   type RightPanelTab,
   type MobileViewMode,
   type SelectedSpace,
@@ -153,4 +155,7 @@ export {
   type EventSpanPosition,
   type CalendarEventLike,
   type CalendarEventBarItem,
+  type DstDisambiguationPolicy,
+  type StaleRequestTicket,
+  type StaleRequestGuard,
 } from './calendar';

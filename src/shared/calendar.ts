@@ -113,6 +113,7 @@ export interface CalendarNavigationState {
   mobileView: MobileViewMode;
   diaryAutoSwitchedToPersonal?: boolean;
   selectedEventId?: string | null;
+  highlightedSourceMessageId?: string | null;
 }
 
 export type EventSpanPosition = 'single' | 'start' | 'middle' | 'end';
@@ -134,6 +135,62 @@ export interface CalendarEventBarItem<T extends CalendarEventLike = CalendarEven
   spanTotalDays: number;
   isMultiDay: boolean;
   timeLabel: string;
+}
+
+export type DstDisambiguationPolicy = 'earlier' | 'later' | 'reject';
+
+export interface StaleRequestTicket {
+  readonly requestId: number;
+  readonly signal: AbortSignal;
+}
+
+export interface StaleRequestGuard {
+  /** Starts a new async operation, aborting any previous in-flight request. */
+  begin(): StaleRequestTicket;
+  /** Invalidates any in-flight request (e.g. on identity switch or logout) and aborts its signal. */
+  invalidate(): number;
+  /** Returns true only if `requestId` is still the latest active request and has not been invalidated/aborted. */
+  isCurrent(requestId: number): boolean;
+}
+
+/**
+ * Coordinates async requests across identity/space switches (PR #27 Blocking 1 fix).
+ * Ensures that switching identity or space immediately aborts any in-flight fetch and
+ * prevents out-of-order stale responses from overwriting the current identity/space state.
+ */
+export function createStaleRequestGuard(): StaleRequestGuard {
+  let currentRequestId = 0;
+  let activeController: AbortController | null = null;
+
+  return {
+    begin(): StaleRequestTicket {
+      if (activeController) {
+        activeController.abort();
+      }
+      currentRequestId += 1;
+      const controller = new AbortController();
+      activeController = controller;
+      return {
+        requestId: currentRequestId,
+        signal: controller.signal,
+      };
+    },
+    invalidate(): number {
+      if (activeController) {
+        activeController.abort();
+        activeController = null;
+      }
+      currentRequestId += 1;
+      return currentRequestId;
+    },
+    isCurrent(requestId: number): boolean {
+      return (
+        requestId === currentRequestId &&
+        activeController !== null &&
+        !activeController.signal.aborted
+      );
+    },
+  };
 }
 
 function pad2(num: number): string {
@@ -320,10 +377,16 @@ export function formatInstantToLocalDateTimeInput(
  * Converts either a full ISO 8601 timestamp (with `Z` or `±HH:MM`) OR a local wall-clock
  * datetime string (`YYYY-MM-DDTHH:mm` / `YYYY-MM-DDTHH:mm:ss`) interpreted in `timeZone`
  * into a canonical UTC ISO 8601 string (`...Z`).
+ *
+ * Handles Daylight Saving Time (DST) transitions explicitly (PR #27 Non-blocking #2):
+ * - Nonexistent spring-forward wall times (e.g. `2026-03-08T02:30` in `America/New_York`) are strictly rejected.
+ * - Repeated fall-back wall times (e.g. `2026-11-01T01:30` in `America/New_York`) are disambiguated
+ *   deterministically according to `options?.disambiguation` (defaults to `'earlier'` per RFC 5545 / Temporal).
  */
 export function convertLocalDateTimeInTimezoneToUtcIso(
   dateTimeOrIso: string,
   timeZone: string = DEFAULT_TIMEZONE,
+  options?: { disambiguation?: DstDisambiguationPolicy },
 ): string {
   const trimmed = dateTimeOrIso.trim();
   if (isValidUtcIsoTimestamp(trimmed)) {
@@ -345,7 +408,7 @@ export function convertLocalDateTimeInTimezoneToUtcIso(
   }
 
   const targetUtcWallMs = Date.UTC(year, month - 1, day, hour, minute, second);
-  let guessMs = targetUtcWallMs;
+  const disambiguation: DstDisambiguationPolicy = options?.disambiguation ?? 'earlier';
 
   const formatter = new Intl.DateTimeFormat('en-CA', {
     timeZone: timeZone.trim(),
@@ -358,22 +421,54 @@ export function convertLocalDateTimeInTimezoneToUtcIso(
     hourCycle: 'h23',
   });
 
-  for (let i = 0; i < 3; i++) {
-    const parts = formatter.formatToParts(new Date(guessMs));
+  const getObservedWallMs = (utcMs: number): number => {
+    const parts = formatter.formatToParts(new Date(utcMs));
     const pYear = Number(parts.find((p) => p.type === 'year')?.value ?? year);
     const pMonth = Number(parts.find((p) => p.type === 'month')?.value ?? month);
     const pDay = Number(parts.find((p) => p.type === 'day')?.value ?? day);
     const pHour = Number(parts.find((p) => p.type === 'hour')?.value ?? hour);
     const pMinute = Number(parts.find((p) => p.type === 'minute')?.value ?? minute);
     const pSecond = Number(parts.find((p) => p.type === 'second')?.value ?? second);
+    return Date.UTC(pYear, pMonth - 1, pDay, pHour, pMinute, pSecond);
+  };
 
-    const observedWallMs = Date.UTC(pYear, pMonth - 1, pDay, pHour, pMinute, pSecond);
-    const diffMs = targetUtcWallMs - observedWallMs;
-    if (diffMs === 0) break;
-    guessMs += diffMs;
+  const getOffsetAtUtcMs = (utcMs: number): number => getObservedWallMs(utcMs) - utcMs;
+
+  // Probe offsets before and after any potential DST transition around targetUtcWallMs
+  // (all IANA timezone offsets lie within [-14h, +14h])
+  const baseGuessUtcMs = targetUtcWallMs - getOffsetAtUtcMs(targetUtcWallMs);
+  const offsetBefore = getOffsetAtUtcMs(baseGuessUtcMs - 6 * 3600_000);
+  const offsetAfter = getOffsetAtUtcMs(baseGuessUtcMs + 6 * 3600_000);
+
+  const rawCandidates = [
+    targetUtcWallMs - offsetBefore,
+    targetUtcWallMs - offsetAfter,
+  ];
+  const uniqueCandidates = Array.from(new Set(rawCandidates)).sort((a, b) => a - b);
+  const validUtcCandidates = uniqueCandidates.filter(
+    (candMs) => getObservedWallMs(candMs) === targetUtcWallMs,
+  );
+
+  if (validUtcCandidates.length === 0) {
+    throw new Error(
+      `指定的本地時間 (${trimmed}) 在時區 ${timeZone.trim()} 因日光節約時間 (DST) 跳轉而不存在`,
+    );
   }
 
-  return new Date(guessMs).toISOString();
+  if (validUtcCandidates.length > 1) {
+    if (disambiguation === 'reject') {
+      throw new Error(
+        `指定的本地時間 (${trimmed}) 在時區 ${timeZone.trim()} 因日光節約時間 (DST) 回撥而重複出現兩次`,
+      );
+    }
+    const chosenMs =
+      disambiguation === 'later'
+        ? validUtcCandidates[validUtcCandidates.length - 1]!
+        : validUtcCandidates[0]!;
+    return new Date(chosenMs).toISOString();
+  }
+
+  return new Date(validUtcCandidates[0]!).toISOString();
 }
 
 /**
@@ -680,6 +775,7 @@ export function createInitialCalendarNavigationState(
     mobileView: 'calendar',
     diaryAutoSwitchedToPersonal: false,
     selectedEventId: null,
+    highlightedSourceMessageId: null,
   };
 }
 
@@ -711,6 +807,7 @@ export function selectCalendarDateBlank(
     mobileView: options?.openMobilePanel ? 'panel' : state.mobileView,
     diaryAutoSwitchedToPersonal: false,
     selectedEventId: null,
+    highlightedSourceMessageId: null,
   };
 }
 
@@ -739,6 +836,7 @@ export function selectCalendarEventFromCell(
     mobileView: options?.openMobilePanel ? 'panel' : state.mobileView,
     diaryAutoSwitchedToPersonal: false,
     selectedEventId: eventId,
+    highlightedSourceMessageId: null,
   };
 }
 
@@ -749,6 +847,62 @@ export function clearSelectedCalendarEvent(
   return {
     ...state,
     selectedEventId: null,
+  };
+}
+
+/**
+ * Synchronizes `selectedSpace`, `selectedDate`, `displayedMonth`, `activeTab`, and `highlightedSourceMessageId`
+ * when navigating from an event's "查看來源聊天" action back to its source message (PR #27 Blocking 2 fix).
+ * - If the source message belongs to a family chat room (`roomKind === 'family'`), switches `selectedSpace`
+ *   to `{ kind: 'family', familyId }` and opens the `'chat'` tab (even if the event itself was personal).
+ * - If the source message belongs to a personal mood room (`roomKind === 'personal'`), switches `selectedSpace`
+ *   to `{ kind: 'personal' }` and opens the `'mood'` tab.
+ * - If `sourceStatus !== 'accessible'` or `sourceMessage` is null (deleted or inaccessible), returns `state` unchanged.
+ */
+export function navigateCalendarToEventSourceMessage(
+  state: CalendarNavigationState,
+  source: {
+    sourceStatus: 'none' | 'accessible' | 'deleted' | 'inaccessible';
+    sourceMessage: {
+      id: string;
+      roomId: string;
+      roomKind: 'personal' | 'family';
+      familyId: string | null;
+      localDate: string;
+    } | null;
+  },
+  authorizedFamilyIds?: readonly string[],
+): CalendarNavigationState {
+  if (source.sourceStatus !== 'accessible' || !source.sourceMessage) {
+    return state;
+  }
+
+  const msg = source.sourceMessage;
+  let targetSpace: SelectedSpace;
+  let targetTab: RightPanelTab;
+
+  if (msg.roomKind === 'personal') {
+    targetSpace = { kind: 'personal' };
+    targetTab = 'mood';
+  } else if (msg.roomKind === 'family' && msg.familyId) {
+    if (authorizedFamilyIds && !authorizedFamilyIds.includes(msg.familyId)) {
+      return state;
+    }
+    targetSpace = { kind: 'family', familyId: msg.familyId };
+    targetTab = 'chat';
+  } else {
+    return state;
+  }
+
+  const jumped = jumpCalendarToDate(state, msg.localDate);
+  return {
+    ...jumped,
+    selectedSpace: targetSpace,
+    activeTab: targetTab,
+    selectedEventId: null,
+    highlightedSourceMessageId: msg.id,
+    diaryAutoSwitchedToPersonal: false,
+    mobileView: 'panel',
   };
 }
 
@@ -766,6 +920,7 @@ export function switchRightPanelTab(
     selectedSpace: autoSwitched ? { kind: 'personal' } : state.selectedSpace,
     diaryAutoSwitchedToPersonal: autoSwitched,
     selectedEventId: autoSwitched ? null : state.selectedEventId,
+    highlightedSourceMessageId: null,
     // selectedDate and todayDate are intentionally untouched
   };
 }
@@ -784,6 +939,7 @@ export function selectCalendarSpace(
     activeTab: shouldLeavePersonalOnlyTab ? 'summary' : state.activeTab,
     diaryAutoSwitchedToPersonal: false,
     selectedEventId: null,
+    highlightedSourceMessageId: null,
   };
 }
 
@@ -797,7 +953,8 @@ export function resetCalendarSelectedSpaceToPersonal(
   if (
     state.selectedSpace.kind === 'personal' &&
     !state.diaryAutoSwitchedToPersonal &&
-    !state.selectedEventId
+    !state.selectedEventId &&
+    !state.highlightedSourceMessageId
   ) {
     return state;
   }
@@ -806,6 +963,7 @@ export function resetCalendarSelectedSpaceToPersonal(
     selectedSpace: { kind: 'personal' },
     diaryAutoSwitchedToPersonal: false,
     selectedEventId: null,
+    highlightedSourceMessageId: null,
   };
 }
 
@@ -825,6 +983,7 @@ export function reconcileCalendarSelectedSpace(
         selectedSpace: { kind: 'personal' },
         diaryAutoSwitchedToPersonal: false,
         selectedEventId: null,
+        highlightedSourceMessageId: null,
       };
     }
   }

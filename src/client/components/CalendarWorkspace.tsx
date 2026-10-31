@@ -26,6 +26,7 @@ import {
   isValidUtcIsoTimestamp,
   jumpCalendarToDate,
   navigateCalendarMonth,
+  navigateCalendarToEventSourceMessage,
   normalizeToUtcIsoTimestamp,
   refreshCalendarTodayDate,
   resolveEventCalendarDates,
@@ -47,6 +48,7 @@ export interface CalendarWorkspaceProps {
   onChangeNavState: (next: CalendarNavigationState) => void;
   families: FamilySummary[];
   onSelectFamilySpace?: (familyId: string) => void;
+  currentUserId?: string | null;
   timezone?: string;
   getNow?: () => Date;
   events?: EventDetail[];
@@ -64,6 +66,7 @@ export function CalendarWorkspace({
   onChangeNavState,
   families,
   onSelectFamilySpace,
+  currentUserId = null,
   timezone = DEFAULT_TIMEZONE,
   getNow,
   events: controlledEvents,
@@ -84,6 +87,7 @@ export function CalendarWorkspace({
     mobileView,
     diaryAutoSwitchedToPersonal,
     selectedEventId = null,
+    highlightedSourceMessageId = null,
   } = navState;
 
   // Local fallback state when rendered standalone in component tests without controlled `events`
@@ -157,15 +161,19 @@ export function CalendarWorkspace({
         ? `家庭：${selectedFamily.name}`
         : '家庭空間';
 
-  // Strictly isolate events by the active `selectedSpace` (Personal vs selected Family)
+  // Strictly isolate events by the active `selectedSpace` (Personal vs selected Family) and `currentUserId`
   const spaceScopedEvents = useMemo(() => {
     return allEvents.filter((ev) => {
       if (selectedSpace.kind === 'personal') {
-        return ev.scope === 'personal';
+        if (ev.scope !== 'personal') return false;
+        if (currentUserId && ev.ownerUserId && ev.ownerUserId !== currentUserId) {
+          return false;
+        }
+        return true;
       }
       return ev.scope === 'family' && ev.familyId === selectedSpace.familyId;
     });
-  }, [allEvents, selectedSpace]);
+  }, [allEvents, selectedSpace, currentUserId]);
 
   // Map space-scoped events onto calendar date cells via `resolveEventCalendarDates`
   const eventsByDateMap = useMemo(
@@ -300,15 +308,20 @@ export function CalendarWorkspace({
 
   const handleJumpToSourceMessage = (ev: EventDetail) => {
     if (ev.sourceStatus !== 'accessible' || !ev.sourceMessage) return;
-    const targetTab: RightPanelTab =
-      ev.sourceMessage.roomKind === 'personal' ? 'mood' : 'chat';
-    let nextState = jumpCalendarToDate(navState, ev.sourceMessage.localDate);
-    nextState = switchRightPanelTab(nextState, targetTab);
-    onChangeNavState({
-      ...nextState,
-      selectedEventId: null,
-      mobileView: 'panel',
-    });
+    const authorizedFamilyIds = families.map((f) => f.id);
+    const nextState = navigateCalendarToEventSourceMessage(
+      navState,
+      ev,
+      authorizedFamilyIds,
+    );
+    if (nextState === navState) return;
+    onChangeNavState(nextState);
+    if (
+      nextState.selectedSpace.kind === 'family' &&
+      onSelectFamilySpace
+    ) {
+      onSelectFamilySpace(nextState.selectedSpace.familyId);
+    }
   };
 
   const resolveFormTimestamps = ():
@@ -346,10 +359,13 @@ export function CalendarWorkspace({
       startIso = isValidUtcIsoTimestamp(formStartsAt)
         ? normalizeToUtcIsoTimestamp(formStartsAt)
         : convertLocalDateTimeInTimezoneToUtcIso(formStartsAt, trimmedTz);
-    } catch {
+    } catch (err: unknown) {
       return {
         ok: false,
-        message: '具時間事件開始時間格式無效（請提供 YYYY-MM-DDTHH:mm 或 ISO 8601 時間戳）',
+        message:
+          err instanceof Error && err.message.includes('日光節約時間')
+            ? err.message
+            : '具時間事件開始時間格式無效（請提供 YYYY-MM-DDTHH:mm 或 ISO 8601 時間戳）',
       };
     }
 
@@ -357,10 +373,13 @@ export function CalendarWorkspace({
       endIso = isValidUtcIsoTimestamp(formEndsAt)
         ? normalizeToUtcIsoTimestamp(formEndsAt)
         : convertLocalDateTimeInTimezoneToUtcIso(formEndsAt, trimmedTz);
-    } catch {
+    } catch (err: unknown) {
       return {
         ok: false,
-        message: '具時間事件結束時間格式無效（請提供 YYYY-MM-DDTHH:mm 或 ISO 8601 時間戳）',
+        message:
+          err instanceof Error && err.message.includes('日光節約時間')
+            ? err.message
+            : '具時間事件結束時間格式無效（請提供 YYYY-MM-DDTHH:mm 或 ISO 8601 時間戳）',
       };
     }
 
@@ -413,7 +432,8 @@ export function CalendarWorkspace({
                 ? 'cal_personal_local'
                 : `cal_family_${selectedSpace.familyId}`,
             scope: parsed.data.scope,
-            ownerUserId: parsed.data.scope === 'personal' ? 'usr_local' : null,
+            ownerUserId:
+              parsed.data.scope === 'personal' ? (currentUserId ?? 'usr_local') : null,
             familyId: parsed.data.scope === 'family' ? parsed.data.familyId! : null,
             title: parsed.data.title,
             description: parsed.data.description ?? null,
@@ -1685,10 +1705,19 @@ export function CalendarWorkspace({
                 )}
 
                 {activeTab === 'mood' && (
-                  <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-xs text-slate-700">
+                  <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-xs text-slate-700 space-y-2">
                     <p className="font-semibold text-slate-900">
                       💬 個人心情聊天室（定位日期：{selectedDate}）
                     </p>
+                    {highlightedSourceMessageId && (
+                      <div
+                        data-testid="chat-panel-source-message-locator"
+                        data-source-message-id={highlightedSourceMessageId}
+                        className="rounded-md border border-indigo-200 bg-indigo-50 px-3 py-1.5 text-[11px] font-medium text-indigo-900"
+                      >
+                        📍 已定位至來源訊息：<code>{highlightedSourceMessageId}</code>（{selectedDate}）
+                      </div>
+                    )}
                     <p className="mt-1 text-slate-600">
                       「心情」即個人專屬聊天室（<code>kind = 'personal'</code>
                       ），支援文字、emoji、快速筆記與外部 HTTPS 圖片連結，並將在
@@ -1698,10 +1727,19 @@ export function CalendarWorkspace({
                 )}
 
                 {activeTab === 'chat' && (
-                  <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-xs text-slate-700">
+                  <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-xs text-slate-700 space-y-2">
                     <p className="font-semibold text-slate-900">
                       🏠 家庭聊天室（定位日期：{selectedDate}）
                     </p>
+                    {highlightedSourceMessageId && (
+                      <div
+                        data-testid="chat-panel-source-message-locator"
+                        data-source-message-id={highlightedSourceMessageId}
+                        className="rounded-md border border-indigo-200 bg-indigo-50 px-3 py-1.5 text-[11px] font-medium text-indigo-900"
+                      >
+                        📍 已定位至來源訊息：<code>{highlightedSourceMessageId}</code>（{selectedDate}）
+                      </div>
+                    )}
                     {selectedSpace.kind === 'family' && selectedFamily ? (
                       <p className="mt-1 text-slate-600">
                         目前顯示「{selectedFamily.name}」的唯一家庭聊天室，定位於{' '}

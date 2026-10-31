@@ -1,4 +1,4 @@
-import { type FormEvent, useCallback, useEffect, useState } from 'react';
+import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 import {
   DATA_OWNERSHIP_SECURITY_NOTICE,
   DEFAULT_TIMEZONE,
@@ -14,6 +14,7 @@ import {
   type FamilySummary,
   type UpdateEventRequest,
   createInitialCalendarNavigationState,
+  createStaleRequestGuard,
   reconcileCalendarSelectedSpace,
   resetCalendarSelectedSpaceToPersonal,
   type CalendarNavigationState,
@@ -52,6 +53,33 @@ export function App() {
   const [spaceEvents, setSpaceEvents] = useState<EventDetail[]>([]);
   const [eventsLoading, setEventsLoading] = useState<boolean>(false);
   const [eventsError, setEventsError] = useState<string | null>(null);
+  const eventsRequestGuardRef = useRef(createStaleRequestGuard());
+
+  const clearSpaceEventsAndAbort = useCallback(() => {
+    eventsRequestGuardRef.current.invalidate();
+    setSpaceEvents([]);
+    setEventsError(null);
+    setEventsLoading(false);
+  }, []);
+
+  const handleChangeCalendarNavState = useCallback(
+    (next: CalendarNavigationState) => {
+      setCalendarNavState((prev) => {
+        const spaceChanged =
+          prev.selectedSpace.kind !== next.selectedSpace.kind ||
+          (prev.selectedSpace.kind === 'family' &&
+            next.selectedSpace.kind === 'family' &&
+            prev.selectedSpace.familyId !== next.selectedSpace.familyId);
+        if (spaceChanged) {
+          eventsRequestGuardRef.current.invalidate();
+          setSpaceEvents([]);
+          setEventsError(null);
+        }
+        return next;
+      });
+    },
+    [],
+  );
 
   // Family form states
   const [newFamilyName, setNewFamilyName] = useState<string>('');
@@ -91,6 +119,7 @@ export function App() {
       setIdentityError(null);
       if (!parsed.data.sessionId) {
         window.localStorage.removeItem(SESSION_STORAGE_KEY);
+        clearSpaceEventsAndAbort();
         setCalendarNavState((prev) => resetCalendarSelectedSpaceToPersonal(prev));
       }
     } catch (err: unknown) {
@@ -98,7 +127,7 @@ export function App() {
     } finally {
       setIdentityLoading(false);
     }
-  }, [baseUrl]);
+  }, [baseUrl, clearSpaceEventsAndAbort]);
 
   const fetchPendingInvitations = useCallback(async () => {
     const storedSessionId = window.localStorage.getItem(SESSION_STORAGE_KEY);
@@ -248,10 +277,11 @@ export function App() {
   const fetchSpaceEvents = useCallback(async () => {
     const storedSessionId = window.localStorage.getItem(SESSION_STORAGE_KEY);
     if (!storedSessionId || !identityState?.currentUser) {
-      setSpaceEvents([]);
-      setEventsError(null);
+      clearSpaceEventsAndAbort();
       return;
     }
+    const ticket = eventsRequestGuardRef.current.begin();
+    setSpaceEvents([]);
     setEventsLoading(true);
     setEventsError(null);
     try {
@@ -261,20 +291,40 @@ export function App() {
           : '?scope=personal';
       const res = await fetch(`${baseUrl}/api/events${query}`, {
         headers: getAuthHeaders(),
+        signal: ticket.signal,
       });
+      if (!eventsRequestGuardRef.current.isCurrent(ticket.requestId)) {
+        return;
+      }
       if (!res.ok) {
         const errData = (await res.json().catch(() => ({}))) as { message?: string };
         throw new Error(errData.message ?? '無法載入行程事件');
       }
       const data = (await res.json()) as EventDetail[];
+      if (!eventsRequestGuardRef.current.isCurrent(ticket.requestId)) {
+        return;
+      }
       setSpaceEvents(data);
     } catch (err: unknown) {
+      if (!eventsRequestGuardRef.current.isCurrent(ticket.requestId)) {
+        return;
+      }
+      if (err instanceof Error && err.name === 'AbortError') {
+        return;
+      }
       setEventsError(err instanceof Error ? err.message : '無法載入行程事件');
       setSpaceEvents([]);
     } finally {
-      setEventsLoading(false);
+      if (eventsRequestGuardRef.current.isCurrent(ticket.requestId)) {
+        setEventsLoading(false);
+      }
     }
-  }, [baseUrl, calendarNavState.selectedSpace, identityState?.currentUser]);
+  }, [
+    baseUrl,
+    calendarNavState.selectedSpace,
+    clearSpaceEventsAndAbort,
+    identityState?.currentUser,
+  ]);
 
   useEffect(() => {
     if (identityState?.currentUser) {
@@ -287,11 +337,16 @@ export function App() {
       setFamilyDetail(null);
       setPendingInvitations([]);
       setSpaceOverview(null);
-      setSpaceEvents([]);
-      setEventsError(null);
+      clearSpaceEventsAndAbort();
       setCalendarNavState((prev) => resetCalendarSelectedSpaceToPersonal(prev));
     }
-  }, [identityState?.currentUser, fetchFamilies, fetchPendingInvitations, fetchSpaceOverview]);
+  }, [
+    identityState?.currentUser,
+    clearSpaceEventsAndAbort,
+    fetchFamilies,
+    fetchPendingInvitations,
+    fetchSpaceOverview,
+  ]);
 
   useEffect(() => {
     void fetchSpaceEvents();
@@ -309,6 +364,8 @@ export function App() {
     setSubmitting(true);
     setIdentityError(null);
     setFamilyMessage(null);
+    // Immediately clear previous user's space events & abort in-flight requests on identity switch (PR #27 Blocking 1)
+    clearSpaceEventsAndAbort();
     try {
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
@@ -334,6 +391,7 @@ export function App() {
       if (parsed.sessionId) {
         window.localStorage.setItem(SESSION_STORAGE_KEY, parsed.sessionId);
       }
+      clearSpaceEventsAndAbort();
       setIdentityState(parsed);
       setEmailInput('');
       setDisplayNameInput('');
@@ -357,6 +415,7 @@ export function App() {
     setSubmitting(true);
     setIdentityError(null);
     setFamilyMessage(null);
+    clearSpaceEventsAndAbort();
     try {
       const res = await fetch(`${baseUrl}/api/test-identity/logout`, {
         method: 'POST',
@@ -366,6 +425,7 @@ export function App() {
       const json: unknown = await res.json();
       const parsed = TestIdentityStateResponseSchema.parse(json);
       window.localStorage.removeItem(SESSION_STORAGE_KEY);
+      clearSpaceEventsAndAbort();
       setIdentityState(parsed);
       setFamilies([]);
       setSelectedFamilyId(null);
@@ -567,6 +627,12 @@ export function App() {
       }
       setFamilyMessage({ type: 'success', text: `已成功退出「${familyDetail.name}」` });
       setSelectedFamilyId(null);
+      if (
+        calendarNavState.selectedSpace.kind === 'family' &&
+        calendarNavState.selectedSpace.familyId === leavingFamilyId
+      ) {
+        clearSpaceEventsAndAbort();
+      }
       setCalendarNavState((prev) =>
         reconcileCalendarSelectedSpace(
           prev,
@@ -726,8 +792,9 @@ export function App() {
         {/* Main Calendar Layout & Right-Hand Function Tabs (Issue #5, #6 & #7) */}
         <CalendarWorkspace
           navState={calendarNavState}
-          onChangeNavState={setCalendarNavState}
+          onChangeNavState={handleChangeCalendarNavState}
           families={families}
+          currentUserId={currentUser?.id ?? null}
           timezone={activeTimezone}
           onSelectFamilySpace={(fid) => setSelectedFamilyId(fid)}
           events={currentUser ? spaceEvents : undefined}

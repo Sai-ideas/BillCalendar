@@ -10,6 +10,7 @@ import {
   UpdateDiaryRequestSchema,
   UpdateEventRequestSchema,
   UpdateTaskRequestSchema,
+  addDaysToLocalDate,
   buildMonthCalendarGrid,
   isValidLocalDateString,
   isValidUtcIsoTimestamp,
@@ -1285,6 +1286,8 @@ export function createEventsRouter() {
     const yearQuery = c.req.query('year')?.trim();
     const monthQuery = c.req.query('month')?.trim();
     let monthGridDateSet: Set<string> | null = null;
+    let coarseMinDate: string | null = dateFilter ? addDaysToLocalDate(dateFilter, -1) : null;
+    let coarseMaxDate: string | null = dateFilter ? addDaysToLocalDate(dateFilter, 1) : null;
     if (yearQuery !== undefined || monthQuery !== undefined) {
       const parsedYear = Number(yearQuery);
       const parsedMonth = Number(monthQuery);
@@ -1313,9 +1316,24 @@ export function createEventsRouter() {
         dummySelected,
       );
       monthGridDateSet = new Set(gridCells.map((cell) => cell.dateStr));
+      const firstGridDate = gridCells[0]?.dateStr;
+      const lastGridDate = gridCells[gridCells.length - 1]?.dateStr;
+      if (firstGridDate && lastGridDate) {
+        const monthMin = addDaysToLocalDate(firstGridDate, -1);
+        const monthMax = addDaysToLocalDate(lastGridDate, 1);
+        coarseMinDate =
+          coarseMinDate && coarseMinDate > monthMin ? coarseMinDate : monthMin;
+        coarseMaxDate =
+          coarseMaxDate && coarseMaxDate < monthMax ? coarseMaxDate : monthMax;
+      }
     }
 
-    const filterEventByDateOrMonth = (ev: EventDetail): boolean => {
+    const filterEventByDateOrMonth = (ev: {
+      startsAt: string;
+      endsAt: string;
+      allDay: boolean;
+      timezone: string;
+    }): boolean => {
       if (!dateFilter && !monthGridDateSet) return true;
       try {
         const occupiedDates = resolveEventCalendarDates(ev, ev.timezone || DEFAULT_TIMEZONE);
@@ -1329,6 +1347,17 @@ export function createEventsRouter() {
       } catch {
         return false;
       }
+    };
+
+    const buildCalendarEventsWhereClause = (calendarId: string) => {
+      if (coarseMinDate && coarseMaxDate) {
+        return and(
+          eq(events.calendarId, calendarId),
+          sql`substr(${events.startsAt}, 1, 10) <= ${coarseMaxDate}`,
+          sql`substr(${events.endsAt}, 1, 10) >= ${coarseMinDate}`,
+        );
+      }
+      return eq(events.calendarId, calendarId);
     };
 
     if (scopeQuery === 'family') {
@@ -1351,17 +1380,20 @@ export function createEventsRouter() {
       const eventRows = await db
         .select()
         .from(events)
-        .where(eq(events.calendarId, containers.calendar.id))
+        .where(buildCalendarEventsWhereClause(containers.calendar.id))
         .orderBy(asc(events.startsAt), asc(events.id));
 
       const result: EventDetail[] = [];
       for (const ev of eventRows) {
+        if (!filterEventByDateOrMonth(ev)) {
+          continue;
+        }
         const resolvedSource = await resolveSourceMessageForTarget(
           db,
           currentUser,
           ev.sourceMessageId,
         );
-        const detail: EventDetail = {
+        result.push({
           id: ev.id,
           calendarId: ev.calendarId,
           scope: 'family',
@@ -1379,10 +1411,7 @@ export function createEventsRouter() {
           createdBy: ev.createdBy,
           createdAt: ev.createdAt,
           updatedAt: ev.updatedAt,
-        };
-        if (filterEventByDateOrMonth(detail)) {
-          result.push(detail);
-        }
+        });
       }
 
       return c.json(result, 200);
@@ -1397,17 +1426,20 @@ export function createEventsRouter() {
     const eventRows = await db
       .select()
       .from(events)
-      .where(eq(events.calendarId, personal.calendar.id))
+      .where(buildCalendarEventsWhereClause(personal.calendar.id))
       .orderBy(asc(events.startsAt), asc(events.id));
 
     const result: EventDetail[] = [];
     for (const ev of eventRows) {
+      if (!filterEventByDateOrMonth(ev)) {
+        continue;
+      }
       const resolvedSource = await resolveSourceMessageForTarget(
         db,
         currentUser,
         ev.sourceMessageId,
       );
-      const detail: EventDetail = {
+      result.push({
         id: ev.id,
         calendarId: ev.calendarId,
         scope: 'personal',
@@ -1425,10 +1457,7 @@ export function createEventsRouter() {
         createdBy: ev.createdBy,
         createdAt: ev.createdAt,
         updatedAt: ev.updatedAt,
-      };
-      if (filterEventByDateOrMonth(detail)) {
-        result.push(detail);
-      }
+      });
     }
 
     return c.json(result, 200);

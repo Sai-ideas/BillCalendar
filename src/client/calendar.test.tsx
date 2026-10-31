@@ -13,13 +13,16 @@ import {
   buildCalendarEventsByDateMap,
   buildMonthCalendarGrid,
   canNavigateCalendarMonth,
+  convertLocalDateTimeInTimezoneToUtcIso,
   createInitialCalendarNavigationState,
+  createStaleRequestGuard,
   deriveSelectedDateForMonth,
   formatInstantToLocalDate,
   getLunarDateInfo,
   getTodayLocalDate,
   isSolarYearInLunarSupportedRange,
   navigateCalendarMonth,
+  navigateCalendarToEventSourceMessage,
   reconcileCalendarSelectedSpace,
   refreshCalendarTodayDate,
   resetCalendarSelectedSpaceToPersonal,
@@ -1044,5 +1047,266 @@ describe('Issue #7 Personal & Family Calendar Events CRUD, Event Bars & Detail I
     const mapByTaipeiTz = buildCalendarEventsByDateMap([nyEvent], 'Asia/Taipei');
     expect(mapByTaipeiTz['2026-10-31']).toHaveLength(1);
     expect(mapByTaipeiTz['2026-10-31']?.[0]?.timeLabel).toBe('06:00');
+  });
+
+  it('PR #27 Blocking 1 regression: prevents previous user personal events leak on identity switch and discards out-of-order stale responses', async () => {
+    // 1. Verify StaleRequestGuard aborts and invalidates older tickets when a newer identity/space request begins or invalidates
+    const guard = createStaleRequestGuard();
+    const userATicket = guard.begin();
+    expect(guard.isCurrent(userATicket.requestId)).toBe(true);
+    expect(userATicket.signal.aborted).toBe(false);
+
+    // User switches identity to User B -> begins new request (or invalidates first)
+    const userBTicket = guard.begin();
+    expect(userATicket.signal.aborted).toBe(true);
+    expect(guard.isCurrent(userATicket.requestId)).toBe(false);
+    expect(guard.isCurrent(userBTicket.requestId)).toBe(true);
+
+    // Simulate out-of-order completion: User B resolves first, then User A's slow request resolves later
+    let appliedEvents: string[] = [];
+    const applyIfCurrent = (requestId: number, items: string[]) => {
+      if (!guard.isCurrent(requestId)) return;
+      appliedEvents = items;
+    };
+
+    applyIfCurrent(userBTicket.requestId, ['evt_user_b_1']);
+    expect(appliedEvents).toEqual(['evt_user_b_1']);
+
+    // Stale User A response arrives after User B -> must be ignored
+    applyIfCurrent(userATicket.requestId, ['evt_user_a_secret']);
+    expect(appliedEvents).toEqual(['evt_user_b_1']);
+
+    // Explicit invalidate() on logout / identity switch
+    guard.invalidate();
+    expect(userBTicket.signal.aborted).toBe(true);
+    expect(guard.isCurrent(userBTicket.requestId)).toBe(false);
+
+    // 2. Verify CalendarWorkspace immediately isolates personal events by `currentUserId` even if stale events array is still passed
+    function IdentitySwitchHarness() {
+      const [currentUserId, setCurrentUserId] = useState<string>('usr_alice');
+      const [navState, setNavState] = useState<CalendarNavigationState>(() =>
+        createInitialCalendarNavigationState('2026-10-30'),
+      );
+      return (
+        <div>
+          <button
+            type="button"
+            data-testid="switch-to-bob-btn"
+            onClick={() => setCurrentUserId('usr_bob')}
+          >
+            切換為 Bob
+          </button>
+          <CalendarWorkspace
+            navState={navState}
+            onChangeNavState={setNavState}
+            families={MOCK_FAMILIES}
+            currentUserId={currentUserId}
+            events={SAMPLE_EVENTS}
+          />
+        </div>
+      );
+    }
+
+    render(<IdentitySwitchHarness />);
+    // Initially as usr_alice: Alice's personal event on 2026-10-15 is visible
+    expect(
+      screen.getByTestId('calendar-cell-event-2026-10-15-evt_personal_single'),
+    ).toBeTruthy();
+
+    // Immediately switch identity to usr_bob -> Alice's personal event must disappear immediately without waiting for network
+    fireEvent.click(screen.getByTestId('switch-to-bob-btn'));
+    expect(
+      screen.queryByTestId('calendar-cell-event-2026-10-15-evt_personal_single'),
+    ).toBeNull();
+  });
+
+  it('PR #27 Blocking 2 regression: jumping from a personal event derived from a family chat message synchronizes selectedSpace to that family and opens chat tab', () => {
+    const crossSpaceEvents: EventDetail[] = [
+      {
+        id: 'evt_personal_from_family_chat',
+        calendarId: 'cal_p1',
+        scope: 'personal',
+        ownerUserId: 'usr_alice',
+        familyId: null,
+        title: '從家庭群組轉存的個人提醒',
+        description: '記得買牛奶回家',
+        startsAt: '2026-10-18',
+        endsAt: '2026-10-18',
+        allDay: true,
+        timezone: 'Asia/Taipei',
+        sourceMessageId: 'msg_fam_chat_99',
+        sourceStatus: 'accessible',
+        sourceMessage: {
+          id: 'msg_fam_chat_99',
+          roomId: 'room_fam_01',
+          roomKind: 'family',
+          familyId: 'fam_01',
+          senderUserId: 'usr_bob',
+          body: '下班順路買兩瓶鮮奶喔！',
+          localDate: '2026-10-12',
+          recordDate: null,
+          createdAt: '2026-10-12T09:30:00.000Z',
+        },
+        createdBy: 'usr_alice',
+        createdAt: '2026-10-12T10:00:00.000Z',
+        updatedAt: '2026-10-12T10:00:00.000Z',
+      },
+      {
+        id: 'evt_family_from_personal_mood',
+        calendarId: 'cal_fam_01',
+        scope: 'family',
+        ownerUserId: null,
+        familyId: 'fam_01',
+        title: '從個人心情轉存的家庭聚會',
+        description: null,
+        startsAt: '2026-10-25',
+        endsAt: '2026-10-25',
+        allDay: true,
+        timezone: 'Asia/Taipei',
+        sourceMessageId: 'msg_personal_mood_77',
+        sourceStatus: 'accessible',
+        sourceMessage: {
+          id: 'msg_personal_mood_77',
+          roomId: 'room_personal_alice',
+          roomKind: 'personal',
+          familyId: null,
+          senderUserId: 'usr_alice',
+          body: '月底帶全家人去吃火鍋',
+          localDate: '2026-10-08',
+          recordDate: null,
+          createdAt: '2026-10-08T04:00:00.000Z',
+        },
+        createdBy: 'usr_alice',
+        createdAt: '2026-10-08T05:00:00.000Z',
+        updatedAt: '2026-10-08T05:00:00.000Z',
+      },
+    ];
+
+    render(
+      <StatefulCalendarHarness
+        initialToday="2026-10-30"
+        initialEvents={crossSpaceEvents}
+      />,
+    );
+
+    // Initially in Personal Space (`個人空間`)
+    expect(screen.getByTestId('status-selected-space').textContent).toBe('個人空間');
+
+    // Click the personal event on 2026-10-18 that originated from a family chat message (`fam_01`)
+    fireEvent.click(
+      screen.getByTestId(
+        'calendar-cell-event-2026-10-18-evt_personal_from_family_chat',
+      ),
+    );
+    expect(
+      screen.getByTestId('event-detail-source-accessible').textContent,
+    ).toContain('下班順路買兩瓶鮮奶喔！');
+
+    // Click "查看來源聊天 ➔"
+    fireEvent.click(screen.getByTestId('event-detail-jump-source-btn'));
+
+    // Must synchronize selectedSpace to `家庭：陳家生活空間` (`fam_01`), selectedDate to `2026-10-12`, and activeTab to `chat`
+    expect(screen.getByTestId('status-selected-space').textContent).toBe(
+      '家庭：陳家生活空間',
+    );
+    expect(screen.getByTestId('status-selected-date').textContent).toBe('2026-10-12');
+    expect(screen.getByTestId('right-tab-chat').getAttribute('aria-selected')).toBe(
+      'true',
+    );
+    const chatPanel = screen.getByTestId('right-tabpanel-chat');
+    expect(chatPanel.textContent).toContain('目前顯示「陳家生活空間」的唯一家庭聊天室');
+    expect(
+      screen
+        .getByTestId('chat-panel-source-message-locator')
+        .getAttribute('data-source-message-id'),
+    ).toBe('msg_fam_chat_99');
+
+    // Now test the reverse direction: in Family Space (`fam_01`), click the family event on 2026-10-25 derived from a personal mood message
+    fireEvent.click(
+      screen.getByTestId(
+        'calendar-cell-event-2026-10-25-evt_family_from_personal_mood',
+      ),
+    );
+    fireEvent.click(screen.getByTestId('event-detail-jump-source-btn'));
+
+    // Must synchronize selectedSpace back to `個人空間`, selectedDate to `2026-10-08`, and activeTab to `mood`
+    expect(screen.getByTestId('status-selected-space').textContent).toBe('個人空間');
+    expect(screen.getByTestId('status-selected-date').textContent).toBe('2026-10-08');
+    expect(screen.getByTestId('right-tab-mood').getAttribute('aria-selected')).toBe(
+      'true',
+    );
+    expect(
+      screen
+        .getByTestId('chat-panel-source-message-locator')
+        .getAttribute('data-source-message-id'),
+    ).toBe('msg_personal_mood_77');
+
+    // Also verify deleted or inaccessible source messages do not navigate in `navigateCalendarToEventSourceMessage`
+    const initialState = createInitialCalendarNavigationState('2026-10-30');
+    expect(
+      navigateCalendarToEventSourceMessage(
+        initialState,
+        {
+          sourceStatus: 'deleted',
+          sourceMessage: null,
+        },
+        ['fam_01'],
+      ),
+    ).toBe(initialState);
+    expect(
+      navigateCalendarToEventSourceMessage(
+        initialState,
+        {
+          sourceStatus: 'accessible',
+          sourceMessage: {
+            id: 'msg_unauth_fam',
+            roomId: 'room_fam_unauth',
+            roomKind: 'family',
+            familyId: 'fam_unauth',
+            localDate: '2026-10-12',
+          },
+        },
+        ['fam_01'],
+      ),
+    ).toBe(initialState);
+  });
+
+  it('PR #27 Non-blocking 2 regression: rejects nonexistent DST spring-forward wall times and deterministically disambiguates repeated fall-back wall times', () => {
+    // 1. Nonexistent DST spring-forward gap in America/New_York: 2026-03-08 02:30 does not exist (clocks jump 02:00 EST -> 03:00 EDT)
+    expect(() =>
+      convertLocalDateTimeInTimezoneToUtcIso(
+        '2026-03-08T02:30',
+        'America/New_York',
+      ),
+    ).toThrow(/因日光節約時間 \(DST\) 跳轉而不存在/);
+
+    // 2. Repeated DST fall-back wall time in America/New_York: 2026-11-01 01:30 occurs twice (01:30 EDT = 05:30Z, 01:30 EST = 06:30Z)
+    expect(
+      convertLocalDateTimeInTimezoneToUtcIso(
+        '2026-11-01T01:30',
+        'America/New_York',
+      ),
+    ).toBe('2026-11-01T05:30:00.000Z');
+    expect(
+      convertLocalDateTimeInTimezoneToUtcIso(
+        '2026-11-01T01:30',
+        'America/New_York',
+        { disambiguation: 'earlier' },
+      ),
+    ).toBe('2026-11-01T05:30:00.000Z');
+    expect(
+      convertLocalDateTimeInTimezoneToUtcIso(
+        '2026-11-01T01:30',
+        'America/New_York',
+        { disambiguation: 'later' },
+      ),
+    ).toBe('2026-11-01T06:30:00.000Z');
+    expect(() =>
+      convertLocalDateTimeInTimezoneToUtcIso(
+        '2026-11-01T01:30',
+        'America/New_York',
+        { disambiguation: 'reject' },
+      ),
+    ).toThrow(/因日光節約時間 \(DST\) 回撥而重複出現兩次/);
   });
 });
