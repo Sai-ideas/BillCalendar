@@ -958,4 +958,88 @@ describe('Issue #8 <App /> task CRUD against the API', () => {
     expect(moodInput.value).toBe('');
     expect(moodRecordDateInput.value).toBe('');
   });
+
+  it('Issue #10 & #28 <App />: clicking "查看來源聊天" jumps to source message, synchronizes space and highlightedSourceMessageId, and renders focused chat timeline', async () => {
+    const api = installFakeApi('sess_alice');
+    const scrollMock = vi.fn();
+    Element.prototype.scrollIntoView = scrollMock;
+
+    const sourceMsgId = 'msg_source_e2e';
+    const sourceMsg = {
+      id: sourceMsgId,
+      roomId: 'room_personal',
+      roomKind: 'personal',
+      familyId: null,
+      senderUserId: 'usr_alice',
+      senderDisplayName: '愛麗絲',
+      body: '來源生活筆記：預約牙醫門診 🦷',
+      localDate: '2026-10-25',
+      recordDate: null,
+      createdAt: '2026-10-25T09:00:00.000Z',
+      updatedAt: '2026-10-25T09:00:00.000Z',
+      derivedTasks: [],
+      derivedEvents: [],
+      derivedCount: 1,
+    };
+
+    api.chatStore = [sourceMsg];
+
+    // Seed personal event derived from sourceMsg
+    const dentistEvent = {
+      id: 'ev_dentist',
+      calendarId: 'cal_personal',
+      scope: 'personal' as const,
+      ownerUserId: 'usr_alice',
+      familyId: null,
+      title: '看牙醫 🦷',
+      description: null,
+      startsAt: TODAY,
+      endsAt: TODAY,
+      allDay: true,
+      timezone: 'Asia/Taipei',
+      sourceMessageId: sourceMsgId,
+      sourceStatus: 'accessible' as const,
+      sourceMessage: {
+        id: sourceMsgId,
+        roomId: 'room_personal',
+        roomKind: 'personal' as const,
+        familyId: null,
+        senderUserId: 'usr_alice',
+        senderDisplayName: '愛麗絲',
+        body: '來源生活筆記：預約牙醫門診 🦷',
+        localDate: TODAY,
+        recordDate: null,
+        createdAt: NOW,
+      },
+      createdBy: 'usr_alice',
+      createdAt: NOW,
+      updatedAt: NOW,
+    };
+    api.data.set('events:sess_alice:personal', [dentistEvent]);
+
+    render(<App />);
+
+    // Wait for event bar to appear on calendar
+    const eventBar = await screen.findByTestId(`calendar-cell-event-${TODAY}-ev_dentist`);
+    fireEvent.click(eventBar);
+
+    // Event Detail inspector is opened
+    expect(await screen.findByTestId('event-detail-panel')).toBeTruthy();
+
+    // Click "查看來源聊天" button
+    const jumpBtn = screen.getByTestId('event-detail-jump-source-btn');
+    expect(jumpBtn).toBeTruthy();
+    fireEvent.click(jumpBtn);
+
+    // Should switch to mood tab and locate source message
+    await waitFor(() => {
+      expect(screen.getByTestId('chat-panel-source-message-locator')).toBeTruthy();
+      expect(screen.getByTestId(`chat-message-${sourceMsgId}`)).toBeTruthy();
+    });
+
+    const msgEl = screen.getByTestId(`chat-message-${sourceMsgId}`);
+    expect(msgEl.getAttribute('data-highlighted')).toBe('true');
+    expect(scrollMock).toHaveBeenCalled();
+  });
+
 });

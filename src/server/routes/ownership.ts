@@ -20,6 +20,7 @@ import {
   type DiaryEntry,
   type EventDetail,
   type MessageWithAuthorizedDerived,
+  type PaginatedMessagesResponse,
   type ResourceScope,
   type TaskDetail,
 } from '../../shared';
@@ -471,6 +472,7 @@ export function createChatRoomsRouter() {
   });
 
   // GET /api/chat-rooms/:roomId/messages - List active messages in a room with viewer-scoped derived records
+    // GET /api/chat-rooms/:roomId/messages - List active messages in a room with pagination, anchor date, and viewer-scoped derived records
   router.get('/:roomId/messages', async (c) => {
     const currentUser = c.get('currentUser');
     const db = c.get('db');
@@ -481,21 +483,246 @@ export function createChatRoomsRouter() {
       return c.json(resourceNotFoundOrInaccessibleResponse(access.message), access.status);
     }
 
-    const msgRows = await db
-      .select({
-        message: messages,
-        senderDisplayName: users.displayName,
-      })
-      .from(messages)
-      .leftJoin(users, eq(messages.senderUserId, users.id))
-      .where(and(eq(messages.roomId, roomId), isNull(messages.deletedAt)))
-      .orderBy(asc(messages.createdAt), asc(messages.id));
+    const url = new URL(c.req.url);
+    const anchorDate = url.searchParams.get('anchorDate')?.trim() || undefined;
+    const targetMessageId = url.searchParams.get('targetMessageId')?.trim() || undefined;
+    const beforeCursor = url.searchParams.get('before')?.trim() || undefined;
+    const afterCursor = url.searchParams.get('after')?.trim() || undefined;
+    const limitRaw = url.searchParams.get('limit');
+    let limit = limitRaw ? parseInt(limitRaw, 10) : 50;
+    if (isNaN(limit) || limit < 1) limit = 50;
+    if (limit > 100) limit = 100;
 
-    const result: MessageWithAuthorizedDerived[] = [];
-    for (const row of msgRows) {
+    async function getAnchorMessage(cursorId: string) {
+      const rows = await db
+        .select({
+          id: messages.id,
+          createdAt: messages.createdAt,
+          localDate: messages.localDate,
+          deletedAt: messages.deletedAt,
+        })
+        .from(messages)
+        .where(and(eq(messages.roomId, roomId), eq(messages.id, cursorId)))
+        .limit(1);
+      return rows[0] ?? null;
+    }
+
+    let selectedRows: { message: typeof messages.$inferSelect; senderDisplayName: string | null }[] = [];
+    let hasMoreBefore = false;
+    let hasMoreAfter = false;
+    let targetMessageFound: boolean | undefined = undefined;
+
+    if (targetMessageId) {
+      const target = await getAnchorMessage(targetMessageId);
+      if (!target || target.deletedAt !== null) {
+        targetMessageFound = false;
+      } else {
+        targetMessageFound = true;
+        const half = Math.floor(limit / 2);
+        const earlierRows = await db
+          .select({ message: messages, senderDisplayName: users.displayName })
+          .from(messages)
+          .leftJoin(users, eq(messages.senderUserId, users.id))
+          .where(
+            and(
+              eq(messages.roomId, roomId),
+              isNull(messages.deletedAt),
+              sql`(${messages.createdAt} < ${target.createdAt} OR (${messages.createdAt} = ${target.createdAt} AND ${messages.id} < ${target.id}))`,
+            ),
+          )
+          .orderBy(desc(messages.createdAt), desc(messages.id))
+          .limit(half + 1);
+
+        if (earlierRows.length > half) {
+          hasMoreBefore = true;
+          earlierRows.splice(half);
+        }
+
+        const laterRows = await db
+          .select({ message: messages, senderDisplayName: users.displayName })
+          .from(messages)
+          .leftJoin(users, eq(messages.senderUserId, users.id))
+          .where(
+            and(
+              eq(messages.roomId, roomId),
+              isNull(messages.deletedAt),
+              sql`(${messages.createdAt} > ${target.createdAt} OR (${messages.createdAt} = ${target.createdAt} AND ${messages.id} >= ${target.id}))`,
+            ),
+          )
+          .orderBy(asc(messages.createdAt), asc(messages.id))
+          .limit(limit - half + 1);
+
+        if (laterRows.length > limit - half) {
+          hasMoreAfter = true;
+          laterRows.splice(limit - half);
+        }
+
+        selectedRows = [...earlierRows.reverse(), ...laterRows];
+      }
+    }
+
+    if (!targetMessageId || targetMessageFound === false) {
+      if (beforeCursor) {
+        const cursor = await getAnchorMessage(beforeCursor);
+        if (cursor) {
+          const rows = await db
+            .select({ message: messages, senderDisplayName: users.displayName })
+            .from(messages)
+            .leftJoin(users, eq(messages.senderUserId, users.id))
+            .where(
+              and(
+                eq(messages.roomId, roomId),
+                isNull(messages.deletedAt),
+                sql`(${messages.createdAt} < ${cursor.createdAt} OR (${messages.createdAt} = ${cursor.createdAt} AND ${messages.id} < ${cursor.id}))`,
+              ),
+            )
+            .orderBy(desc(messages.createdAt), desc(messages.id))
+            .limit(limit + 1);
+
+          if (rows.length > limit) {
+            hasMoreBefore = true;
+            rows.splice(limit);
+          }
+          hasMoreAfter = true;
+          selectedRows = rows.reverse();
+        }
+      } else if (afterCursor) {
+        const cursor = await getAnchorMessage(afterCursor);
+        if (cursor) {
+          const rows = await db
+            .select({ message: messages, senderDisplayName: users.displayName })
+            .from(messages)
+            .leftJoin(users, eq(messages.senderUserId, users.id))
+            .where(
+              and(
+                eq(messages.roomId, roomId),
+                isNull(messages.deletedAt),
+                sql`(${messages.createdAt} > ${cursor.createdAt} OR (${messages.createdAt} = ${cursor.createdAt} AND ${messages.id} > ${cursor.id}))`,
+              ),
+            )
+            .orderBy(asc(messages.createdAt), asc(messages.id))
+            .limit(limit + 1);
+
+          if (rows.length > limit) {
+            hasMoreAfter = true;
+            rows.splice(limit);
+          }
+          hasMoreBefore = true;
+          selectedRows = rows;
+        }
+      } else if (anchorDate) {
+        // Issue #10: Locate message close to anchorDate utilizing idx_messages_room_date_created
+        const exactRows = await db
+          .select({ id: messages.id, createdAt: messages.createdAt })
+          .from(messages)
+          .where(
+            and(
+              eq(messages.roomId, roomId),
+              eq(messages.localDate, anchorDate),
+              isNull(messages.deletedAt),
+            ),
+          )
+          .orderBy(asc(messages.createdAt), asc(messages.id))
+          .limit(1);
+
+        let anchor = exactRows[0];
+        if (!anchor) {
+          const nextRows = await db
+            .select({ id: messages.id, createdAt: messages.createdAt })
+            .from(messages)
+            .where(
+              and(
+                eq(messages.roomId, roomId),
+                sql`${messages.localDate} > ${anchorDate}`,
+                isNull(messages.deletedAt),
+              ),
+            )
+            .orderBy(asc(messages.localDate), asc(messages.createdAt), asc(messages.id))
+            .limit(1);
+          anchor = nextRows[0];
+        }
+        if (!anchor) {
+          const prevRows = await db
+            .select({ id: messages.id, createdAt: messages.createdAt })
+            .from(messages)
+            .where(
+              and(
+                eq(messages.roomId, roomId),
+                sql`${messages.localDate} < ${anchorDate}`,
+                isNull(messages.deletedAt),
+              ),
+            )
+            .orderBy(desc(messages.localDate), desc(messages.createdAt), desc(messages.id))
+            .limit(1);
+          anchor = prevRows[0];
+        }
+
+        if (anchor) {
+          const half = Math.floor(limit / 2);
+          const earlierRows = await db
+            .select({ message: messages, senderDisplayName: users.displayName })
+            .from(messages)
+            .leftJoin(users, eq(messages.senderUserId, users.id))
+            .where(
+              and(
+                eq(messages.roomId, roomId),
+                isNull(messages.deletedAt),
+                sql`(${messages.createdAt} < ${anchor.createdAt} OR (${messages.createdAt} = ${anchor.createdAt} AND ${messages.id} < ${anchor.id}))`,
+              ),
+            )
+            .orderBy(desc(messages.createdAt), desc(messages.id))
+            .limit(half + 1);
+
+          if (earlierRows.length > half) {
+            hasMoreBefore = true;
+            earlierRows.splice(half);
+          }
+
+          const laterRows = await db
+            .select({ message: messages, senderDisplayName: users.displayName })
+            .from(messages)
+            .leftJoin(users, eq(messages.senderUserId, users.id))
+            .where(
+              and(
+                eq(messages.roomId, roomId),
+                isNull(messages.deletedAt),
+                sql`(${messages.createdAt} > ${anchor.createdAt} OR (${messages.createdAt} = ${anchor.createdAt} AND ${messages.id} >= ${anchor.id}))`,
+              ),
+            )
+            .orderBy(asc(messages.createdAt), asc(messages.id))
+            .limit(limit - half + 1);
+
+          if (laterRows.length > limit - half) {
+            hasMoreAfter = true;
+            laterRows.splice(limit - half);
+          }
+
+          selectedRows = [...earlierRows.reverse(), ...laterRows];
+        }
+      } else {
+        // Default: most recent messages
+        const rows = await db
+          .select({ message: messages, senderDisplayName: users.displayName })
+          .from(messages)
+          .leftJoin(users, eq(messages.senderUserId, users.id))
+          .where(and(eq(messages.roomId, roomId), isNull(messages.deletedAt)))
+          .orderBy(desc(messages.createdAt), desc(messages.id))
+          .limit(limit + 1);
+
+        if (rows.length > limit) {
+          hasMoreBefore = true;
+          rows.splice(limit);
+        }
+        hasMoreAfter = false;
+        selectedRows = rows.reverse();
+      }
+    }
+
+    const resultList: MessageWithAuthorizedDerived[] = [];
+    for (const row of selectedRows) {
       const msg = row.message;
       const derived = await getAuthorizedDerivedRecordsForMessage(db, currentUser, msg.id);
-      result.push({
+      resultList.push({
         id: msg.id,
         roomId: msg.roomId,
         roomKind: access.room.kind as ResourceScope,
@@ -513,7 +740,17 @@ export function createChatRoomsRouter() {
       });
     }
 
-    return c.json(result, 200);
+    const payload: PaginatedMessagesResponse = {
+      messages: resultList,
+      hasMoreBefore,
+      hasMoreAfter,
+      startCursor: resultList.length > 0 ? resultList[0].id : null,
+      endCursor: resultList.length > 0 ? resultList[resultList.length - 1].id : null,
+      anchorDate: anchorDate ?? null,
+      targetMessageFound,
+    };
+
+    return c.json(payload, 200);
   });
 
   // POST /api/chat-rooms/:roomId/messages - Post a message to an authorized personal or family chat room

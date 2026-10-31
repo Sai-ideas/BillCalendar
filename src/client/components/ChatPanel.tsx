@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import {
   LocalDateStringSchema,
+  formatChatDateDivider,
   sortMessagesStably,
   type MessageWithAuthorizedDerived,
 } from '../../shared';
@@ -17,6 +18,13 @@ export interface ChatPanelProps {
   messages: MessageWithAuthorizedDerived[];
   loading?: boolean;
   error?: string | null;
+  hasMoreBefore?: boolean;
+  hasMoreAfter?: boolean;
+  loadingEarlier?: boolean;
+  loadingLater?: boolean;
+  targetMessageFound?: boolean | null;
+  onLoadEarlier?: () => Promise<void>;
+  onLoadLater?: () => Promise<void>;
   onSendMessage: (payload: { body: string; recordDate?: string | null }) => Promise<void>;
   onDeleteMessage: (messageId: string) => Promise<void>;
 }
@@ -47,6 +55,13 @@ export function ChatPanel({
   messages,
   loading = false,
   error = null,
+  hasMoreBefore = false,
+  hasMoreAfter = false,
+  loadingEarlier = false,
+  loadingLater = false,
+  targetMessageFound = null,
+  onLoadEarlier,
+  onLoadLater,
   onSendMessage,
   onDeleteMessage,
 }: ChatPanelProps) {
@@ -63,7 +78,25 @@ export function ChatPanel({
     setFormError(null);
   }, [roomKind, familyDisplayName, selectedDate]);
 
+  // Issue #28: Smooth scroll into view when highlightedMessageId is present and message exists
+  useEffect(() => {
+    if (highlightedMessageId) {
+      const timer = setTimeout(() => {
+        const el = document.querySelector(`[data-testid="chat-message-${highlightedMessageId}"]`);
+        if (el) {
+          el.scrollIntoView?.({ behavior: 'smooth', block: 'center' });
+        }
+      }, 50);
+      return () => clearTimeout(timer);
+    }
+  }, [highlightedMessageId, messages]);
+
   const sortedMessages = sortMessagesStably(messages);
+  const hasSelectedDateMessages = sortedMessages.some((m) => m.localDate === selectedDate);
+  const isSourceMissingOrDeleted =
+    Boolean(highlightedMessageId) &&
+    (targetMessageFound === false ||
+      (!loading && sortedMessages.length > 0 && !sortedMessages.some((m) => m.id === highlightedMessageId)));
 
   const handleAddEmoji = (emoji: string) => {
     setDraftText((prev) => prev + emoji);
@@ -112,6 +145,8 @@ export function ChatPanel({
     }
   };
 
+  let lastLocalDate: string | null = null;
+
   return (
     <div className="flex flex-col h-full space-y-3 text-xs">
       {/* Context banner */}
@@ -133,8 +168,7 @@ export function ChatPanel({
         {roomKind === 'personal' ? (
           <p className="text-slate-600">
             「心情」即個人專屬聊天室（<code>kind = 'personal'</code>
-            ），支援文字、emoji、快速筆記與外部 HTTPS 圖片連結，並將在
-            Issue #9 / #10 接入時間軸定位與上下文捲動。
+            ），支援文字、emoji、快速筆記與外部 HTTPS 圖片連結，並支援時間軸按日期定位與前後連續捲動分頁。
           </p>
         ) : (
           <p className="text-slate-600">
@@ -154,20 +188,65 @@ export function ChatPanel({
         </div>
       )}
 
+      {/* Issue #28: Graceful degradation alert for deleted or missing source messages */}
+      {isSourceMissingOrDeleted && (
+        <div
+          role="alert"
+          data-testid="chat-source-missing-alert"
+          className="rounded-md border border-amber-300 bg-amber-50 p-2.5 text-xs text-amber-900 flex items-start gap-2"
+        >
+          <span className="text-sm">⚠️</span>
+          <div>
+            <p className="font-medium">來源訊息已遭移除、不存在或無存取權限</p>
+            <p className="text-[11px] text-amber-800 mt-0.5">
+              已為您安全切換至接近日期（<code>{selectedDate}</code>）的時間軸瀏覽。
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* Message List */}
       <div
         data-testid="chat-messages-container"
         className="flex-1 overflow-y-auto min-h-[220px] max-h-[380px] space-y-2.5 rounded-lg border border-slate-200 bg-white p-3 shadow-inner"
       >
-        {loading && messages.length === 0 && (
+        {/* Load Earlier (Before) Button */}
+        {hasMoreBefore && onLoadEarlier && (
+          <div className="text-center py-1">
+            <button
+              type="button"
+              data-testid="chat-load-earlier-button"
+              disabled={loadingEarlier || loading}
+              onClick={() => void onLoadEarlier()}
+              className="rounded border border-slate-300 bg-white px-3 py-1 text-[11px] font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-50 transition-colors shadow-2xs"
+            >
+              {loadingEarlier ? '載入更早訊息中...' : '↑ 載入更早訊息'}
+            </button>
+          </div>
+        )}
+
+        {loading && sortedMessages.length === 0 && (
           <p data-testid="chat-loading" className="text-center py-8 text-slate-400">
             載入訊息中...
           </p>
         )}
 
-        {!loading && messages.length === 0 && (
+        {!loading && sortedMessages.length === 0 && (
           <div data-testid="chat-empty-state" className="text-center py-8 text-slate-400">
             目前尚無訊息。在下方輸入文字或 emoji 開始記錄！
+          </div>
+        )}
+
+        {/* Issue #10: Friendly empty state banner if selected date has no messages but timeline has messages */}
+        {!loading && sortedMessages.length > 0 && !hasSelectedDateMessages && (
+          <div
+            data-testid="chat-selected-date-empty-notice"
+            className="rounded-md border border-amber-200 bg-amber-50/90 p-2.5 text-center text-xs text-amber-800 my-1"
+          >
+            📅 {selectedDate} 尚無
+            {roomKind === 'personal'
+              ? '心情筆記，在今日記下一筆吧'
+              : '家庭聊天訊息，在此留下紀錄吧'}
           </div>
         )}
 
@@ -182,93 +261,129 @@ export function ChatPanel({
             ? '我'
             : msg.senderDisplayName || msg.senderUserId;
 
+          // Issue #10: Date divider between different local dates
+          const showDateDivider = msg.localDate !== lastLocalDate;
+          if (showDateDivider) {
+            lastLocalDate = msg.localDate;
+          }
+
           return (
-            <div
-              key={msg.id}
-              data-testid={`chat-message-${msg.id}`}
-              data-highlighted={isHighlighted ? 'true' : 'false'}
-              className={`rounded-lg border p-2.5 transition-all ${
-                isHighlighted
-                  ? 'border-indigo-400 bg-indigo-50/80 ring-2 ring-indigo-400 shadow-sm'
-                  : isMe
-                    ? 'border-indigo-100 bg-indigo-50/30'
-                    : 'border-slate-200 bg-slate-50/60'
-              }`}
-            >
-              {/* Header: Sender & Actions */}
-              <div className="flex items-center justify-between gap-2 border-b border-slate-150 pb-1 text-[11px]">
-                <div className="flex items-center gap-1.5">
-                  <span
-                    className={`font-semibold ${
-                      isMe ? 'text-indigo-700' : 'text-slate-800'
-                    }`}
-                  >
-                    {senderName}
+            <div key={msg.id} className="space-y-2">
+              {showDateDivider && (
+                <div
+                  data-testid="chat-date-divider"
+                  data-date={msg.localDate}
+                  className="flex items-center my-3"
+                >
+                  <div className="flex-grow border-t border-slate-200" />
+                  <span className="mx-2 rounded-full bg-slate-100 border border-slate-200 px-2.5 py-0.5 text-[10px] font-medium text-slate-500">
+                    {formatChatDateDivider(msg.localDate)}
                   </span>
-                  {currentUserRole === 'admin' && !isMe && roomKind === 'family' && (
-                    <span className="rounded bg-amber-100 px-1 py-0.2 text-[9px] font-medium text-amber-800">
-                      群組管理員視角
+                  <div className="flex-grow border-t border-slate-200" />
+                </div>
+              )}
+
+              <div
+                data-testid={`chat-message-${msg.id}`}
+                data-highlighted={isHighlighted ? 'true' : 'false'}
+                className={`rounded-lg border p-2.5 transition-all ${
+                  isHighlighted
+                    ? 'border-indigo-400 bg-indigo-50/80 ring-2 ring-indigo-400 shadow-sm'
+                    : isMe
+                      ? 'border-indigo-100 bg-indigo-50/30'
+                      : 'border-slate-200 bg-slate-50/60'
+                }`}
+              >
+                {/* Header: Sender & Actions */}
+                <div className="flex items-center justify-between gap-2 border-b border-slate-150 pb-1 text-[11px]">
+                  <div className="flex items-center gap-1.5">
+                    <span
+                      className={`font-semibold ${
+                        isMe ? 'text-indigo-700' : 'text-slate-800'
+                      }`}
+                    >
+                      {senderName}
+                    </span>
+                    {currentUserRole === 'admin' && !isMe && roomKind === 'family' && (
+                      <span className="rounded bg-amber-100 px-1 py-0.2 text-[9px] font-medium text-amber-800">
+                        群組管理員視角
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono text-[10px] text-slate-400">
+                      {msg.localDate} {formatTime(msg.createdAt)}
+                    </span>
+                    {canDelete && (
+                      <button
+                        type="button"
+                        data-testid={`delete-message-${msg.id}`}
+                        disabled={isDeleting}
+                        onClick={() => void handleDelete(msg.id)}
+                        className="text-[11px] font-medium text-rose-600 hover:text-rose-800 hover:underline disabled:opacity-50"
+                        title={
+                          currentUserRole === 'admin' && !isMe
+                            ? '以管理員權限刪除此群組訊息'
+                            : '刪除此訊息'
+                        }
+                      >
+                        {isDeleting ? '刪除中...' : '刪除'}
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {/* Body: Preserves emojis and linebreaks */}
+                <div className="mt-1.5 text-xs text-slate-800 whitespace-pre-wrap break-words">
+                  {msg.body}
+                </div>
+
+                {/* Badges: recordDate and derived tasks/events */}
+                <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[10px]">
+                  {msg.recordDate && (
+                    <span
+                      data-testid={`chat-record-date-badge-${msg.id}`}
+                      className="inline-flex items-center gap-1 rounded bg-amber-50 border border-amber-200 px-1.5 py-0.5 font-medium text-amber-800"
+                    >
+                      📅 補記日：{msg.recordDate}
                     </span>
                   )}
-                </div>
-                <div className="flex items-center gap-2">
-                  <span className="font-mono text-[10px] text-slate-400">
-                    {msg.localDate} {formatTime(msg.createdAt)}
-                  </span>
-                  {canDelete && (
-                    <button
-                      type="button"
-                      data-testid={`delete-message-${msg.id}`}
-                      disabled={isDeleting}
-                      onClick={() => void handleDelete(msg.id)}
-                      className="text-[11px] font-medium text-rose-600 hover:text-rose-800 hover:underline disabled:opacity-50"
-                      title={
-                        currentUserRole === 'admin' && !isMe
-                          ? '以管理員權限刪除此群組訊息'
-                          : '刪除此訊息'
-                      }
+                  {msg.derivedTasks?.map((t) => (
+                    <span
+                      key={t.id}
+                      className="inline-flex items-center gap-1 rounded bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 text-emerald-800 font-medium"
                     >
-                      {isDeleting ? '刪除中...' : '刪除'}
-                    </button>
-                  )}
+                      ✓ 待辦：{t.title}
+                    </span>
+                  ))}
+                  {msg.derivedEvents?.map((ev) => (
+                    <span
+                      key={ev.id}
+                      className="inline-flex items-center gap-1 rounded bg-blue-50 border border-blue-200 px-1.5 py-0.5 text-blue-800 font-medium"
+                    >
+                      📅 行程：{ev.title}
+                    </span>
+                  ))}
                 </div>
-              </div>
-
-              {/* Body: Preserves emojis and linebreaks */}
-              <div className="mt-1.5 text-xs text-slate-800 whitespace-pre-wrap break-words">
-                {msg.body}
-              </div>
-
-              {/* Badges: recordDate and derived tasks/events */}
-              <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[10px]">
-                {msg.recordDate && (
-                  <span
-                    data-testid={`chat-record-date-badge-${msg.id}`}
-                    className="inline-flex items-center gap-1 rounded bg-amber-50 border border-amber-200 px-1.5 py-0.5 font-medium text-amber-800"
-                  >
-                    📅 補記日：{msg.recordDate}
-                  </span>
-                )}
-                {msg.derivedTasks?.map((t) => (
-                  <span
-                    key={t.id}
-                    className="inline-flex items-center gap-1 rounded bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 text-emerald-800 font-medium"
-                  >
-                    ✓ 待辦：{t.title}
-                  </span>
-                ))}
-                {msg.derivedEvents?.map((ev) => (
-                  <span
-                    key={ev.id}
-                    className="inline-flex items-center gap-1 rounded bg-blue-50 border border-blue-200 px-1.5 py-0.5 text-blue-800 font-medium"
-                  >
-                    📅 行程：{ev.title}
-                  </span>
-                ))}
               </div>
             </div>
           );
         })}
+
+        {/* Load Later (After) Button */}
+        {hasMoreAfter && onLoadLater && (
+          <div className="text-center py-1">
+            <button
+              type="button"
+              data-testid="chat-load-later-button"
+              disabled={loadingLater || loading}
+              onClick={() => void onLoadLater()}
+              className="rounded border border-slate-300 bg-white px-3 py-1 text-[11px] font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-50 transition-colors shadow-2xs"
+            >
+              {loadingLater ? '載入更新訊息中...' : '↓ 載入更新訊息'}
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Message Input & Send Form */}

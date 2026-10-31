@@ -84,6 +84,13 @@ export interface CalendarWorkspaceProps {
   chatError?: string | null;
   onCreateChatMessage?: (payload: { body: string; recordDate?: string | null }) => Promise<MessageWithAuthorizedDerived>;
   onDeleteChatMessage?: (messageId: string) => Promise<void>;
+  chatHasMoreBefore?: boolean;
+  chatHasMoreAfter?: boolean;
+  chatLoadingEarlier?: boolean;
+  chatLoadingLater?: boolean;
+  chatTargetMessageFound?: boolean | null;
+  onChatLoadEarlier?: () => Promise<void>;
+  onChatLoadLater?: () => Promise<void>;
   maxVisibleEventsPerCell?: number;
 }
 
