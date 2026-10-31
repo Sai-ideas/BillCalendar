@@ -45,11 +45,13 @@ import {
   type FamilySummary,
   type RightPanelTab,
   type SelectedSpace,
+  type MessageWithAuthorizedDerived,
   type TaskDetail,
   type UpdateEventRequest,
   type UpdateTaskRequest,
 } from '../../shared';
 import { TasksPanel, type TaskMutationInput } from './TasksPanel';
+import { ChatPanel } from './ChatPanel';
 
 /** Max task chips rendered inside one calendar date cell before collapsing into "+N 待辦". */
 const MAX_VISIBLE_TASKS_PER_CELL = 2;
@@ -76,6 +78,12 @@ export interface CalendarWorkspaceProps {
   onCreateTask?: (payload: CreateTaskRequest) => Promise<TaskDetail>;
   onUpdateTask?: (taskId: string, payload: UpdateTaskRequest) => Promise<TaskDetail>;
   onDeleteTask?: (taskId: string) => Promise<void>;
+  chatMessages?: MessageWithAuthorizedDerived[];
+  initialChatMessages?: MessageWithAuthorizedDerived[];
+  chatLoading?: boolean;
+  chatError?: string | null;
+  onCreateChatMessage?: (payload: { body: string; recordDate?: string | null }) => Promise<MessageWithAuthorizedDerived>;
+  onDeleteChatMessage?: (messageId: string) => Promise<void>;
   maxVisibleEventsPerCell?: number;
 }
 
@@ -101,6 +109,12 @@ export function CalendarWorkspace({
   onCreateTask,
   onUpdateTask,
   onDeleteTask,
+  chatMessages: controlledChatMessages,
+  initialChatMessages = [],
+  chatLoading = false,
+  chatError = null,
+  onCreateChatMessage,
+  onDeleteChatMessage,
   maxVisibleEventsPerCell = MAX_VISIBLE_EVENTS_PER_CELL,
 }: CalendarWorkspaceProps) {
   const {
@@ -122,6 +136,74 @@ export function CalendarWorkspace({
   // Local fallback tasks when rendered standalone without controlled `tasks` (Issue #8)
   const [localTasks, setLocalTasks] = useState<TaskDetail[]>(() => initialTasks);
   const allTasks = controlledTasks ?? localTasks;
+
+  // Local fallback chat messages when rendered standalone (Issue #9)
+  const [localChatMessages, setLocalChatMessages] = useState<MessageWithAuthorizedDerived[]>(
+    () => initialChatMessages,
+  );
+  const allChatMessages = controlledChatMessages ?? localChatMessages;
+
+  const spaceContextKey = `${currentUserId ?? 'anon'}:${
+    selectedSpace.kind === 'personal' ? 'personal' : selectedSpace.familyId
+  }`;
+
+  const moodMessages = useMemo(
+    () => allChatMessages.filter((m) => m.roomKind === 'personal'),
+    [allChatMessages],
+  );
+
+  const familyMessages = useMemo(
+    () =>
+      allChatMessages.filter(
+        (m) =>
+          m.roomKind === 'family' &&
+          (selectedSpace.kind === 'family' ? m.familyId === selectedSpace.familyId : true),
+      ),
+    [allChatMessages, selectedSpace],
+  );
+
+  const handleSendChatMessage = async (payload: { body: string; recordDate?: string | null }) => {
+    if (onCreateChatMessage) {
+      await onCreateChatMessage(payload);
+    } else {
+      const nowIso = new Date().toISOString();
+      const newMsg: MessageWithAuthorizedDerived = {
+        id: `msg_local_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        roomId:
+          activeTab === 'mood'
+            ? 'room_personal'
+            : selectedSpace.kind === 'family'
+              ? `room_${selectedSpace.familyId}`
+              : 'room_unknown',
+        roomKind: activeTab === 'mood' ? 'personal' : 'family',
+        familyId:
+          activeTab === 'mood'
+            ? null
+            : selectedSpace.kind === 'family'
+              ? selectedSpace.familyId
+              : null,
+        senderUserId: currentUserId ?? 'local_user',
+        senderDisplayName: currentUserId ? '我' : '訪客',
+        body: payload.body,
+        localDate: selectedDate,
+        recordDate: payload.recordDate ?? null,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        derivedTasks: [],
+        derivedEvents: [],
+        derivedCount: 0,
+      };
+      setLocalChatMessages((prev) => [...prev, newMsg]);
+    }
+  };
+
+  const handleDeleteChatMessage = async (messageId: string) => {
+    if (onDeleteChatMessage) {
+      await onDeleteChatMessage(messageId);
+    } else {
+      setLocalChatMessages((prev) => prev.filter((m) => m.id !== messageId));
+    }
+  };
 
   // Track which date cells have expanded overflow event lists (`+N 更多`)
   const [expandedOverflowCells, setExpandedOverflowCells] = useState<Record<string, boolean>>({});
@@ -1932,53 +2014,58 @@ export function CalendarWorkspace({
                 )}
 
                 {activeTab === 'mood' && (
-                  <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-xs text-slate-700 space-y-2">
-                    <p className="font-semibold text-slate-900">
-                      💬 個人心情聊天室（定位日期：{selectedDate}）
-                    </p>
-                    {highlightedSourceMessageId && (
-                      <div
-                        data-testid="chat-panel-source-message-locator"
-                        data-source-message-id={highlightedSourceMessageId}
-                        className="rounded-md border border-indigo-200 bg-indigo-50 px-3 py-1.5 text-[11px] font-medium text-indigo-900"
-                      >
-                        📍 已定位至來源訊息：<code>{highlightedSourceMessageId}</code>（{selectedDate}）
-                      </div>
-                    )}
-                    <p className="mt-1 text-slate-600">
-                      「心情」即個人專屬聊天室（<code>kind = 'personal'</code>
-                      ），支援文字、emoji、快速筆記與外部 HTTPS 圖片連結，並將在
-                      Issue #9 / #10 接入時間軸定位與上下文捲動。
-                    </p>
-                  </div>
+                  <ChatPanel
+                    roomId="personal"
+                    roomKind="personal"
+                    roomLabel="個人心情聊天室"
+                    selectedDate={selectedDate}
+                    highlightedMessageId={highlightedSourceMessageId}
+                    currentUserId={currentUserId}
+                    currentUserRole={null}
+                    messages={moodMessages}
+                    loading={chatLoading}
+                    error={chatError}
+                    onSendMessage={handleSendChatMessage}
+                    onDeleteMessage={handleDeleteChatMessage}
+                  />
                 )}
 
-                {activeTab === 'chat' && (
-                  <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-xs text-slate-700 space-y-2">
-                    <p className="font-semibold text-slate-900">
-                      🏠 家庭聊天室（定位日期：{selectedDate}）
-                    </p>
-                    {highlightedSourceMessageId && (
-                      <div
-                        data-testid="chat-panel-source-message-locator"
-                        data-source-message-id={highlightedSourceMessageId}
-                        className="rounded-md border border-indigo-200 bg-indigo-50 px-3 py-1.5 text-[11px] font-medium text-indigo-900"
-                      >
-                        📍 已定位至來源訊息：<code>{highlightedSourceMessageId}</code>（{selectedDate}）
-                      </div>
-                    )}
-                    {selectedSpace.kind === 'family' && selectedFamily ? (
-                      <p className="mt-1 text-slate-600">
-                        目前顯示「{selectedFamily.name}」的唯一家庭聊天室，定位於{' '}
-                        <code>{selectedDate}</code> 並保留前後訊息上下文。
+                {activeTab === 'chat' &&
+                  (selectedSpace.kind === 'family' && selectedFamily ? (
+                    <ChatPanel
+                      roomId={selectedSpace.familyId}
+                      roomKind="family"
+                      roomLabel={`家庭聊天室（${selectedFamily.name}）`}
+                      familyDisplayName={selectedFamily.name}
+                      selectedDate={selectedDate}
+                      highlightedMessageId={highlightedSourceMessageId}
+                      currentUserId={currentUserId}
+                      currentUserRole={selectedFamily.myRole}
+                      messages={familyMessages}
+                      loading={chatLoading}
+                      error={chatError}
+                      onSendMessage={handleSendChatMessage}
+                      onDeleteMessage={handleDeleteChatMessage}
+                    />
+                  ) : (
+                    <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-xs text-slate-700 space-y-2">
+                      <p className="font-semibold text-slate-900">
+                        🏠 家庭聊天室（定位日期：{selectedDate}）
                       </p>
-                    ) : (
+                      {highlightedSourceMessageId && (
+                        <div
+                          data-testid="chat-panel-source-message-locator"
+                          data-source-message-id={highlightedSourceMessageId}
+                          className="rounded-md border border-indigo-200 bg-indigo-50 px-3 py-1.5 text-[11px] font-medium text-indigo-900"
+                        >
+                          📍 已定位至來源訊息：<code>{highlightedSourceMessageId}</code>（{selectedDate}）
+                        </div>
+                      )}
                       <p className="mt-1 text-amber-800">
                         您目前位於「個人空間」。請由頂端空間切換器選擇一個家庭空間以檢視該家庭聊天室，或切換至「心情」分頁記錄個人隨手記。
                       </p>
-                    )}
-                  </div>
-                )}
+                    </div>
+                  ))}
 
                 {activeTab === 'ledger' && (
                   <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-xs text-slate-700">
@@ -1997,6 +2084,7 @@ export function CalendarWorkspace({
                     tasks={spaceScopedTasks}
                     selectedDate={selectedDate}
                     spaceLabel={currentSpaceLabel}
+                    contextKey={spaceContextKey}
                     loading={tasksLoading}
                     error={tasksError}
                     onCreate={handleCreateTaskInput}

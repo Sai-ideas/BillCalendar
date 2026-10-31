@@ -141,6 +141,8 @@ interface FakeApi {
   families: Record<string, unknown[]>;
   taskMutations: { method: string; path: string; body: unknown }[];
   tasksStore: unknown[] | null;
+  chatMutations: { method: string; path: string; body: unknown }[];
+  chatStore: any[];
 }
 
 function json(body: unknown, status = 200): Response {
@@ -173,6 +175,8 @@ function installFakeApi(initialSession: SessionId | null): FakeApi {
     families: { sess_alice: [FAMILY], sess_bob: [] },
     taskMutations: [],
     tasksStore: null,
+    chatMutations: [],
+    chatStore: [],
   };
   if (initialSession) window.localStorage.setItem('bc_test_session_id', initialSession);
 
@@ -220,6 +224,50 @@ function installFakeApi(initialSession: SessionId | null): FakeApi {
       }
       if (path === '/api/invitations') return json([]);
       if (path === '/api/spaces') return json({ message: 'n/a' }, 404);
+      if (path === '/api/chat-rooms') {
+        const scope = url.searchParams.get('scope') ?? 'personal';
+        return json([
+          {
+            id: scope === 'family' ? 'room_fam_01' : 'room_personal',
+            kind: scope,
+            userId: scope === 'personal' ? (USERS[session as SessionId]?.id ?? 'usr_alice') : null,
+            familyId: scope === 'family' ? 'fam_01' : null,
+            timezone: 'Asia/Taipei',
+            createdAt: NOW,
+            updatedAt: NOW,
+          },
+        ]);
+      }
+      if (path.startsWith('/api/chat-rooms/') && path.endsWith('/messages')) {
+        if (method === 'POST') {
+          api.chatMutations.push({ method, path, body });
+          const created = {
+            id: `msg_${Date.now()}`,
+            roomId: url.pathname.split('/')[3],
+            roomKind: 'personal',
+            familyId: null,
+            senderUserId: USERS[session as SessionId]?.id ?? 'usr_alice',
+            senderDisplayName: USERS[session as SessionId]?.displayName ?? '愛麗絲',
+            body: body.body,
+            localDate: TODAY,
+            recordDate: body.recordDate ?? null,
+            createdAt: NOW,
+            updatedAt: NOW,
+            derivedTasks: [],
+            derivedEvents: [],
+            derivedCount: 0,
+          };
+          api.chatStore.push(created);
+          return json(created, 201);
+        }
+        return json(api.chatStore);
+      }
+      if (path.startsWith('/api/messages/') && method === 'DELETE') {
+        const id = path.split('/')[3];
+        api.chatMutations.push({ method, path, body: null });
+        api.chatStore = api.chatStore.filter((m: any) => m.id !== id);
+        return json({ success: true, id, deletedAt: NOW });
+      }
 
       if (path === '/api/events' || path === '/api/tasks') {
         const kind = path === '/api/events' ? 'events' : 'tasks';
@@ -645,5 +693,81 @@ describe('Issue #8 <App /> task CRUD against the API', () => {
     render(<App />);
     await waitFor(() => expect(titleCount('正常行程')).toBeGreaterThan(0));
     expect((await screen.findByTestId('summary-tasks-api-error')).textContent).toContain('待辦服務暫時不可用');
+  });
+
+  it('Issue #31 & #9: space switch immediately aborts in-flight requests and clears data synchronously outside state updater', async () => {
+    const api = installFakeApi('sess_alice');
+    api.data.set('events:sess_alice:personal', [
+      eventFixture('Alice 個人事件', 'personal', { ownerUserId: 'usr_alice' }),
+    ]);
+    api.data.set('tasks:sess_alice:personal', [
+      taskFixture('Alice 個人待辦', 'personal', { ownerUserId: 'usr_alice' }),
+    ]);
+
+    render(<App />);
+    await waitFor(() => expect(titleCount('Alice 個人事件')).toBeGreaterThan(0));
+    expect(titleCount('Alice 個人待辦')).toBeGreaterThan(0);
+
+    // Park family events so family space load stays in-flight
+    const familyGate = deferred<unknown[]>();
+    api.parked.set('events:sess_alice:family', { gate: familyGate, honorAbort: true });
+
+    // Switch to family space
+    fireEvent.click(screen.getByTestId('space-switch-family-fam_01'));
+
+    // Synchronously, personal events and tasks are cleared immediately upon space switch
+    expect(titleCount('Alice 個人事件')).toBe(0);
+    expect(titleCount('Alice 個人待辦')).toBe(0);
+
+    // Release gate
+    familyGate.resolve([]);
+  });
+
+  it('Issue #9 <App /> chat CRUD: loads mood messages, posts message with emoji and deletes through API', async () => {
+    const api = installFakeApi('sess_alice');
+    api.chatStore = [
+      {
+        id: 'msg_existing',
+        roomId: 'room_personal',
+        roomKind: 'personal',
+        familyId: null,
+        senderUserId: 'usr_alice',
+        senderDisplayName: '愛麗絲',
+        body: '既有心情筆記 ✨',
+        localDate: TODAY,
+        recordDate: null,
+        createdAt: NOW,
+        updatedAt: NOW,
+        derivedTasks: [],
+        derivedEvents: [],
+        derivedCount: 0,
+      },
+    ];
+
+    api.data.set('events:sess_alice:personal', [
+      eventFixture('Alice 既有行程', 'personal', { ownerUserId: 'usr_alice' }),
+    ]);
+
+    render(<App />);
+    await waitFor(() => expect(titleCount('Alice 既有行程')).toBeGreaterThan(0));
+
+    // Switch to mood tab
+    fireEvent.click(screen.getByTestId('right-tab-mood'));
+    await waitFor(() => expect(screen.getByText('既有心情筆記 ✨')).toBeTruthy());
+
+    // Post a new message
+    fireEvent.change(screen.getByTestId('chat-message-input'), {
+      target: { value: '今日進度大超前 🚀' },
+    });
+    fireEvent.click(screen.getByTestId('emoji-btn-🎉'));
+    fireEvent.click(screen.getByTestId('chat-send-button'));
+
+    await waitFor(() => expect(screen.getByText('今日進度大超前 🚀🎉')).toBeTruthy());
+    expect(api.chatMutations.some((m) => m.method === 'POST')).toBe(true);
+
+    // Delete existing message
+    fireEvent.click(screen.getByTestId('delete-message-msg_existing'));
+    await waitFor(() => expect(screen.queryByText('既有心情筆記 ✨')).toBeNull());
+    expect(api.chatMutations.some((m) => m.method === 'DELETE')).toBe(true);
   });
 });

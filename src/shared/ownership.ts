@@ -159,6 +159,7 @@ export const MessageWithAuthorizedDerivedSchema = z.object({
   roomKind: ResourceScopeSchema,
   familyId: z.string().nullable(),
   senderUserId: z.string(),
+  senderDisplayName: z.string().optional(),
   body: z.string(),
   localDate: z.string(),
   recordDate: z.string().nullable(),
@@ -170,12 +171,21 @@ export const MessageWithAuthorizedDerivedSchema = z.object({
 });
 export type MessageWithAuthorizedDerived = z.infer<typeof MessageWithAuthorizedDerivedSchema>;
 
+export function sortMessagesStably<T extends { createdAt: string; id: string }>(list: T[]): T[] {
+  return [...list].sort((a, b) => {
+    const timeCmp = a.createdAt.localeCompare(b.createdAt);
+    if (timeCmp !== 0) return timeCmp;
+    return a.id.localeCompare(b.id);
+  });
+}
+
 export const SourceMessagePreviewSchema = z.object({
   id: z.string(),
   roomId: z.string(),
   roomKind: ResourceScopeSchema,
   familyId: z.string().nullable(),
   senderUserId: z.string(),
+  senderDisplayName: z.string().optional(),
   body: z.string(),
   localDate: z.string(),
   recordDate: z.string().nullable(),

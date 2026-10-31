@@ -13,6 +13,7 @@ import {
   type TaskDetail,
 } from '../shared';
 import { CalendarWorkspace } from './components/CalendarWorkspace';
+import { TasksPanel } from './components/TasksPanel';
 
 afterEach(() => {
   cleanup();
@@ -300,6 +301,78 @@ describe('Issue #8 Personal & Family Tasks', () => {
       expect(
         screen.getByTestId('chat-panel-source-message-locator').getAttribute('data-source-message-id'),
       ).toBe('msg_fam');
+    });
+
+    it('Issue #31 acceptance: automatically resets unsent create drafts and errors on space / identity context switch', () => {
+      const dummyProps = {
+        tasks: [],
+        selectedDate: '2026-10-30',
+        spaceLabel: '個人空間',
+        onCreate: async () => {},
+        onUpdate: async () => {},
+        onDelete: async () => {},
+        onJumpToSource: () => {},
+      };
+
+      const { rerender } = render(<TasksPanel {...dummyProps} contextKey="usr_alice:personal" />);
+      
+      // 1. Open create form and enter an unsubmitted draft
+      fireEvent.click(screen.getByTestId('task-open-create-btn'));
+      expect(screen.getByTestId('task-crud-form')).toBeTruthy();
+
+      const titleInput = screen.getByTestId('task-form-title-input') as HTMLInputElement;
+      fireEvent.change(titleInput, { target: { value: '未送出的草稿待辦' } });
+      expect(titleInput.value).toBe('未送出的草稿待辦');
+
+      // Trigger a form error by entering invalid due date
+      const dueInput = screen.getByTestId('task-form-due-date-input') as HTMLInputElement;
+      fireEvent.change(dueInput, { target: { value: 'invalid-date' } });
+      fireEvent.click(screen.getByTestId('task-form-submit-btn'));
+      expect(screen.getByTestId('task-form-error')).toBeTruthy();
+
+      // 2. Switch identity / space context by changing contextKey and spaceLabel
+      rerender(
+        <TasksPanel
+          {...dummyProps}
+          spaceLabel="家庭：陳家生活空間"
+          contextKey="usr_alice:fam_01"
+        />
+      );
+
+      // Form is closed and formError is reset
+      expect(screen.queryByTestId('task-crud-form')).toBeNull();
+      expect(screen.queryByTestId('task-form-error')).toBeNull();
+
+      // 3. Reopen create form: fields are clean
+      fireEvent.click(screen.getByTestId('task-open-create-btn'));
+      const newTitleInput = screen.getByTestId('task-form-title-input') as HTMLInputElement;
+      const newDueInput = screen.getByTestId('task-form-due-date-input') as HTMLInputElement;
+      expect(newTitleInput.value).toBe('');
+      expect(newDueInput.value).toBe('');
+      expect(screen.queryByTestId('task-form-error')).toBeNull();
+    });
+
+    it('Issue #31 acceptance: CalendarWorkspace resets TasksPanel create draft when switching space', () => {
+      render(<Harness initialTasks={[]} />);
+
+      // Go to tasks tab in personal space
+      fireEvent.click(screen.getByTestId('right-tab-tasks'));
+      fireEvent.click(screen.getByTestId('task-open-create-btn'));
+
+      const titleInput = screen.getByTestId('task-form-title-input') as HTMLInputElement;
+      fireEvent.change(titleInput, { target: { value: '個人空間未送出草稿' } });
+      expect(titleInput.value).toBe('個人空間未送出草稿');
+
+      // Switch to family space
+      fireEvent.click(screen.getByTestId('space-switch-family-fam_01'));
+
+      // Check tasks tab in family space: create form is closed!
+      expect(screen.queryByTestId('task-crud-form')).toBeNull();
+
+      // Reopen in family space: clean draft
+      fireEvent.click(screen.getByTestId('task-open-create-btn'));
+      const freshTitleInput = screen.getByTestId('task-form-title-input') as HTMLInputElement;
+      expect(freshTitleInput.value).toBe('');
     });
   });
 });

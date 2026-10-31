@@ -37,6 +37,7 @@ import {
   messages,
   taskLists,
   tasks,
+  users,
 } from '../db/schema';
 import {
   authorizeChatRoomById,
@@ -481,13 +482,18 @@ export function createChatRoomsRouter() {
     }
 
     const msgRows = await db
-      .select()
+      .select({
+        message: messages,
+        senderDisplayName: users.displayName,
+      })
       .from(messages)
+      .leftJoin(users, eq(messages.senderUserId, users.id))
       .where(and(eq(messages.roomId, roomId), isNull(messages.deletedAt)))
       .orderBy(asc(messages.createdAt), asc(messages.id));
 
     const result: MessageWithAuthorizedDerived[] = [];
-    for (const msg of msgRows) {
+    for (const row of msgRows) {
+      const msg = row.message;
       const derived = await getAuthorizedDerivedRecordsForMessage(db, currentUser, msg.id);
       result.push({
         id: msg.id,
@@ -495,6 +501,7 @@ export function createChatRoomsRouter() {
         roomKind: access.room.kind as ResourceScope,
         familyId: access.room.familyId,
         senderUserId: msg.senderUserId,
+        senderDisplayName: row.senderDisplayName ?? undefined,
         body: msg.body,
         localDate: msg.localDate,
         recordDate: msg.recordDate,
@@ -588,6 +595,7 @@ export function createChatRoomsRouter() {
       roomKind: access.room.kind as ResourceScope,
       familyId: access.room.familyId,
       senderUserId: currentUser.id,
+      senderDisplayName: currentUser.displayName,
       body: parsed.data.body,
       localDate,
       recordDate,
@@ -616,11 +624,20 @@ export function createMessagesRouter() {
     const db = c.get('db');
     const messageId = c.req.param('id');
 
-    const rows = await db.select().from(messages).where(eq(messages.id, messageId)).limit(1);
-    const msg = rows[0];
-    if (!msg) {
+    const rows = await db
+      .select({
+        message: messages,
+        senderDisplayName: users.displayName,
+      })
+      .from(messages)
+      .leftJoin(users, eq(messages.senderUserId, users.id))
+      .where(eq(messages.id, messageId))
+      .limit(1);
+    const row = rows[0];
+    if (!row) {
       return c.json(resourceNotFoundOrInaccessibleResponse('找不到該訊息或無權限存取'), 404);
     }
+    const msg = row.message;
 
     const access = await authorizeChatRoomById(db, currentUser, msg.roomId);
     if (!access.allowed) {
@@ -638,6 +655,7 @@ export function createMessagesRouter() {
       roomKind: access.room.kind as ResourceScope,
       familyId: access.room.familyId,
       senderUserId: msg.senderUserId,
+      senderDisplayName: row.senderDisplayName ?? undefined,
       body: msg.body,
       localDate: msg.localDate,
       recordDate: msg.recordDate,

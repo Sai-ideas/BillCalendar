@@ -57,6 +57,7 @@ export {
   DerivedTaskSummarySchema,
   DerivedEventSummarySchema,
   MessageWithAuthorizedDerivedSchema,
+  sortMessagesStably,
   SourceMessagePreviewSchema,
   CreateTaskRequestSchema,
   UpdateTaskRequestSchema,

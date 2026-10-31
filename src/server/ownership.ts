@@ -23,6 +23,7 @@ import {
   messages,
   taskLists,
   tasks,
+  users,
 } from './db/schema';
 
 /**
@@ -439,9 +440,11 @@ export async function authorizeSourceMessageForCreation(
     .select({
       message: messages,
       room: chatRooms,
+      senderDisplayName: users.displayName,
     })
     .from(messages)
     .innerJoin(chatRooms, eq(messages.roomId, chatRooms.id))
+    .leftJoin(users, eq(messages.senderUserId, users.id))
     .where(eq(messages.id, sourceMessageId))
     .limit(1);
 
@@ -524,9 +527,11 @@ export async function resolveSourceMessageForTarget(
     .select({
       message: messages,
       room: chatRooms,
+      senderDisplayName: users.displayName,
     })
     .from(messages)
     .innerJoin(chatRooms, eq(messages.roomId, chatRooms.id))
+    .leftJoin(users, eq(messages.senderUserId, users.id))
     .where(eq(messages.id, sourceMessageId))
     .limit(1);
 
@@ -562,6 +567,7 @@ export async function resolveSourceMessageForTarget(
       roomKind: match.room.kind as ResourceScope,
       familyId: match.room.familyId,
       senderUserId: match.message.senderUserId,
+      senderDisplayName: match.senderDisplayName ?? undefined,
       body: match.message.body,
       localDate: match.message.localDate,
       recordDate: match.message.recordDate,
