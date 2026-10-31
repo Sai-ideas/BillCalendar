@@ -10,9 +10,12 @@ import {
   UpdateDiaryRequestSchema,
   UpdateEventRequestSchema,
   UpdateTaskRequestSchema,
+  addDaysToLocalDate,
+  buildMonthCalendarGrid,
   isValidLocalDateString,
   isValidUtcIsoTimestamp,
   normalizeToUtcIsoTimestamp,
+  resolveEventCalendarDates,
   type ChatRoomSummary,
   type DiaryEntry,
   type EventDetail,
@@ -1259,8 +1262,103 @@ export function createEventsRouter() {
       return c.json(crossUserForbiddenResponse(), 403);
     }
 
-    const scopeQuery = c.req.query('scope') ?? (c.req.query('familyId') ? 'family' : 'personal');
+    const rawScope = c.req.query('scope');
+    if (rawScope && rawScope !== 'personal' && rawScope !== 'family') {
+      return c.json({ error: 'VALIDATION_ERROR', message: '無效的空間範圍 (scope)' }, 400);
+    }
     const familyId = c.req.query('familyId')?.trim();
+    if (rawScope === 'personal' && familyId) {
+      return c.json(
+        { error: 'VALIDATION_ERROR', message: '個人空間事件查詢不可指定 familyId' },
+        400,
+      );
+    }
+    const scopeQuery = rawScope ?? (familyId ? 'family' : 'personal');
+
+    const dateFilter = c.req.query('date')?.trim();
+    if (dateFilter && !isValidLocalDateString(dateFilter)) {
+      return c.json(
+        { error: 'VALIDATION_ERROR', message: '查詢日期格式必須為有效的 YYYY-MM-DD' },
+        400,
+      );
+    }
+
+    const yearQuery = c.req.query('year')?.trim();
+    const monthQuery = c.req.query('month')?.trim();
+    let monthGridDateSet: Set<string> | null = null;
+    let coarseMinDate: string | null = dateFilter ? addDaysToLocalDate(dateFilter, -1) : null;
+    let coarseMaxDate: string | null = dateFilter ? addDaysToLocalDate(dateFilter, 1) : null;
+    if (yearQuery !== undefined || monthQuery !== undefined) {
+      const parsedYear = Number(yearQuery);
+      const parsedMonth = Number(monthQuery);
+      if (
+        !yearQuery ||
+        !monthQuery ||
+        !Number.isInteger(parsedYear) ||
+        parsedYear < 1900 ||
+        parsedYear > 2100 ||
+        !Number.isInteger(parsedMonth) ||
+        parsedMonth < 1 ||
+        parsedMonth > 12
+      ) {
+        return c.json(
+          {
+            error: 'VALIDATION_ERROR',
+            message: '月份查詢必須同時提供有效的 year (1900–2100) 與 month (1–12)',
+          },
+          400,
+        );
+      }
+      const dummySelected = `${String(parsedYear).padStart(4, '0')}-${String(parsedMonth).padStart(2, '0')}-01`;
+      const gridCells = buildMonthCalendarGrid(
+        { year: parsedYear, month: parsedMonth },
+        dummySelected,
+        dummySelected,
+      );
+      monthGridDateSet = new Set(gridCells.map((cell) => cell.dateStr));
+      const firstGridDate = gridCells[0]?.dateStr;
+      const lastGridDate = gridCells[gridCells.length - 1]?.dateStr;
+      if (firstGridDate && lastGridDate) {
+        const monthMin = addDaysToLocalDate(firstGridDate, -1);
+        const monthMax = addDaysToLocalDate(lastGridDate, 1);
+        coarseMinDate =
+          coarseMinDate && coarseMinDate > monthMin ? coarseMinDate : monthMin;
+        coarseMaxDate =
+          coarseMaxDate && coarseMaxDate < monthMax ? coarseMaxDate : monthMax;
+      }
+    }
+
+    const filterEventByDateOrMonth = (ev: {
+      startsAt: string;
+      endsAt: string;
+      allDay: boolean;
+      timezone: string;
+    }): boolean => {
+      if (!dateFilter && !monthGridDateSet) return true;
+      try {
+        const occupiedDates = resolveEventCalendarDates(ev, ev.timezone || DEFAULT_TIMEZONE);
+        if (dateFilter && !occupiedDates.includes(dateFilter)) {
+          return false;
+        }
+        if (monthGridDateSet && !occupiedDates.some((d) => monthGridDateSet.has(d))) {
+          return false;
+        }
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    const buildCalendarEventsWhereClause = (calendarId: string) => {
+      if (coarseMinDate && coarseMaxDate) {
+        return and(
+          eq(events.calendarId, calendarId),
+          sql`substr(${events.startsAt}, 1, 10) <= ${coarseMaxDate}`,
+          sql`substr(${events.endsAt}, 1, 10) >= ${coarseMinDate}`,
+        );
+      }
+      return eq(events.calendarId, calendarId);
+    };
 
     if (scopeQuery === 'family') {
       if (!familyId) {
@@ -1282,11 +1380,14 @@ export function createEventsRouter() {
       const eventRows = await db
         .select()
         .from(events)
-        .where(eq(events.calendarId, containers.calendar.id))
+        .where(buildCalendarEventsWhereClause(containers.calendar.id))
         .orderBy(asc(events.startsAt), asc(events.id));
 
       const result: EventDetail[] = [];
       for (const ev of eventRows) {
+        if (!filterEventByDateOrMonth(ev)) {
+          continue;
+        }
         const resolvedSource = await resolveSourceMessageForTarget(
           db,
           currentUser,
@@ -1325,11 +1426,14 @@ export function createEventsRouter() {
     const eventRows = await db
       .select()
       .from(events)
-      .where(eq(events.calendarId, personal.calendar.id))
+      .where(buildCalendarEventsWhereClause(personal.calendar.id))
       .orderBy(asc(events.startsAt), asc(events.id));
 
     const result: EventDetail[] = [];
     for (const ev of eventRows) {
+      if (!filterEventByDateOrMonth(ev)) {
+        continue;
+      }
       const resolvedSource = await resolveSourceMessageForTarget(
         db,
         currentUser,
@@ -1616,7 +1720,12 @@ export function createEventsRouter() {
 
     if (typeof rawBody === 'object' && rawBody !== null) {
       const record = rawBody as Record<string, unknown>;
-      if (record.sourceMessageId !== undefined || record.calendarId !== undefined) {
+      if (
+        record.sourceMessageId !== undefined ||
+        record.calendarId !== undefined ||
+        record.scope !== undefined ||
+        record.familyId !== undefined
+      ) {
         return c.json(
           {
             error: 'FORBIDDEN',

@@ -85,6 +85,9 @@ export {
 } from './ownership';
 
 export {
+  SUPPORTED_SOLAR_YEAR_MIN,
+  SUPPORTED_SOLAR_YEAR_MAX,
+  isSolarYearInLunarSupportedRange,
   LUNAR_AND_HOLIDAY_PROVENANCE,
   SOLAR_TERMS_ZH_TW_MAP,
   ALL_24_SOLAR_TERMS_ZH_TW,
@@ -97,6 +100,9 @@ export {
 } from './lunar';
 
 export {
+  MIN_CALENDAR_YEAR,
+  MAX_CALENDAR_YEAR,
+  MAX_VISIBLE_EVENTS_PER_CELL,
   RightPanelTabSchema,
   MobileViewModeSchema,
   SelectedSpaceSchema,
@@ -113,14 +119,23 @@ export {
   formatYearMonthLabel,
   getTodayLocalDate,
   formatInstantToLocalDate,
+  formatInstantToLocalTimeLabel,
+  formatInstantToLocalDateTimeInput,
+  convertLocalDateTimeInTimezoneToUtcIso,
   addDaysToLocalDate,
   listInclusiveLocalDates,
   resolveEventCalendarDates,
+  buildCalendarEventsByDateMap,
+  getCellEventsDisplaySlice,
   shiftYearMonth,
+  clampYearMonthToSupportedRange,
+  canNavigateCalendarMonth,
   deriveSelectedDateForMonth,
   buildMonthCalendarGrid,
   createInitialCalendarNavigationState,
   selectCalendarDateBlank,
+  selectCalendarEventFromCell,
+  clearSelectedCalendarEvent,
   switchRightPanelTab,
   selectCalendarSpace,
   resetCalendarSelectedSpaceToPersonal,
@@ -128,6 +143,8 @@ export {
   refreshCalendarTodayDate,
   navigateCalendarMonth,
   jumpCalendarToDate,
+  navigateCalendarToEventSourceMessage,
+  createStaleRequestGuard,
   type RightPanelTab,
   type MobileViewMode,
   type SelectedSpace,
@@ -135,4 +152,10 @@ export {
   type YearMonth,
   type CalendarGridCell,
   type CalendarNavigationState,
+  type EventSpanPosition,
+  type CalendarEventLike,
+  type CalendarEventBarItem,
+  type DstDisambiguationPolicy,
+  type StaleRequestTicket,
+  type StaleRequestGuard,
 } from './calendar';
