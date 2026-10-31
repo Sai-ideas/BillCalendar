@@ -24,6 +24,8 @@ import {
   type ChatRoomSummary,
   type MessageWithAuthorizedDerived,
   type CalendarNavigationState,
+  type RightPanelTab,
+  type SelectedSpace,
   type HealthResponse,
   type TestIdentityStateResponse,
 } from '../shared';
@@ -77,14 +79,30 @@ export function App() {
   const [tasksError, setTasksError] = useState<string | null>(null);
   const tasksRequestGuardRef = useRef(createStaleRequestGuard());
 
-  // Chat state (Issue #9 & Review Blocking 1) — scoped to active room identity
+  // Chat state (Issue #9, #10 & #28) — scoped to active room identity with pagination & cursors
   const [chatState, setChatState] = useState<{
     roomKey: string | null;
     messages: MessageWithAuthorizedDerived[];
+    hasMoreBefore: boolean;
+    hasMoreAfter: boolean;
+    startCursor: string | null;
+    endCursor: string | null;
+    targetMessageFound: boolean | null;
   }>(() => ({
     roomKey: getActiveChatRoomKey(createInitialCalendarNavigationState()),
     messages: [],
+    hasMoreBefore: false,
+    hasMoreAfter: false,
+    startCursor: null,
+    endCursor: null,
+    targetMessageFound: null,
   }));
+  const [chatLoadingEarlier, setChatLoadingEarlier] = useState(false);
+  const [chatLoadingLater, setChatLoadingLater] = useState(false);
+
+  // Maintain chatStateRef to access current cursors in stable callbacks
+  const chatStateRef = useRef(chatState);
+  chatStateRef.current = chatState;
   const [chatLoading, setChatLoading] = useState<boolean>(false);
   const [chatError, setChatError] = useState<string | null>(null);
   const chatRequestGuardRef = useRef(createStaleRequestGuard());
@@ -106,7 +124,7 @@ export function App() {
     setSpaceTasks([]);
     setTasksError(null);
     setTasksLoading(false);
-    setChatState({ roomKey: null, messages: [] });
+    setChatState({ roomKey: null, messages: [], hasMoreBefore: false, hasMoreAfter: false, startCursor: null, endCursor: null, targetMessageFound: null });
     setChatError(null);
     setChatLoading(false);
   }, []);
@@ -138,7 +156,7 @@ export function App() {
         setEventsError(null);
         setSpaceTasks([]);
         setTasksError(null);
-        setChatState({ roomKey: nextRoomKey, messages: [] });
+        setChatState({ roomKey: nextRoomKey, messages: [], hasMoreBefore: false, hasMoreAfter: false, startCursor: null, endCursor: null, targetMessageFound: null });
         setChatError(null);
         setChatLoading(nextRoomKey !== null);
       } else if (roomChanged) {
@@ -146,7 +164,7 @@ export function App() {
         // Synchronously invalidate pending room reads, clear previous room messages, and set loading
         chatEpochRef.current += 1;
         chatRequestGuardRef.current.invalidate();
-        setChatState({ roomKey: nextRoomKey, messages: [] });
+        setChatState({ roomKey: nextRoomKey, messages: [], hasMoreBefore: false, hasMoreAfter: false, startCursor: null, endCursor: null, targetMessageFound: null });
         setChatError(null);
         setChatLoading(nextRoomKey !== null);
       }
@@ -170,14 +188,15 @@ export function App() {
 
   const baseUrl = import.meta.env.VITE_API_BASE_URL ?? '';
 
-  const getAuthHeaders = (): Record<string, string> => {
+  // Blocking 1: Stabilize getAuthHeaders with useCallback to prevent repeated fetch cycles
+  const getAuthHeaders = useCallback((): Record<string, string> => {
     const storedSessionId = window.localStorage.getItem(SESSION_STORAGE_KEY);
     const headers: Record<string, string> = {};
     if (storedSessionId) {
       headers['X-Test-Session-Id'] = storedSessionId;
     }
     return headers;
-  };
+  }, []);
 
   const fetchIdentityState = useCallback(async () => {
     setIdentityLoading(true);
@@ -451,33 +470,13 @@ export function App() {
     }
   }, [baseUrl, calendarNavState.selectedSpace, identityState?.currentUser]);
 
-  const fetchChatMessages = useCallback(async () => {
-    const storedSessionId = window.localStorage.getItem(SESSION_STORAGE_KEY);
-    if (!storedSessionId || !identityState?.currentUser) {
-      chatRequestGuardRef.current.invalidate();
-      setChatState({ roomKey: null, messages: [] });
-      setChatError(null);
-      setChatLoading(false);
-      return;
-    }
-
-    const expectedRoomKey = getActiveChatRoomKey(calendarNavStateRef.current);
-    if (!expectedRoomKey) {
-      chatRequestGuardRef.current.invalidate();
-      setChatState({ roomKey: null, messages: [] });
-      setChatError(null);
-      setChatLoading(false);
-      return;
-    }
-
-    const activeTab = calendarNavStateRef.current.activeTab;
-    const selectedSpace = calendarNavStateRef.current.selectedSpace;
-    const captureChatEpoch = chatEpochRef.current;
-    const ticket = chatRequestGuardRef.current.begin();
-    setChatLoading(true);
-    setChatError(null);
-
-    try {
+  // Helper to reliably resolve roomId across personal mood / family chat with /api/chat-rooms fallback
+  const resolveRoomId = useCallback(
+    async (
+      activeTab: RightPanelTab,
+      selectedSpace: SelectedSpace,
+      signal?: AbortSignal,
+    ): Promise<string | null> => {
       let roomId: string | null = null;
       if (activeTab === 'mood') {
         roomId = spaceOverview?.personalSpace.chatRoomId ?? null;
@@ -487,34 +486,86 @@ export function App() {
             ?.chatRoomId ?? null;
       }
 
-      if (!roomId) {
-        const scope = activeTab === 'mood' ? 'personal' : 'family';
-        const query =
-          scope === 'family' && selectedSpace.kind === 'family'
-            ? `?scope=family&familyId=${encodeURIComponent(selectedSpace.familyId)}`
-            : '?scope=personal';
+      if (roomId) return roomId;
+
+      const scope = activeTab === 'mood' ? 'personal' : 'family';
+      const query =
+        scope === 'family' && selectedSpace.kind === 'family'
+          ? `?scope=family&familyId=${encodeURIComponent(selectedSpace.familyId)}`
+          : '?scope=personal';
+
+      try {
         const roomRes = await fetch(`${baseUrl}/api/chat-rooms${query}`, {
           headers: getAuthHeaders(),
-          signal: ticket.signal,
+          signal,
         });
-        if (
-          !chatRequestGuardRef.current.isCurrent(ticket.requestId) ||
-          chatEpochRef.current !== captureChatEpoch ||
-          getActiveChatRoomKey(calendarNavStateRef.current) !== expectedRoomKey
-        ) {
-          return;
-        }
         if (roomRes.ok) {
           const rooms = (await roomRes.json()) as ChatRoomSummary[];
-          roomId = rooms[0]?.id ?? null;
+          return rooms[0]?.id ?? null;
         }
+      } catch {
+        return null;
+      }
+      return null;
+    },
+    [baseUrl, getAuthHeaders, spaceOverview],
+  );
+
+  // Issue #10: Anchor-driven timeline fetch (initial mount, date click, or source jump)
+  const fetchChatTimeline = useCallback(async (opts?: { silent?: boolean }) => {
+    const storedSessionId = window.localStorage.getItem(SESSION_STORAGE_KEY);
+    if (!storedSessionId || !identityState?.currentUser) {
+      chatRequestGuardRef.current.invalidate();
+      setChatState({ roomKey: null, messages: [], hasMoreBefore: false, hasMoreAfter: false, startCursor: null, endCursor: null, targetMessageFound: null });
+      setChatError(null);
+      setChatLoading(false);
+      return;
+    }
+
+    const expectedRoomKey = getActiveChatRoomKey(calendarNavStateRef.current);
+    if (!expectedRoomKey) {
+      chatRequestGuardRef.current.invalidate();
+      setChatState({ roomKey: null, messages: [], hasMoreBefore: false, hasMoreAfter: false, startCursor: null, endCursor: null, targetMessageFound: null });
+      setChatError(null);
+      setChatLoading(false);
+      return;
+    }
+
+    const activeTab = calendarNavStateRef.current.activeTab;
+    const selectedSpace = calendarNavStateRef.current.selectedSpace;
+    const captureChatEpoch = chatEpochRef.current;
+    const ticket = chatRequestGuardRef.current.begin();
+    if (!opts?.silent) {
+      setChatLoading(true);
+    }
+    setChatError(null);
+
+    try {
+      const roomId = await resolveRoomId(activeTab, selectedSpace, ticket.signal);
+      if (
+        !chatRequestGuardRef.current.isCurrent(ticket.requestId) ||
+        chatEpochRef.current !== captureChatEpoch ||
+        getActiveChatRoomKey(calendarNavStateRef.current) !== expectedRoomKey
+      ) {
+        return;
       }
 
       if (!roomId) {
         throw new Error('找不到對應聊天室');
       }
 
-      const res = await fetch(`${baseUrl}/api/chat-rooms/${encodeURIComponent(roomId)}/messages`, {
+      // Build query params: anchorDate (selectedDate) and targetMessageId (highlightedSourceMessageId)
+      const params = new URLSearchParams();
+      if (calendarNavStateRef.current.highlightedSourceMessageId) {
+        params.set('targetMessageId', calendarNavStateRef.current.highlightedSourceMessageId);
+      }
+      if (calendarNavStateRef.current.selectedDate) {
+        params.set('anchorDate', calendarNavStateRef.current.selectedDate);
+      }
+      params.set('limit', '50');
+      const queryString = params.toString() ? `?${params.toString()}` : '';
+
+      const res = await fetch(`${baseUrl}/api/chat-rooms/${encodeURIComponent(roomId)}/messages${queryString}`, {
         headers: getAuthHeaders(),
         signal: ticket.signal,
       });
@@ -532,7 +583,7 @@ export function App() {
         throw new Error(errData.message ?? '無法載入聊天室訊息');
       }
 
-      const data = (await res.json()) as MessageWithAuthorizedDerived[];
+      const raw = (await res.json()) as any;
       if (
         !chatRequestGuardRef.current.isCurrent(ticket.requestId) ||
         chatEpochRef.current !== captureChatEpoch ||
@@ -541,10 +592,30 @@ export function App() {
         return;
       }
 
-      const sorted = sortMessagesStably(data);
+      const isArray = Array.isArray(raw);
+      const rawMessages: MessageWithAuthorizedDerived[] = isArray ? raw : (raw.messages ?? []);
+      const hasMoreBefore = isArray ? false : Boolean(raw.hasMoreBefore);
+      const hasMoreAfter = isArray ? false : Boolean(raw.hasMoreAfter);
+      const startCursor = isArray ? (rawMessages[0]?.id ?? null) : (raw.startCursor ?? null);
+      const endCursor = isArray ? (rawMessages[rawMessages.length - 1]?.id ?? null) : (raw.endCursor ?? null);
+      const targetMessageFound = isArray ? null : (raw.targetMessageFound ?? null);
+
+      // Non-blocking 1: If targetMessageId was requested but missing/deleted, clear stale highlightedSourceMessageId
+      if (targetMessageFound === false && calendarNavStateRef.current.highlightedSourceMessageId) {
+        setCalendarNavState((prev) =>
+          prev.highlightedSourceMessageId ? { ...prev, highlightedSourceMessageId: null } : prev,
+        );
+      }
+
+      const sorted = sortMessagesStably(rawMessages);
       setChatState({
         roomKey: expectedRoomKey,
         messages: sorted,
+        hasMoreBefore,
+        hasMoreAfter,
+        startCursor,
+        endCursor,
+        targetMessageFound,
       });
     } catch (err: unknown) {
       if (
@@ -569,18 +640,181 @@ export function App() {
     }
   }, [
     baseUrl,
+    getAuthHeaders,
     identityState?.currentUser,
     spaceOverview,
   ]);
 
-  // Issue #9: Fetch messages and low-frequency polling when mood or chat tab is active
+  // Blocking 2: Low-frequency background polling that PRESERVES expanded timeline and pagination cursors
+  const pollChatUpdates = useCallback(async () => {
+    const current = chatStateRef.current;
+    const expectedRoomKey = getActiveChatRoomKey(calendarNavStateRef.current);
+    if (!current.roomKey || current.roomKey !== expectedRoomKey) return;
+
+    // If room is currently empty, perform silent initial load
+    if (current.messages.length === 0) {
+      await fetchChatTimeline({ silent: true });
+      return;
+    }
+
+    // If user is already at the latest end of the timeline (hasMoreAfter === false) and has endCursor,
+    // fetch incremental new messages after endCursor and merge without resetting history
+    if (!current.hasMoreAfter && current.endCursor) {
+      const activeTab = calendarNavStateRef.current.activeTab;
+      const selectedSpace = calendarNavStateRef.current.selectedSpace;
+      const roomId = await resolveRoomId(activeTab, selectedSpace);
+      if (!roomId) return;
+
+      const captureEpoch = chatEpochRef.current;
+      try {
+        const res = await fetch(
+          `${baseUrl}/api/chat-rooms/${encodeURIComponent(roomId)}/messages?after=${encodeURIComponent(current.endCursor)}&limit=50`,
+          { headers: getAuthHeaders() },
+        );
+        if (!res.ok) return;
+
+        const raw = (await res.json()) as any;
+        if (chatEpochRef.current !== captureEpoch || getActiveChatRoomKey(calendarNavStateRef.current) !== expectedRoomKey) {
+          return;
+        }
+
+        const rawMessages: MessageWithAuthorizedDerived[] = Array.isArray(raw) ? raw : (raw.messages ?? []);
+        if (rawMessages.length === 0) return;
+
+        setChatState((prev) => {
+          if (prev.roomKey !== expectedRoomKey) return prev;
+          const map = new Map<string, MessageWithAuthorizedDerived>();
+          for (const m of prev.messages) map.set(m.id, m);
+          for (const m of rawMessages) map.set(m.id, m);
+          const merged = sortMessagesStably(Array.from(map.values()));
+          return {
+            ...prev,
+            messages: merged,
+            hasMoreAfter: Array.isArray(raw) ? false : Boolean(raw.hasMoreAfter),
+            endCursor: merged.length > 0 ? merged[merged.length - 1]!.id : prev.endCursor,
+          };
+        });
+      } catch {
+        // Non-blocking polling error
+      }
+    }
+  }, [baseUrl, fetchChatTimeline, getAuthHeaders, resolveRoomId]);
+
+  const handleLoadEarlierChatMessages = useCallback(async () => {
+    const current = chatStateRef.current;
+    const currentRoomKey = current.roomKey;
+    const startCursor = current.startCursor;
+    if (!currentRoomKey || !startCursor || !current.hasMoreBefore || chatLoadingEarlier) return;
+
+    const captureEpoch = chatEpochRef.current;
+    setChatLoadingEarlier(true);
+    try {
+      const activeTab = calendarNavStateRef.current.activeTab;
+      const selectedSpace = calendarNavStateRef.current.selectedSpace;
+      const roomId = await resolveRoomId(activeTab, selectedSpace);
+      if (!roomId) return;
+
+      const res = await fetch(
+        `${baseUrl}/api/chat-rooms/${encodeURIComponent(roomId)}/messages?before=${encodeURIComponent(startCursor)}&limit=30`,
+        { headers: getAuthHeaders() },
+      );
+      if (!res.ok) return;
+
+      const raw = (await res.json()) as any;
+      if (chatEpochRef.current !== captureEpoch || getActiveChatRoomKey(calendarNavStateRef.current) !== currentRoomKey) {
+        return;
+      }
+      const rawMessages: MessageWithAuthorizedDerived[] = Array.isArray(raw) ? raw : (raw.messages ?? []);
+      const nextHasMoreBefore = Array.isArray(raw) ? false : Boolean(raw.hasMoreBefore);
+
+      setChatState((prev) => {
+        if (prev.roomKey !== currentRoomKey) return prev;
+        const map = new Map<string, MessageWithAuthorizedDerived>();
+        for (const m of rawMessages) map.set(m.id, m);
+        for (const m of prev.messages) map.set(m.id, m);
+        const merged = sortMessagesStably(Array.from(map.values()));
+        return {
+          ...prev,
+          messages: merged,
+          hasMoreBefore: nextHasMoreBefore,
+          startCursor: merged[0]?.id ?? null,
+        };
+      });
+    } catch {
+      // Non-blocking pagination error
+    } finally {
+      setChatLoadingEarlier(false);
+    }
+  }, [baseUrl, chatLoadingEarlier, getAuthHeaders, resolveRoomId]);
+
+  const handleLoadLaterChatMessages = useCallback(async () => {
+    const current = chatStateRef.current;
+    const currentRoomKey = current.roomKey;
+    const endCursor = current.endCursor;
+    if (!currentRoomKey || !endCursor || !current.hasMoreAfter || chatLoadingLater) return;
+
+    const captureEpoch = chatEpochRef.current;
+    setChatLoadingLater(true);
+    try {
+      const activeTab = calendarNavStateRef.current.activeTab;
+      const selectedSpace = calendarNavStateRef.current.selectedSpace;
+      const roomId = await resolveRoomId(activeTab, selectedSpace);
+      if (!roomId) return;
+
+      const res = await fetch(
+        `${baseUrl}/api/chat-rooms/${encodeURIComponent(roomId)}/messages?after=${encodeURIComponent(endCursor)}&limit=30`,
+        { headers: getAuthHeaders() },
+      );
+      if (!res.ok) return;
+
+      const raw = (await res.json()) as any;
+      if (chatEpochRef.current !== captureEpoch || getActiveChatRoomKey(calendarNavStateRef.current) !== currentRoomKey) {
+        return;
+      }
+      const rawMessages: MessageWithAuthorizedDerived[] = Array.isArray(raw) ? raw : (raw.messages ?? []);
+      const nextHasMoreAfter = Array.isArray(raw) ? false : Boolean(raw.hasMoreAfter);
+
+      setChatState((prev) => {
+        if (prev.roomKey !== currentRoomKey) return prev;
+        const map = new Map<string, MessageWithAuthorizedDerived>();
+        for (const m of prev.messages) map.set(m.id, m);
+        for (const m of rawMessages) map.set(m.id, m);
+        const merged = sortMessagesStably(Array.from(map.values()));
+        return {
+          ...prev,
+          messages: merged,
+          hasMoreAfter: nextHasMoreAfter,
+          endCursor: merged[merged.length - 1]?.id ?? null,
+        };
+      });
+    } catch {
+      // Non-blocking pagination error
+    } finally {
+      setChatLoadingLater(false);
+    }
+  }, [baseUrl, chatLoadingLater, getAuthHeaders, resolveRoomId]);
+
+  // Initial / anchor-driven timeline load
   useEffect(() => {
     if (calendarNavState.activeTab !== 'mood' && calendarNavState.activeTab !== 'chat') {
       return;
     }
-    void fetchChatMessages();
+    void fetchChatTimeline();
+  }, [
+    calendarNavState.activeTab,
+    calendarNavState.selectedSpace,
+    calendarNavState.selectedDate,
+    calendarNavState.highlightedSourceMessageId,
+    fetchChatTimeline,
+  ]);
+
+  // Blocking 1 & 2: Low-frequency background polling (separated from anchor date navigation)
+  useEffect(() => {
+    if (calendarNavState.activeTab !== 'mood' && calendarNavState.activeTab !== 'chat') {
+      return;
+    }
     const intervalId = window.setInterval(() => {
-      void fetchChatMessages();
+      void pollChatUpdates();
     }, 10000);
     return () => {
       window.clearInterval(intervalId);
@@ -588,7 +822,7 @@ export function App() {
   }, [
     calendarNavState.activeTab,
     calendarNavState.selectedSpace,
-    fetchChatMessages,
+    pollChatUpdates,
   ]);
 
   useEffect(() => {
@@ -1083,29 +1317,7 @@ export function App() {
   }): Promise<MessageWithAuthorizedDerived> => {
     const activeTab = calendarNavState.activeTab;
     const selectedSpace = calendarNavState.selectedSpace;
-    let roomId: string | null = null;
-    if (activeTab === 'mood') {
-      roomId = spaceOverview?.personalSpace.chatRoomId ?? null;
-    } else if (activeTab === 'chat' && selectedSpace.kind === 'family') {
-      roomId =
-        spaceOverview?.familySpaces.find((f) => f.familyId === selectedSpace.familyId)
-          ?.chatRoomId ?? null;
-    }
-
-    if (!roomId) {
-      const scope = activeTab === 'mood' ? 'personal' : 'family';
-      const query =
-        scope === 'family' && selectedSpace.kind === 'family'
-          ? `?scope=family&familyId=${encodeURIComponent(selectedSpace.familyId)}`
-          : '?scope=personal';
-      const roomRes = await fetch(`${baseUrl}/api/chat-rooms${query}`, {
-        headers: getAuthHeaders(),
-      });
-      if (roomRes.ok) {
-        const rooms = (await roomRes.json()) as ChatRoomSummary[];
-        roomId = rooms[0]?.id ?? null;
-      }
-    }
+    const roomId = await resolveRoomId(activeTab, selectedSpace);
 
     if (!roomId) {
       throw new Error('找不到可發送的目標聊天室');
@@ -1138,7 +1350,7 @@ export function App() {
         for (const m of prev.messages) map.set(m.id, m);
         map.set(created.id, created);
         return {
-          roomKey: prev.roomKey,
+          ...prev,
           messages: sortMessagesStably(Array.from(map.values())),
         };
       });
@@ -1166,7 +1378,7 @@ export function App() {
       setChatState((prev) => {
         if (prev.roomKey !== targetRoomKey) return prev;
         return {
-          roomKey: prev.roomKey,
+          ...prev,
           messages: prev.messages.filter((m) => m.id !== messageId),
         };
       });
@@ -1249,6 +1461,13 @@ export function App() {
           }
           chatLoading={chatLoading}
           chatError={chatError}
+          chatHasMoreBefore={chatState.hasMoreBefore}
+          chatHasMoreAfter={chatState.hasMoreAfter}
+          chatLoadingEarlier={chatLoadingEarlier}
+          chatLoadingLater={chatLoadingLater}
+          chatTargetMessageFound={chatState.targetMessageFound}
+          onChatLoadEarlier={currentUser ? handleLoadEarlierChatMessages : undefined}
+          onChatLoadLater={currentUser ? handleLoadLaterChatMessages : undefined}
           onCreateChatMessage={currentUser ? handleCreateChatMessage : undefined}
           onDeleteChatMessage={currentUser ? handleDeleteChatMessage : undefined}
         />

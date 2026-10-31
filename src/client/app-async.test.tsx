@@ -143,7 +143,7 @@ interface FakeApi {
   tasksStore: unknown[] | null;
   chatMutations: { method: string; path: string; body: unknown }[];
   chatStore: any[];
-  chatData: Map<string, unknown[]>;
+  chatData: Map<string, unknown>;
   parkedChat: Map<string, { gate: Deferred<unknown[]>; honorAbort: boolean }>;
 }
 
@@ -281,6 +281,17 @@ function installFakeApi(initialSession: SessionId | null): FakeApi {
             }
           });
           return json(payload);
+        }
+
+        const before = url.searchParams.get('before');
+        const after = url.searchParams.get('after');
+        if (before) {
+          const key = `before:${before}`;
+          if (api.chatData.has(key)) return json(api.chatData.get(key)!);
+        }
+        if (after) {
+          const key = `after:${after}`;
+          if (api.chatData.has(key)) return json(api.chatData.get(key)!);
         }
 
         if (api.chatData.has(chatKey)) {
@@ -958,4 +969,314 @@ describe('Issue #8 <App /> task CRUD against the API', () => {
     expect(moodInput.value).toBe('');
     expect(moodRecordDateInput.value).toBe('');
   });
+
+  it('Issue #10 & #28 <App />: clicking "查看來源聊天" jumps to source message, synchronizes space and highlightedSourceMessageId, and renders focused chat timeline', async () => {
+    const api = installFakeApi('sess_alice');
+    const scrollMock = vi.fn();
+    Element.prototype.scrollIntoView = scrollMock;
+
+    const sourceMsgId = 'msg_source_e2e';
+    const sourceMsg = {
+      id: sourceMsgId,
+      roomId: 'room_personal',
+      roomKind: 'personal',
+      familyId: null,
+      senderUserId: 'usr_alice',
+      senderDisplayName: '愛麗絲',
+      body: '來源生活筆記：預約牙醫門診 🦷',
+      localDate: '2026-10-25',
+      recordDate: null,
+      createdAt: '2026-10-25T09:00:00.000Z',
+      updatedAt: '2026-10-25T09:00:00.000Z',
+      derivedTasks: [],
+      derivedEvents: [],
+      derivedCount: 1,
+    };
+
+    api.chatStore = [sourceMsg];
+
+    // Seed personal event derived from sourceMsg
+    const dentistEvent = {
+      id: 'ev_dentist',
+      calendarId: 'cal_personal',
+      scope: 'personal' as const,
+      ownerUserId: 'usr_alice',
+      familyId: null,
+      title: '看牙醫 🦷',
+      description: null,
+      startsAt: TODAY,
+      endsAt: TODAY,
+      allDay: true,
+      timezone: 'Asia/Taipei',
+      sourceMessageId: sourceMsgId,
+      sourceStatus: 'accessible' as const,
+      sourceMessage: {
+        id: sourceMsgId,
+        roomId: 'room_personal',
+        roomKind: 'personal' as const,
+        familyId: null,
+        senderUserId: 'usr_alice',
+        senderDisplayName: '愛麗絲',
+        body: '來源生活筆記：預約牙醫門診 🦷',
+        localDate: TODAY,
+        recordDate: null,
+        createdAt: NOW,
+      },
+      createdBy: 'usr_alice',
+      createdAt: NOW,
+      updatedAt: NOW,
+    };
+    api.data.set('events:sess_alice:personal', [dentistEvent]);
+
+    render(<App />);
+
+    // Wait for event bar to appear on calendar
+    const eventBar = await screen.findByTestId(`calendar-cell-event-${TODAY}-ev_dentist`);
+    fireEvent.click(eventBar);
+
+    // Event Detail inspector is opened
+    expect(await screen.findByTestId('event-detail-panel')).toBeTruthy();
+
+    // Click "查看來源聊天" button
+    const jumpBtn = screen.getByTestId('event-detail-jump-source-btn');
+    expect(jumpBtn).toBeTruthy();
+    fireEvent.click(jumpBtn);
+
+    // Should switch to mood tab and locate source message
+    await waitFor(() => {
+      expect(screen.getByTestId('chat-panel-source-message-locator')).toBeTruthy();
+      expect(screen.getByTestId(`chat-message-${sourceMsgId}`)).toBeTruthy();
+    });
+
+    const msgEl = screen.getByTestId(`chat-message-${sourceMsgId}`);
+    expect(msgEl.getAttribute('data-highlighted')).toBe('true');
+    await waitFor(() => {
+      expect(scrollMock).toHaveBeenCalled();
+    });
+  });
+
+
+  it('PR #33 Review Blocking 1: stable chat tab does NOT repeatedly fetch on rerenders and polling triggers only on timer', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      const api = installFakeApi('sess_alice');
+      api.chatStore = [
+        {
+          id: 'msg_stable_1',
+          roomId: 'room_personal',
+          roomKind: 'personal',
+          familyId: null,
+          senderUserId: 'usr_alice',
+          senderDisplayName: '愛麗絲',
+          body: '穩定測試訊息',
+          localDate: TODAY,
+          recordDate: null,
+          createdAt: NOW,
+          updatedAt: NOW,
+          derivedTasks: [],
+          derivedEvents: [],
+          derivedCount: 0,
+        },
+      ];
+
+      render(<App />);
+
+      // Switch to mood tab
+      fireEvent.click(screen.getByTestId('right-tab-mood'));
+      expect(await screen.findByText('穩定測試訊息')).toBeTruthy();
+
+      const initialFetchCalls = api.calls.filter(
+        (c) => c.method === 'GET' && c.path === '/api/chat-rooms/room_personal/messages',
+      );
+      expect(initialFetchCalls.length).toBe(1);
+
+      // Type in input multiple times (causing multiple App/ChatPanel rerenders)
+      const input = screen.getByTestId('chat-message-input');
+      fireEvent.change(input, { target: { value: '哈' } });
+      fireEvent.change(input, { target: { value: '哈哈' } });
+      fireEvent.change(input, { target: { value: '哈哈哈' } });
+
+      // Ensure no repeated chat fetch was triggered by typing / rerenders!
+      const afterTypingCalls = api.calls.filter(
+        (c) => c.method === 'GET' && c.path === '/api/chat-rooms/room_personal/messages',
+      );
+      expect(afterTypingCalls.length).toBe(1);
+
+      // Now advance timer by 10s -> Polling triggers
+      await vi.advanceTimersByTimeAsync(10000);
+
+      const afterPollCalls = api.calls.filter(
+        (c) => c.method === 'GET' && c.path === '/api/chat-rooms/room_personal/messages',
+      );
+      expect(afterPollCalls.length).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('PR #33 Review Blocking 2: background polling preserves expanded paginated timeline and merges new messages without resetting', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      const api = installFakeApi('sess_alice');
+
+      const msgNewest = {
+        id: 'msg_p_newest',
+        roomId: 'room_personal',
+        roomKind: 'personal',
+        familyId: null,
+        senderUserId: 'usr_alice',
+        senderDisplayName: '愛麗絲',
+        body: '最新訊息（首頁）',
+        localDate: TODAY,
+        recordDate: null,
+        createdAt: '2026-10-30T10:00:00.000Z',
+        updatedAt: '2026-10-30T10:00:00.000Z',
+        derivedTasks: [],
+        derivedEvents: [],
+        derivedCount: 0,
+      };
+
+      const msgOlder = {
+        id: 'msg_p_older',
+        roomId: 'room_personal',
+        roomKind: 'personal',
+        familyId: null,
+        senderUserId: 'usr_alice',
+        senderDisplayName: '愛麗絲',
+        body: '更早的歷史訊息 📜',
+        localDate: TODAY,
+        recordDate: null,
+        createdAt: '2026-10-30T08:00:00.000Z',
+        updatedAt: '2026-10-30T08:00:00.000Z',
+        derivedTasks: [],
+        derivedEvents: [],
+        derivedCount: 0,
+      };
+
+      // Initial page has hasMoreBefore: true
+      api.chatData.set('room_personal', {
+        messages: [msgNewest],
+        hasMoreBefore: true,
+        hasMoreAfter: false,
+        startCursor: msgNewest.id,
+        endCursor: msgNewest.id,
+      });
+
+      // Older page when "before=msg_p_newest"
+      api.chatData.set('before:msg_p_newest', {
+        messages: [msgOlder],
+        hasMoreBefore: false,
+        hasMoreAfter: true,
+        startCursor: msgOlder.id,
+        endCursor: msgOlder.id,
+      });
+
+      render(<App />);
+
+      // Switch to mood tab
+      fireEvent.click(screen.getByTestId('right-tab-mood'));
+      expect(await screen.findByText('最新訊息（首頁）')).toBeTruthy();
+
+      // Click "載入更早訊息"
+      const earlierBtn = await screen.findByTestId('chat-load-earlier-button');
+      fireEvent.click(earlierBtn);
+
+      // Now both messages are present in expanded timeline
+      expect(await screen.findByText('更早的歷史訊息 📜')).toBeTruthy();
+      expect(screen.getByText('最新訊息（首頁）')).toBeTruthy();
+
+      // Configure newly incoming message for polling after endCursor
+      const msgPolled = {
+        id: 'msg_p_polled',
+        roomId: 'room_personal',
+        roomKind: 'personal',
+        familyId: null,
+        senderUserId: 'usr_alice',
+        senderDisplayName: '愛麗絲',
+        body: '後台輪詢抓到的最新推播 🔔',
+        localDate: TODAY,
+        recordDate: null,
+        createdAt: '2026-10-30T11:00:00.000Z',
+        updatedAt: '2026-10-30T11:00:00.000Z',
+        derivedTasks: [],
+        derivedEvents: [],
+        derivedCount: 0,
+      };
+      api.chatData.set(`after:${msgNewest.id}`, {
+        messages: [msgPolled],
+        hasMoreBefore: false,
+        hasMoreAfter: false,
+        startCursor: msgPolled.id,
+        endCursor: msgPolled.id,
+      });
+
+      // Advance timer by 10s to trigger background polling
+      await vi.advanceTimersByTimeAsync(10000);
+
+      // Crucial verification: The expanded older history must NOT be collapsed or wiped!
+      expect(await screen.findByText('後台輪詢抓到的最新推播 🔔')).toBeTruthy();
+      expect(screen.getByText('更早的歷史訊息 📜')).toBeTruthy();
+      expect(screen.getByText('最新訊息（首頁）')).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('PR #33 Review Non-blocking 1: missing/deleted source message displays fallback alert and clears stale highlightedSourceMessageId', async () => {
+    const api = installFakeApi('sess_alice');
+    api.chatData.set('room_personal', {
+      messages: [],
+      hasMoreBefore: false,
+      hasMoreAfter: false,
+      startCursor: null,
+      endCursor: null,
+      targetMessageFound: false,
+    });
+
+    const deletedSourceEv = {
+      id: 'ev_deleted_src',
+      calendarId: 'cal_personal',
+      scope: 'personal' as const,
+      ownerUserId: 'usr_alice',
+      familyId: null,
+      title: '已刪來源行程',
+      description: null,
+      startsAt: TODAY,
+      endsAt: TODAY,
+      allDay: true,
+      timezone: 'Asia/Taipei',
+      sourceMessageId: 'msg_nonexistent_999',
+      sourceStatus: 'accessible' as const,
+      sourceMessage: {
+        id: 'msg_nonexistent_999',
+        roomId: 'room_personal',
+        roomKind: 'personal' as const,
+        familyId: null,
+        senderUserId: 'usr_alice',
+        senderDisplayName: '愛麗絲',
+        body: '假裝可存取的來源訊息',
+        localDate: TODAY,
+        recordDate: null,
+        createdAt: NOW,
+      },
+      createdBy: 'usr_alice',
+      createdAt: NOW,
+      updatedAt: NOW,
+    };
+    api.data.set('events:sess_alice:personal', [deletedSourceEv]);
+
+    render(<App />);
+
+    const evBar = await screen.findByTestId(`calendar-cell-event-${TODAY}-ev_deleted_src`);
+    fireEvent.click(evBar);
+
+    expect(await screen.findByTestId('event-detail-panel')).toBeTruthy();
+    const jumpBtn = screen.getByTestId('event-detail-jump-source-btn');
+    fireEvent.click(jumpBtn);
+
+    // Shows fallback alert banner gracefully without crash
+    expect(await screen.findByTestId('chat-source-missing-alert')).toBeTruthy();
+    expect(screen.getByTestId('chat-source-missing-alert').textContent).toContain('來源訊息已遭移除、不存在或無存取權限');
+  });
+
 });

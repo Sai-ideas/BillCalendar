@@ -179,6 +179,34 @@ export function sortMessagesStably<T extends { createdAt: string; id: string }>(
   });
 }
 
+export const PaginatedMessagesResponseSchema = z.object({
+  messages: z.array(MessageWithAuthorizedDerivedSchema),
+  hasMoreBefore: z.boolean(),
+  hasMoreAfter: z.boolean(),
+  startCursor: z.string().nullable(),
+  endCursor: z.string().nullable(),
+  anchorDate: z.string().nullable().optional(),
+  targetMessageFound: z.boolean().optional(),
+});
+export type PaginatedMessagesResponse = z.infer<typeof PaginatedMessagesResponseSchema>;
+
+export function formatChatDateDivider(localDate: string): string {
+  try {
+    const parts = localDate.split('-');
+    if (parts.length !== 3) return localDate;
+    const year = Number(parts[0]);
+    const month = Number(parts[1]);
+    const day = Number(parts[2]);
+    if (isNaN(year) || isNaN(month) || isNaN(day)) return localDate;
+    const d = new Date(Date.UTC(year, month - 1, day));
+    const weekDays = ['星期日', '星期一', '星期二', '星期三', '星期四', '星期五', '星期六'];
+    const weekDay = weekDays[d.getUTCDay()];
+    return `${year}年${month}月${day}日 ${weekDay}`;
+  } catch {
+    return localDate;
+  }
+}
+
 export const SourceMessagePreviewSchema = z.object({
   id: z.string(),
   roomId: z.string(),

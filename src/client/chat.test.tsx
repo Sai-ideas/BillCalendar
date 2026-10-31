@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { useState } from 'react';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   createInitialCalendarNavigationState,
   type CalendarNavigationState,
@@ -295,4 +295,219 @@ describe('Issue #9 ChatPanel & CalendarWorkspace Mood/Chat Integration', () => {
       expect(screen.getByTestId('chat-send-button').hasAttribute('disabled')).toBe(true);
     });
   });
+
+  describe('Issue #10 Chat Timeline Date Dividers, Empty State, and Pagination', () => {
+    it('renders date dividers between different localDates formatted in Traditional Chinese', () => {
+      const messages = [
+        makeMessage({
+          id: 'msg_d1',
+          body: '10月29日的筆記',
+          localDate: '2026-10-29',
+          createdAt: '2026-10-29T10:00:00.000Z',
+          roomKind: 'personal',
+        }),
+        makeMessage({
+          id: 'msg_d2',
+          body: '10月30日的筆記',
+          localDate: '2026-10-30',
+          createdAt: '2026-10-30T10:00:00.000Z',
+          roomKind: 'personal',
+        }),
+      ];
+
+      render(
+        <ChatPanel
+          roomId="room_p"
+          roomKind="personal"
+          roomLabel="個人心情"
+          selectedDate="2026-10-30"
+          messages={messages}
+          onSendMessage={async () => {}}
+          onDeleteMessage={async () => {}}
+        />,
+      );
+
+      const dividers = screen.getAllByTestId('chat-date-divider');
+      expect(dividers).toHaveLength(2);
+      expect(dividers[0]?.textContent).toContain('2026年10月29日 星期四');
+      expect(dividers[1]?.textContent).toContain('2026年10月30日 星期五');
+    });
+
+    it('shows friendly empty state notice when selectedDate has no messages in current timeline', () => {
+      const messages = [
+        makeMessage({
+          id: 'msg_d1',
+          body: '10月29日的筆記',
+          localDate: '2026-10-29',
+          createdAt: '2026-10-29T10:00:00.000Z',
+          roomKind: 'personal',
+        }),
+      ];
+
+      render(
+        <ChatPanel
+          roomId="room_p"
+          roomKind="personal"
+          roomLabel="個人心情"
+          selectedDate="2026-10-31" // No messages on this date
+          messages={messages}
+          onSendMessage={async () => {}}
+          onDeleteMessage={async () => {}}
+        />,
+      );
+
+      const notice = screen.getByTestId('chat-selected-date-empty-notice');
+      expect(notice.textContent).toContain('2026-10-31 尚無心情筆記，在今日記下一筆吧');
+    });
+
+    it('renders Load Earlier and Load Later pagination buttons and fires callbacks', async () => {
+      let earlierCalled = false;
+      let laterCalled = false;
+
+      render(
+        <ChatPanel
+          roomId="room_p"
+          roomKind="personal"
+          roomLabel="個人心情"
+          selectedDate="2026-10-30"
+          messages={[
+            makeMessage({ id: 'msg_mid', body: '中間訊息', roomKind: 'personal' }),
+          ]}
+          hasMoreBefore={true}
+          hasMoreAfter={true}
+          onLoadEarlier={async () => {
+            earlierCalled = true;
+          }}
+          onLoadLater={async () => {
+            laterCalled = true;
+          }}
+          onSendMessage={async () => {}}
+          onDeleteMessage={async () => {}}
+        />,
+      );
+
+      const earlierBtn = screen.getByTestId('chat-load-earlier-button');
+      const laterBtn = screen.getByTestId('chat-load-later-button');
+
+      expect(earlierBtn).toBeTruthy();
+      expect(laterBtn).toBeTruthy();
+
+      fireEvent.click(earlierBtn);
+      expect(earlierCalled).toBe(true);
+
+      fireEvent.click(laterBtn);
+      expect(laterCalled).toBe(true);
+    });
+  });
+
+  describe('Issue #28 Source Message Scroll Focus & Graceful Degradation', () => {
+    it('scrolls into view when highlightedMessageId exists in message list', async () => {
+      const scrollIntoViewMock = vi.fn();
+      // jsdom does not define scrollIntoView by default
+      Element.prototype.scrollIntoView = scrollIntoViewMock;
+
+      const targetMsg = makeMessage({
+        id: 'msg_target_focus',
+        body: '聚焦目標訊息',
+        roomKind: 'personal',
+      });
+
+      render(
+        <ChatPanel
+          roomId="room_p"
+          roomKind="personal"
+          roomLabel="個人心情"
+          selectedDate="2026-10-30"
+          highlightedMessageId="msg_target_focus"
+          messages={[targetMsg]}
+          onSendMessage={async () => {}}
+          onDeleteMessage={async () => {}}
+        />,
+      );
+
+      await waitFor(() => {
+        expect(scrollIntoViewMock).toHaveBeenCalled();
+      });
+    });
+
+    it('displays graceful degradation alert when source message is missing or deleted', () => {
+      render(
+        <ChatPanel
+          roomId="room_p"
+          roomKind="personal"
+          roomLabel="個人心情"
+          selectedDate="2026-10-30"
+          highlightedMessageId="msg_deleted_or_missing"
+          targetMessageFound={false}
+          messages={[
+            makeMessage({ id: 'msg_other', body: '其他筆記', roomKind: 'personal' }),
+          ]}
+          onSendMessage={async () => {}}
+          onDeleteMessage={async () => {}}
+        />,
+      );
+
+      const alert = screen.getByTestId('chat-source-missing-alert');
+      expect(alert.textContent).toContain('來源訊息已遭移除、不存在或無存取權限');
+      expect(alert.textContent).toContain('已為您安全切換至接近日期');
+      expect(screen.getByTestId('chat-message-msg_other')).toBeTruthy();
+    });
+  });
+
+    it('PR #33 Review Non-blocking 2: ChatPanel preserves unsent draft text when selectedDate changes, only resets on room change', () => {
+      const { rerender } = render(
+        <ChatPanel
+          roomId="room_p"
+          roomKind="personal"
+          roomLabel="個人心情"
+          selectedDate="2026-10-30"
+          messages={[]}
+          onSendMessage={async () => {}}
+          onDeleteMessage={async () => {}}
+        />,
+      );
+
+      const input = screen.getByTestId('chat-message-input') as HTMLTextAreaElement;
+      fireEvent.change(input, { target: { value: '這是一段未發送的長篇心情...' } });
+      const recordInput = screen.getByTestId('chat-record-date-input') as HTMLInputElement;
+      fireEvent.change(recordInput, { target: { value: '2026-10-29' } });
+
+      expect(input.value).toBe('這是一段未發送的長篇心情...');
+      expect(recordInput.value).toBe('2026-10-29');
+
+      // User clicks another date on calendar -> selectedDate changes to 2026-10-31
+      rerender(
+        <ChatPanel
+          roomId="room_p"
+          roomKind="personal"
+          roomLabel="個人心情"
+          selectedDate="2026-10-31"
+          messages={[]}
+          onSendMessage={async () => {}}
+          onDeleteMessage={async () => {}}
+        />,
+      );
+
+      // Draft must be preserved!
+      expect(input.value).toBe('這是一段未發送的長篇心情...');
+      expect(recordInput.value).toBe('2026-10-29');
+
+      // Now switch room to family chat -> Draft resets
+      rerender(
+        <ChatPanel
+          roomId="room_fam_01"
+          roomKind="family"
+          roomLabel="家庭聊天室"
+          familyDisplayName="陳家"
+          selectedDate="2026-10-31"
+          messages={[]}
+          onSendMessage={async () => {}}
+          onDeleteMessage={async () => {}}
+        />,
+      );
+
+      expect(input.value).toBe('');
+      expect(recordInput.value).toBe('');
+    });
+
 });

@@ -748,7 +748,8 @@ describe('Issue #4 Data Ownership and Authorization Middleware', () => {
       devEnv,
     );
     expect(bobRoomListRes.status).toBe(200);
-    const bobRoomMsgs = (await bobRoomListRes.json()) as unknown[];
+    const bobRoomData = (await bobRoomListRes.json()) as any;
+    const bobRoomMsgs = (Array.isArray(bobRoomData) ? bobRoomData : bobRoomData.messages) as unknown[];
     expect(bobRoomMsgs).toHaveLength(1);
     const bobRoomFirstMsg = MessageWithAuthorizedDerivedSchema.parse(bobRoomMsgs[0]);
     expect(bobRoomFirstMsg.derivedCount).toBe(0);
