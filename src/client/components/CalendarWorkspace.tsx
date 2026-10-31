@@ -1,6 +1,7 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import {
   CreateEventRequestSchema,
+  CreateTaskRequestSchema,
   DEFAULT_TIMEZONE,
   LUNAR_AND_HOLIDAY_PROVENANCE,
   MAX_CALENDAR_YEAR,
@@ -8,8 +9,10 @@ import {
   MIN_CALENDAR_YEAR,
   RIGHT_PANEL_TABS,
   UpdateEventRequestSchema,
+  UpdateTaskRequestSchema,
   WEEKDAY_LABELS_ZH,
   buildCalendarEventsByDateMap,
+  buildTasksByDueDateMap,
   buildMonthCalendarGrid,
   canNavigateCalendarMonth,
   clearSelectedCalendarEvent,
@@ -28,6 +31,7 @@ import {
   navigateCalendarMonth,
   navigateCalendarToEventSourceMessage,
   normalizeToUtcIsoTimestamp,
+  openCalendarTasksForDate,
   refreshCalendarTodayDate,
   resolveEventCalendarDates,
   selectCalendarDateBlank,
@@ -36,12 +40,19 @@ import {
   switchRightPanelTab,
   type CalendarNavigationState,
   type CreateEventRequest,
+  type CreateTaskRequest,
   type EventDetail,
   type FamilySummary,
   type RightPanelTab,
   type SelectedSpace,
+  type TaskDetail,
   type UpdateEventRequest,
+  type UpdateTaskRequest,
 } from '../../shared';
+import { TasksPanel, type TaskMutationInput } from './TasksPanel';
+
+/** Max task chips rendered inside one calendar date cell before collapsing into "+N 待辦". */
+const MAX_VISIBLE_TASKS_PER_CELL = 2;
 
 export interface CalendarWorkspaceProps {
   navState: CalendarNavigationState;
@@ -58,6 +69,13 @@ export interface CalendarWorkspaceProps {
   onCreateEvent?: (payload: CreateEventRequest) => Promise<EventDetail>;
   onUpdateEvent?: (eventId: string, payload: UpdateEventRequest) => Promise<EventDetail>;
   onDeleteEvent?: (eventId: string) => Promise<void>;
+  tasks?: TaskDetail[];
+  initialTasks?: TaskDetail[];
+  tasksLoading?: boolean;
+  tasksError?: string | null;
+  onCreateTask?: (payload: CreateTaskRequest) => Promise<TaskDetail>;
+  onUpdateTask?: (taskId: string, payload: UpdateTaskRequest) => Promise<TaskDetail>;
+  onDeleteTask?: (taskId: string) => Promise<void>;
   maxVisibleEventsPerCell?: number;
 }
 
@@ -76,6 +94,13 @@ export function CalendarWorkspace({
   onCreateEvent,
   onUpdateEvent,
   onDeleteEvent,
+  tasks: controlledTasks,
+  initialTasks = [],
+  tasksLoading = false,
+  tasksError = null,
+  onCreateTask,
+  onUpdateTask,
+  onDeleteTask,
   maxVisibleEventsPerCell = MAX_VISIBLE_EVENTS_PER_CELL,
 }: CalendarWorkspaceProps) {
   const {
@@ -93,6 +118,10 @@ export function CalendarWorkspace({
   // Local fallback state when rendered standalone in component tests without controlled `events`
   const [localEvents, setLocalEvents] = useState<EventDetail[]>(() => initialEvents);
   const allEvents = controlledEvents ?? localEvents;
+
+  // Local fallback tasks when rendered standalone without controlled `tasks` (Issue #8)
+  const [localTasks, setLocalTasks] = useState<TaskDetail[]>(() => initialTasks);
+  const allTasks = controlledTasks ?? localTasks;
 
   // Track which date cells have expanded overflow event lists (`+N 更多`)
   const [expandedOverflowCells, setExpandedOverflowCells] = useState<Record<string, boolean>>({});
@@ -174,6 +203,27 @@ export function CalendarWorkspace({
       return ev.scope === 'family' && ev.familyId === selectedSpace.familyId;
     });
   }, [allEvents, selectedSpace, currentUserId]);
+
+  // Strictly isolate tasks by the active `selectedSpace` and `currentUserId` (Issue #8)
+  const spaceScopedTasks = useMemo(() => {
+    return allTasks.filter((task) => {
+      if (selectedSpace.kind === 'personal') {
+        if (task.scope !== 'personal') return false;
+        if (currentUserId && task.ownerUserId && task.ownerUserId !== currentUserId) {
+          return false;
+        }
+        return true;
+      }
+      return task.scope === 'family' && task.familyId === selectedSpace.familyId;
+    });
+  }, [allTasks, selectedSpace, currentUserId]);
+
+  // Tasks with a pure `due_date` map onto the matching date cell (no timezone shifting, Review D4)
+  const tasksByDueDateMap = useMemo(
+    () => buildTasksByDueDateMap(spaceScopedTasks),
+    [spaceScopedTasks],
+  );
+  const selectedDateTasks = tasksByDueDateMap[selectedDate] ?? [];
 
   // Map space-scoped events onto calendar date cells via `resolveEventCalendarDates`
   const eventsByDateMap = useMemo(
@@ -306,7 +356,7 @@ export function CalendarWorkspace({
     });
   };
 
-  const handleJumpToSourceMessage = (ev: EventDetail) => {
+  const handleJumpToSourceMessage = (ev: Pick<EventDetail, 'sourceStatus' | 'sourceMessage'>) => {
     if (ev.sourceStatus !== 'accessible' || !ev.sourceMessage) return;
     const authorizedFamilyIds = families.map((f) => f.id);
     const nextState = navigateCalendarToEventSourceMessage(
@@ -549,6 +599,85 @@ export function CalendarWorkspace({
     } finally {
       setFormSubmitting(false);
     }
+  };
+
+  const handleCreateTaskInput = async (input: { title: string; dueDate: string | null }) => {
+    const candidate: CreateTaskRequest = {
+      scope: selectedSpace.kind,
+      ...(selectedSpace.kind === 'family' ? { familyId: selectedSpace.familyId } : {}),
+      title: input.title,
+      dueDate: input.dueDate,
+    };
+    const parsed = CreateTaskRequestSchema.safeParse(candidate);
+    if (!parsed.success) {
+      throw new Error(parsed.error.issues[0]?.message ?? '待辦資料驗證失敗');
+    }
+    if (onCreateTask) {
+      await onCreateTask(parsed.data);
+      return;
+    }
+    const nowIso = new Date().toISOString();
+    const created: TaskDetail = {
+      id: `task_local_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      listId: selectedSpace.kind === 'personal' ? 'list_personal_local' : `list_family_${selectedSpace.familyId}`,
+      scope: parsed.data.scope,
+      ownerUserId: parsed.data.scope === 'personal' ? (currentUserId ?? 'usr_local') : null,
+      familyId: parsed.data.scope === 'family' ? parsed.data.familyId! : null,
+      title: parsed.data.title,
+      dueDate: parsed.data.dueDate ?? null,
+      completedAt: null,
+      sourceMessageId: null,
+      sourceStatus: 'none',
+      sourceMessage: null,
+      createdBy: 'usr_local',
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    };
+    setLocalTasks((prev) => [...prev, created]);
+  };
+
+  const handleUpdateTaskInput = async (taskId: string, input: TaskMutationInput) => {
+    const parsed = UpdateTaskRequestSchema.safeParse(input);
+    if (!parsed.success) {
+      throw new Error(parsed.error.issues[0]?.message ?? '待辦更新資料驗證失敗');
+    }
+    if (onUpdateTask) {
+      await onUpdateTask(taskId, parsed.data);
+      return;
+    }
+    const nowIso = new Date().toISOString();
+    setLocalTasks((prev) =>
+      prev.map((task) =>
+        task.id !== taskId
+          ? task
+          : {
+              ...task,
+              title: parsed.data.title ?? task.title,
+              dueDate: parsed.data.dueDate !== undefined ? parsed.data.dueDate : task.dueDate,
+              completedAt:
+                parsed.data.completed === undefined
+                  ? task.completedAt
+                  : parsed.data.completed
+                    ? (task.completedAt ?? nowIso)
+                    : null,
+              updatedAt: nowIso,
+            },
+      ),
+    );
+  };
+
+  const handleDeleteTaskInput = async (taskId: string) => {
+    if (onDeleteTask) {
+      await onDeleteTask(taskId);
+      return;
+    }
+    setLocalTasks((prev) => prev.filter((task) => task.id !== taskId));
+  };
+
+  const handleOpenTasksForDate = (dateStr: string) => {
+    setFormMode(null);
+    setFormError(null);
+    onChangeNavState(openCalendarTasksForDate(navState, dateStr, { openMobilePanel: true }));
   };
 
   const activeTabMeta =
@@ -794,6 +923,7 @@ export function CalendarWorkspace({
               } = cell;
 
               const cellEvents = eventsByDateMap[dateStr] ?? [];
+              const cellTasks = tasksByDueDateMap[dateStr] ?? [];
               const cellSlice = getCellEventsDisplaySlice(cellEvents, {
                 maxVisible: maxVisibleEventsPerCell,
                 isExpanded: Boolean(expandedOverflowCells[dateStr]),
@@ -827,6 +957,7 @@ export function CalendarWorkspace({
                   data-is-selected={isSelected ? 'true' : 'false'}
                   data-is-leap-month={lunar.isLeapMonth ? 'true' : 'false'}
                   data-event-count={String(cellSlice.totalCount)}
+                  data-task-count={String(cellTasks.length)}
                   aria-label={`選擇日期 ${dateStr} 農曆${lunar.lunarMonthLabel}${lunar.lunarDayLabel}${lunar.cellDisplayText !== lunar.lunarDayLabel ? ` (${lunar.cellDisplayText})` : ''}${isToday ? ' (今日)' : ''}${isSelected ? ' (已選取)' : ''}`}
                   aria-selected={isSelected}
                   onClick={() => handleCellBlankClick(dateStr, false)}
@@ -985,6 +1116,44 @@ export function CalendarWorkspace({
                       </button>
                     )}
                   </div>
+
+                  {/* Task due-date chips (Issue #8): pure due_date maps to this date cell */}
+                  {cellTasks.length > 0 && (
+                    <div className="mt-0.5 flex w-full flex-col gap-0.5">
+                      {cellTasks.slice(0, MAX_VISIBLE_TASKS_PER_CELL).map((task) => (
+                        <button
+                          key={`task-${dateStr}-${task.id}`}
+                          type="button"
+                          data-testid={`calendar-cell-task-${dateStr}-${task.id}`}
+                          data-completed={task.completedAt ? 'true' : 'false'}
+                          title={`待辦：${task.title}${task.completedAt ? '（已完成）' : ''}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleOpenTasksForDate(dateStr);
+                          }}
+                          className={`flex w-full items-center gap-1 rounded-xs border border-amber-200 bg-amber-50 px-1 py-0.5 text-left text-[10px] leading-tight hover:bg-amber-100 ${
+                            task.completedAt ? 'text-slate-400 line-through' : 'text-amber-900'
+                          }`}
+                        >
+                          <span aria-hidden="true">{task.completedAt ? '☑' : '☐'}</span>
+                          <span className="truncate">{task.title}</span>
+                        </button>
+                      ))}
+                      {cellTasks.length > MAX_VISIBLE_TASKS_PER_CELL && (
+                        <button
+                          type="button"
+                          data-testid={`calendar-cell-more-tasks-${dateStr}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleOpenTasksForDate(dateStr);
+                          }}
+                          className="w-full rounded-xs bg-amber-100 px-1 py-0.5 text-center text-[10px] font-semibold text-amber-900 hover:bg-amber-200"
+                        >
+                          +{cellTasks.length - MAX_VISIBLE_TASKS_PER_CELL} 待辦
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </div>
               );
             })}
@@ -1631,6 +1800,64 @@ export function CalendarWorkspace({
                       </div>
                     </div>
 
+                    {/* Issue #8: tasks due on the selected date */}
+                    <div
+                      data-testid="selected-date-tasks-list"
+                      className="rounded-lg border border-slate-200 bg-slate-50 p-3.5 text-xs text-slate-700 space-y-1.5"
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="font-semibold text-slate-800">
+                          ✅ 當日到期待辦（{selectedDateTasks.length} 筆）
+                        </span>
+                        {tasksLoading && (
+                          <span className="text-[11px] text-slate-400">載入中...</span>
+                        )}
+                      </div>
+                      {tasksError && (
+                        <div
+                          role="alert"
+                          data-testid="summary-tasks-api-error"
+                          className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs font-medium text-red-700"
+                        >
+                          {tasksError}
+                        </div>
+                      )}
+                      {selectedDateTasks.length === 0 ? (
+                        <p data-testid="selected-date-no-tasks" className="text-[11px] text-slate-500">
+                          當日沒有到期的待辦。可前往「待辦」分頁新增。
+                        </p>
+                      ) : (
+                        <ul className="space-y-1">
+                          {selectedDateTasks.map((task) => (
+                            <li
+                              key={`summary-task-${task.id}`}
+                              data-testid={`summary-task-item-${task.id}`}
+                              data-completed={task.completedAt ? 'true' : 'false'}
+                              className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5"
+                            >
+                              <input
+                                type="checkbox"
+                                aria-label={`${task.completedAt ? '取消完成' : '完成'}待辦：${task.title}`}
+                                data-testid={`summary-task-toggle-${task.id}`}
+                                checked={Boolean(task.completedAt)}
+                                onChange={() =>
+                                  void handleUpdateTaskInput(task.id, {
+                                    completed: !task.completedAt,
+                                  }).catch(() => undefined)
+                                }
+                                className="h-4 w-4 rounded border-slate-300 text-indigo-600"
+                              />
+                              <span
+                                className={`font-semibold ${task.completedAt ? 'text-slate-400 line-through' : 'text-slate-900'}`}
+                              >
+                                {task.title}
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+
                     {/* Issue #6 Date/Timezone Strategy & Lunar Data Provenance Card */}
                     <div
                       data-testid="timezone-and-lunar-policy-card"
@@ -1766,15 +1993,17 @@ export function CalendarWorkspace({
                 )}
 
                 {activeTab === 'tasks' && (
-                  <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-xs text-slate-700">
-                    <p className="font-semibold text-slate-900">
-                      ✅ 待辦事項（選取日：{selectedDate} ｜ {currentSpaceLabel}）
-                    </p>
-                    <p className="mt-1 text-slate-600">
-                      顯示 {currentSpaceLabel} 於 <code>{selectedDate}</code>{' '}
-                      截止或無特定日期的待辦事項（Issue #8）。
-                    </p>
-                  </div>
+                  <TasksPanel
+                    tasks={spaceScopedTasks}
+                    selectedDate={selectedDate}
+                    spaceLabel={currentSpaceLabel}
+                    loading={tasksLoading}
+                    error={tasksError}
+                    onCreate={handleCreateTaskInput}
+                    onUpdate={handleUpdateTaskInput}
+                    onDelete={handleDeleteTaskInput}
+                    onJumpToSource={handleJumpToSourceMessage}
+                  />
                 )}
 
                 {activeTab === 'diary' && (

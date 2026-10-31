@@ -751,8 +751,18 @@ export function createTasksRouter() {
       return c.json(crossUserForbiddenResponse(), 403);
     }
 
-    const scopeQuery = c.req.query('scope') ?? (c.req.query('familyId') ? 'family' : 'personal');
+    const rawScope = c.req.query('scope');
+    if (rawScope && rawScope !== 'personal' && rawScope !== 'family') {
+      return c.json({ error: 'VALIDATION_ERROR', message: '無效的空間範圍 (scope)' }, 400);
+    }
+    const scopeQuery = rawScope ?? (c.req.query('familyId') ? 'family' : 'personal');
     const familyId = c.req.query('familyId')?.trim();
+    if (rawScope === 'personal' && familyId) {
+      return c.json(
+        { error: 'VALIDATION_ERROR', message: '個人空間待辦查詢不可指定 familyId' },
+        400,
+      );
+    }
 
     if (scopeQuery === 'family') {
       if (!familyId) {

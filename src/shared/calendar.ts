@@ -1045,3 +1045,54 @@ export function jumpCalendarToDate(
     displayedMonth: clampedYm,
   };
 }
+
+/**
+ * Minimal shape of a task for calendar due-date mapping (Issue #8).
+ */
+export interface CalendarTaskLike {
+  id: string;
+  title: string;
+  dueDate: string | null;
+  completedAt: string | null;
+  createdAt?: string;
+}
+
+/**
+ * Groups tasks onto calendar date cells by their pure `due_date` (`YYYY-MM-DD`, Review D4).
+ * Tasks with `dueDate = null` (or an invalid date string) never appear in a date cell.
+ * `dueDate` is used as-is: no UTC / timezone shifting is applied. Within a cell, incomplete
+ * tasks sort before completed ones, then by `createdAt` and `id`.
+ */
+export function buildTasksByDueDateMap<T extends CalendarTaskLike>(
+  tasks: readonly T[],
+): Record<string, T[]> {
+  const byDate: Record<string, T[]> = {};
+  for (const task of tasks) {
+    if (!task.dueDate || !isValidLocalDateString(task.dueDate)) continue;
+    (byDate[task.dueDate] ??= []).push(task);
+  }
+  for (const key of Object.keys(byDate)) {
+    byDate[key]!.sort((a, b) => {
+      const aDone = a.completedAt ? 1 : 0;
+      const bDone = b.completedAt ? 1 : 0;
+      if (aDone !== bDone) return aDone - bDone;
+      const created = (a.createdAt ?? '').localeCompare(b.createdAt ?? '');
+      if (created !== 0) return created;
+      return a.id.localeCompare(b.id);
+    });
+  }
+  return byDate;
+}
+
+/**
+ * Selects `dateStr` and opens the right-hand 'tasks' tab (clicking a task chip in a date cell).
+ * Space is unchanged; `selectedEventId` is cleared.
+ */
+export function openCalendarTasksForDate(
+  state: CalendarNavigationState,
+  dateStr: string,
+  options?: { openMobilePanel?: boolean },
+): CalendarNavigationState {
+  const selected = selectCalendarDateBlank(state, dateStr, options);
+  return switchRightPanelTab(selected, 'tasks');
+}
