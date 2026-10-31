@@ -8,11 +8,14 @@ import {
   TestIdentityStateResponseSchema,
   type AuthorizedSpaceOverview,
   type CreateEventRequest,
+  type CreateTaskRequest,
   type EventDetail,
   type FamilyDetail,
   type FamilyInvitationSummary,
   type FamilySummary,
+  type TaskDetail,
   type UpdateEventRequest,
+  type UpdateTaskRequest,
   createInitialCalendarNavigationState,
   createStaleRequestGuard,
   reconcileCalendarSelectedSpace,
@@ -55,11 +58,26 @@ export function App() {
   const [eventsError, setEventsError] = useState<string | null>(null);
   const eventsRequestGuardRef = useRef(createStaleRequestGuard());
 
-  const clearSpaceEventsAndAbort = useCallback(() => {
+  // Tasks state (Issue #8) — guarded exactly like events (Issue #29)
+  const [spaceTasks, setSpaceTasks] = useState<TaskDetail[]>([]);
+  const [tasksLoading, setTasksLoading] = useState<boolean>(false);
+  const [tasksError, setTasksError] = useState<string | null>(null);
+  const tasksRequestGuardRef = useRef(createStaleRequestGuard());
+
+  // Bumped whenever identity/space context changes so in-flight mutations (POST/PATCH/DELETE)
+  // that resolve afterwards never write into a different user's or space's list.
+  const contextEpochRef = useRef(0);
+
+  const clearSpaceDataAndAbort = useCallback(() => {
+    contextEpochRef.current += 1;
     eventsRequestGuardRef.current.invalidate();
+    tasksRequestGuardRef.current.invalidate();
     setSpaceEvents([]);
     setEventsError(null);
     setEventsLoading(false);
+    setSpaceTasks([]);
+    setTasksError(null);
+    setTasksLoading(false);
   }, []);
 
   const handleChangeCalendarNavState = useCallback(
@@ -71,9 +89,13 @@ export function App() {
             next.selectedSpace.kind === 'family' &&
             prev.selectedSpace.familyId !== next.selectedSpace.familyId);
         if (spaceChanged) {
+          contextEpochRef.current += 1;
           eventsRequestGuardRef.current.invalidate();
+          tasksRequestGuardRef.current.invalidate();
           setSpaceEvents([]);
           setEventsError(null);
+          setSpaceTasks([]);
+          setTasksError(null);
         }
         return next;
       });
@@ -119,7 +141,7 @@ export function App() {
       setIdentityError(null);
       if (!parsed.data.sessionId) {
         window.localStorage.removeItem(SESSION_STORAGE_KEY);
-        clearSpaceEventsAndAbort();
+        clearSpaceDataAndAbort();
         setCalendarNavState((prev) => resetCalendarSelectedSpaceToPersonal(prev));
       }
     } catch (err: unknown) {
@@ -127,7 +149,7 @@ export function App() {
     } finally {
       setIdentityLoading(false);
     }
-  }, [baseUrl, clearSpaceEventsAndAbort]);
+  }, [baseUrl, clearSpaceDataAndAbort]);
 
   const fetchPendingInvitations = useCallback(async () => {
     const storedSessionId = window.localStorage.getItem(SESSION_STORAGE_KEY);
@@ -277,7 +299,7 @@ export function App() {
   const fetchSpaceEvents = useCallback(async () => {
     const storedSessionId = window.localStorage.getItem(SESSION_STORAGE_KEY);
     if (!storedSessionId || !identityState?.currentUser) {
-      clearSpaceEventsAndAbort();
+      clearSpaceDataAndAbort();
       return;
     }
     const ticket = eventsRequestGuardRef.current.begin();
@@ -322,9 +344,59 @@ export function App() {
   }, [
     baseUrl,
     calendarNavState.selectedSpace,
-    clearSpaceEventsAndAbort,
+    clearSpaceDataAndAbort,
     identityState?.currentUser,
   ]);
+
+  const fetchSpaceTasks = useCallback(async () => {
+    const storedSessionId = window.localStorage.getItem(SESSION_STORAGE_KEY);
+    if (!storedSessionId || !identityState?.currentUser) {
+      tasksRequestGuardRef.current.invalidate();
+      setSpaceTasks([]);
+      setTasksError(null);
+      setTasksLoading(false);
+      return;
+    }
+    const ticket = tasksRequestGuardRef.current.begin();
+    setSpaceTasks([]);
+    setTasksLoading(true);
+    setTasksError(null);
+    try {
+      const query =
+        calendarNavState.selectedSpace.kind === 'family'
+          ? `?scope=family&familyId=${encodeURIComponent(calendarNavState.selectedSpace.familyId)}`
+          : '?scope=personal';
+      const res = await fetch(`${baseUrl}/api/tasks${query}`, {
+        headers: getAuthHeaders(),
+        signal: ticket.signal,
+      });
+      if (!tasksRequestGuardRef.current.isCurrent(ticket.requestId)) {
+        return;
+      }
+      if (!res.ok) {
+        const errData = (await res.json().catch(() => ({}))) as { message?: string };
+        throw new Error(errData.message ?? '無法載入待辦事項');
+      }
+      const data = (await res.json()) as TaskDetail[];
+      if (!tasksRequestGuardRef.current.isCurrent(ticket.requestId)) {
+        return;
+      }
+      setSpaceTasks(data);
+    } catch (err: unknown) {
+      if (!tasksRequestGuardRef.current.isCurrent(ticket.requestId)) {
+        return;
+      }
+      if (err instanceof Error && err.name === 'AbortError') {
+        return;
+      }
+      setTasksError(err instanceof Error ? err.message : '無法載入待辦事項');
+      setSpaceTasks([]);
+    } finally {
+      if (tasksRequestGuardRef.current.isCurrent(ticket.requestId)) {
+        setTasksLoading(false);
+      }
+    }
+  }, [baseUrl, calendarNavState.selectedSpace, identityState?.currentUser]);
 
   useEffect(() => {
     if (identityState?.currentUser) {
@@ -337,12 +409,12 @@ export function App() {
       setFamilyDetail(null);
       setPendingInvitations([]);
       setSpaceOverview(null);
-      clearSpaceEventsAndAbort();
+      clearSpaceDataAndAbort();
       setCalendarNavState((prev) => resetCalendarSelectedSpaceToPersonal(prev));
     }
   }, [
     identityState?.currentUser,
-    clearSpaceEventsAndAbort,
+    clearSpaceDataAndAbort,
     fetchFamilies,
     fetchPendingInvitations,
     fetchSpaceOverview,
@@ -351,6 +423,10 @@ export function App() {
   useEffect(() => {
     void fetchSpaceEvents();
   }, [fetchSpaceEvents]);
+
+  useEffect(() => {
+    void fetchSpaceTasks();
+  }, [fetchSpaceTasks]);
 
   useEffect(() => {
     if (selectedFamilyId) {
@@ -365,7 +441,7 @@ export function App() {
     setIdentityError(null);
     setFamilyMessage(null);
     // Immediately clear previous user's space events & abort in-flight requests on identity switch (PR #27 Blocking 1)
-    clearSpaceEventsAndAbort();
+    clearSpaceDataAndAbort();
     try {
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
@@ -391,7 +467,7 @@ export function App() {
       if (parsed.sessionId) {
         window.localStorage.setItem(SESSION_STORAGE_KEY, parsed.sessionId);
       }
-      clearSpaceEventsAndAbort();
+      clearSpaceDataAndAbort();
       setIdentityState(parsed);
       setEmailInput('');
       setDisplayNameInput('');
@@ -415,7 +491,7 @@ export function App() {
     setSubmitting(true);
     setIdentityError(null);
     setFamilyMessage(null);
-    clearSpaceEventsAndAbort();
+    clearSpaceDataAndAbort();
     try {
       const res = await fetch(`${baseUrl}/api/test-identity/logout`, {
         method: 'POST',
@@ -425,7 +501,7 @@ export function App() {
       const json: unknown = await res.json();
       const parsed = TestIdentityStateResponseSchema.parse(json);
       window.localStorage.removeItem(SESSION_STORAGE_KEY);
-      clearSpaceEventsAndAbort();
+      clearSpaceDataAndAbort();
       setIdentityState(parsed);
       setFamilies([]);
       setSelectedFamilyId(null);
@@ -631,7 +707,7 @@ export function App() {
         calendarNavState.selectedSpace.kind === 'family' &&
         calendarNavState.selectedSpace.familyId === leavingFamilyId
       ) {
-        clearSpaceEventsAndAbort();
+        clearSpaceDataAndAbort();
       }
       setCalendarNavState((prev) =>
         reconcileCalendarSelectedSpace(
@@ -692,6 +768,7 @@ export function App() {
   };
 
   const handleCreateEvent = async (payload: CreateEventRequest): Promise<EventDetail> => {
+    const epoch = contextEpochRef.current;
     const res = await fetch(`${baseUrl}/api/events`, {
       method: 'POST',
       headers: {
@@ -704,7 +781,9 @@ export function App() {
     if (!res.ok) {
       throw new Error(data.message ?? '建立事件失敗');
     }
-    setSpaceEvents((prev) => [...prev, data]);
+    if (epoch === contextEpochRef.current) {
+      setSpaceEvents((prev) => [...prev, data]);
+    }
     return data;
   };
 
@@ -712,6 +791,7 @@ export function App() {
     eventId: string,
     payload: UpdateEventRequest,
   ): Promise<EventDetail> => {
+    const epoch = contextEpochRef.current;
     const res = await fetch(`${baseUrl}/api/events/${eventId}`, {
       method: 'PATCH',
       headers: {
@@ -724,11 +804,14 @@ export function App() {
     if (!res.ok) {
       throw new Error(data.message ?? '更新事件失敗');
     }
-    setSpaceEvents((prev) => prev.map((ev) => (ev.id === eventId ? data : ev)));
+    if (epoch === contextEpochRef.current) {
+      setSpaceEvents((prev) => prev.map((ev) => (ev.id === eventId ? data : ev)));
+    }
     return data;
   };
 
   const handleDeleteEvent = async (eventId: string): Promise<void> => {
+    const epoch = contextEpochRef.current;
     const res = await fetch(`${baseUrl}/api/events/${eventId}`, {
       method: 'DELETE',
       headers: getAuthHeaders(),
@@ -737,7 +820,68 @@ export function App() {
     if (!res.ok) {
       throw new Error(data.message ?? '刪除事件失敗');
     }
-    setSpaceEvents((prev) => prev.filter((ev) => ev.id !== eventId));
+    if (epoch === contextEpochRef.current) {
+      setSpaceEvents((prev) => prev.filter((ev) => ev.id !== eventId));
+    }
+  };
+
+  // Task CRUD handlers (Issue #8)
+  const handleCreateTask = async (payload: CreateTaskRequest): Promise<TaskDetail> => {
+    const epoch = contextEpochRef.current;
+    const res = await fetch(`${baseUrl}/api/tasks`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...getAuthHeaders(),
+      },
+      body: JSON.stringify(payload),
+    });
+    const data = (await res.json()) as TaskDetail & { message?: string };
+    if (!res.ok) {
+      throw new Error(data.message ?? '建立待辦失敗');
+    }
+    if (epoch === contextEpochRef.current) {
+      setSpaceTasks((prev) => [...prev, data]);
+    }
+    return data;
+  };
+
+  const handleUpdateTask = async (
+    taskId: string,
+    payload: UpdateTaskRequest,
+  ): Promise<TaskDetail> => {
+    const epoch = contextEpochRef.current;
+    const res = await fetch(`${baseUrl}/api/tasks/${taskId}`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        ...getAuthHeaders(),
+      },
+      body: JSON.stringify(payload),
+    });
+    const data = (await res.json()) as TaskDetail & { message?: string };
+    if (!res.ok) {
+      throw new Error(data.message ?? '更新待辦失敗');
+    }
+    if (epoch === contextEpochRef.current) {
+      setSpaceTasks((prev) => prev.map((task) => (task.id === taskId ? data : task)));
+    }
+    return data;
+  };
+
+  const handleDeleteTask = async (taskId: string): Promise<void> => {
+    const epoch = contextEpochRef.current;
+    const res = await fetch(`${baseUrl}/api/tasks/${taskId}`, {
+      method: 'DELETE',
+      headers: getAuthHeaders(),
+    });
+    const data = (await res.json().catch(() => ({}))) as { message?: string };
+    if (!res.ok) {
+      throw new Error(data.message ?? '刪除待辦失敗');
+    }
+    if (epoch === contextEpochRef.current) {
+      setSpaceTasks((prev) => prev.filter((task) => task.id !== taskId));
+    }
   };
 
   const currentUser = identityState?.currentUser ?? null;
@@ -766,7 +910,7 @@ export function App() {
               BillCalendar — 生活行事曆 Demo
             </h1>
             <p className="text-xs text-slate-500">
-              高密度月曆與家庭協作示範應用（階段：P3 個人／家庭行事曆事件 CRUD 與月曆事件條整合）
+              高密度月曆與家庭協作示範應用（階段：P3 個人／家庭行事曆事件與待辦 CRUD、月曆整合）
             </p>
           </div>
 
@@ -803,6 +947,12 @@ export function App() {
           onCreateEvent={currentUser ? handleCreateEvent : undefined}
           onUpdateEvent={currentUser ? handleUpdateEvent : undefined}
           onDeleteEvent={currentUser ? handleDeleteEvent : undefined}
+          tasks={currentUser ? spaceTasks : undefined}
+          tasksLoading={tasksLoading}
+          tasksError={tasksError}
+          onCreateTask={currentUser ? handleCreateTask : undefined}
+          onUpdateTask={currentUser ? handleUpdateTask : undefined}
+          onDeleteTask={currentUser ? handleDeleteTask : undefined}
         />
         {/* Global Action Message */}
         {familyMessage && (

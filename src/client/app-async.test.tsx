@@ -1,0 +1,649 @@
+// @vitest-environment jsdom
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { getTodayLocalDate } from '../shared';
+import { App } from './App';
+
+/**
+ * Issue #29 (PR #27 Follow-up #2) + Issue #8:
+ * `<App />`-level integration tests for async identity switching, space switching, logout,
+ * leaving a family and out-of-order network responses for BOTH events and tasks.
+ *
+ * `fetch` is replaced by a controllable in-memory API. Individual `/api/events` and `/api/tasks`
+ * requests can be parked behind deferred promises so tests decide the resolution order.
+ */
+
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+}
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
+const TODAY = getTodayLocalDate();
+const NOW = '2026-10-01T00:00:00.000Z';
+
+const USERS = {
+  sess_alice: {
+    id: 'usr_alice',
+    emailNormalized: 'alice.demo@billcalendar.test',
+    displayName: 'Alice (合成帳號 A)',
+    defaultTimezone: 'Asia/Taipei',
+    createdAt: NOW,
+  },
+  sess_bob: {
+    id: 'usr_bob',
+    emailNormalized: 'bob.demo@billcalendar.test',
+    displayName: 'Bob (合成帳號 B)',
+    defaultTimezone: 'Asia/Taipei',
+    createdAt: NOW,
+  },
+} as const;
+type SessionId = keyof typeof USERS;
+
+const FAMILY = {
+  id: 'fam_01',
+  name: '陳家生活空間',
+  myRole: 'admin',
+  memberCount: 1,
+  createdBy: 'usr_alice',
+  createdAt: NOW,
+  updatedAt: NOW,
+};
+const FAMILY_DETAIL = {
+  ...FAMILY,
+  members: [
+    {
+      id: 'mem_1',
+      userId: 'usr_alice',
+      role: 'admin',
+      displayName: 'Alice (合成帳號 A)',
+      emailNormalized: 'alice.demo@billcalendar.test',
+      joinedAt: NOW,
+    },
+  ],
+  pendingInvitations: [],
+};
+
+function eventFixture(
+  title: string,
+  scope: 'personal' | 'family',
+  opts: { ownerUserId?: string | null; familyId?: string | null } = {},
+) {
+  return {
+    id: `evt_${title}`,
+    calendarId: 'cal_x',
+    scope,
+    ownerUserId: scope === 'personal' ? (opts.ownerUserId ?? null) : null,
+    familyId: scope === 'family' ? (opts.familyId ?? 'fam_01') : null,
+    title,
+    description: null,
+    startsAt: TODAY,
+    endsAt: TODAY,
+    allDay: true,
+    timezone: 'Asia/Taipei',
+    sourceMessageId: null,
+    sourceStatus: 'none',
+    sourceMessage: null,
+    createdBy: 'usr_alice',
+    createdAt: NOW,
+    updatedAt: NOW,
+  };
+}
+
+function taskFixture(
+  title: string,
+  scope: 'personal' | 'family',
+  opts: { ownerUserId?: string | null; familyId?: string | null; dueDate?: string | null } = {},
+) {
+  return {
+    id: `task_${title}`,
+    listId: 'list_x',
+    scope,
+    ownerUserId: scope === 'personal' ? (opts.ownerUserId ?? null) : null,
+    familyId: scope === 'family' ? (opts.familyId ?? 'fam_01') : null,
+    title,
+    dueDate: opts.dueDate === undefined ? TODAY : opts.dueDate,
+    completedAt: null,
+    sourceMessageId: null,
+    sourceStatus: 'none',
+    sourceMessage: null,
+    createdBy: 'usr_alice',
+    createdAt: NOW,
+    updatedAt: NOW,
+  };
+}
+
+interface RecordedCall {
+  method: string;
+  path: string;
+  search: string;
+  session: string | null;
+  signal: AbortSignal | null;
+  body: unknown;
+}
+
+type DataKey = `${'events' | 'tasks'}:${string}:${string}`;
+
+interface FakeApi {
+  calls: RecordedCall[];
+  /** Default payloads, keyed `events|tasks:<session>:<scope>`. */
+  data: Map<DataKey, unknown[]>;
+  /** One-shot parked responses for the next matching request. `honorAbort` mimics real fetch. */
+  parked: Map<DataKey, { gate: Deferred<unknown[]>; honorAbort: boolean }>;
+  selectGate: Deferred<void> | null;
+  logoutGate: Deferred<void> | null;
+  families: Record<string, unknown[]>;
+  taskMutations: { method: string; path: string; body: unknown }[];
+  tasksStore: unknown[] | null;
+}
+
+function json(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+function stateFor(session: SessionId | null) {
+  return {
+    enabled: true,
+    simulationMode: true,
+    isAuthenticatedSecurity: false,
+    securityNotice: 'test',
+    sessionId: session,
+    expiresAt: session ? '2030-01-01T00:00:00.000Z' : null,
+    currentUser: session ? USERS[session] : null,
+    availableUsers: [],
+  };
+}
+
+function installFakeApi(initialSession: SessionId | null): FakeApi {
+  const api: FakeApi = {
+    calls: [],
+    data: new Map(),
+    parked: new Map(),
+    selectGate: null,
+    logoutGate: null,
+    families: { sess_alice: [FAMILY], sess_bob: [] },
+    taskMutations: [],
+    tasksStore: null,
+  };
+  if (initialSession) window.localStorage.setItem('bc_test_session_id', initialSession);
+
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(typeof input === 'string' ? input : input.toString(), 'http://localhost');
+      const headers = new Headers(init?.headers);
+      const session = headers.get('X-Test-Session-Id');
+      const method = (init?.method ?? 'GET').toUpperCase();
+      const body = typeof init?.body === 'string' ? JSON.parse(init.body) : null;
+      const signal = init?.signal ?? null;
+      api.calls.push({ method, path: url.pathname, search: url.search, session, signal, body });
+      const path = url.pathname;
+
+      if (path === '/api/health') {
+        return json({
+          status: 'ok',
+          service: 'billcalendar-api',
+          environment: 'test',
+          timezone: 'Asia/Taipei',
+          timestamp: NOW,
+          database: { connected: true, migrated: true },
+        });
+      }
+      if (path === '/api/test-identity/state') {
+        return json(stateFor(session && session in USERS ? (session as SessionId) : null));
+      }
+      if (path === '/api/test-identity/select') {
+        if (api.selectGate) await api.selectGate.promise;
+        const next: SessionId = String(body?.email).startsWith('bob') ? 'sess_bob' : 'sess_alice';
+        return json(stateFor(next));
+      }
+      if (path === '/api/test-identity/logout') {
+        if (api.logoutGate) await api.logoutGate.promise;
+        return json(stateFor(null));
+      }
+      if (path === '/api/families') {
+        return json(api.families[session ?? ''] ?? []);
+      }
+      if (path === `/api/families/${FAMILY.id}`) return json(FAMILY_DETAIL);
+      if (path === `/api/families/${FAMILY.id}/leave`) {
+        api.families.sess_alice = [];
+        return json({ success: true });
+      }
+      if (path === '/api/invitations') return json([]);
+      if (path === '/api/spaces') return json({ message: 'n/a' }, 404);
+
+      if (path === '/api/events' || path === '/api/tasks') {
+        const kind = path === '/api/events' ? 'events' : 'tasks';
+        if (kind === 'tasks' && method !== 'GET') {
+          api.taskMutations.push({ method, path, body });
+          if (method === 'POST') {
+            const created = taskFixture(String(body.title), body.scope, {
+              ownerUserId: USERS[session as SessionId].id,
+              familyId: body.familyId ?? null,
+              dueDate: body.dueDate ?? null,
+            });
+            return json(created, 201);
+          }
+        }
+        const scope = url.searchParams.get('scope') ?? 'personal';
+        const key: DataKey = `${kind}:${session}:${scope}`;
+        const park = api.parked.get(key);
+        let payload: unknown[];
+        if (park) {
+          api.parked.delete(key);
+          payload = await new Promise<unknown[]>((resolve, reject) => {
+            park.gate.promise.then(resolve);
+            if (park.honorAbort && signal) {
+              signal.addEventListener('abort', () =>
+                reject(new DOMException('The operation was aborted.', 'AbortError')),
+              );
+            }
+          });
+        } else {
+          payload = api.data.get(key) ?? [];
+        }
+        return json(payload);
+      }
+      if (kind_isTaskItemPath(path)) {
+        api.taskMutations.push({ method, path, body });
+        const id = decodeURIComponent(path.split('/').pop()!);
+        if (method === 'DELETE') return json({ success: true, id });
+        const base = taskFixture(id.replace(/^task_/, ''), 'personal', {
+          ownerUserId: USERS[session as SessionId].id,
+          dueDate: body?.dueDate ?? TODAY,
+        });
+        return json({
+          ...base,
+          id,
+          title: body?.title ?? base.title,
+          completedAt: body?.completed ? NOW : null,
+        });
+      }
+      return json({ message: `unhandled ${method} ${path}` }, 404);
+    }),
+  );
+  return api;
+}
+
+function kind_isTaskItemPath(path: string): boolean {
+  return /^\/api\/tasks\/[^/]+$/.test(path);
+}
+
+const flush = async () => {
+  await act(async () => {
+    await Promise.resolve();
+  });
+};
+
+const titleCount = (title: string) => screen.queryAllByText(title).length;
+
+function clickPreset(name: RegExp) {
+  fireEvent.click(screen.getByRole('button', { name }));
+}
+
+const hasCall = (api: FakeApi, path: string, session: string, search = '') =>
+  api.calls.some((c) => c.path === path && c.session === session && c.search.includes(search));
+
+function createMemoryStorage(): Storage {
+  const store = new Map<string, string>();
+  return {
+    get length() {
+      return store.size;
+    },
+    clear: () => store.clear(),
+    getItem: (key: string) => store.get(key) ?? null,
+    key: (index: number) => [...store.keys()][index] ?? null,
+    removeItem: (key: string) => void store.delete(key),
+    setItem: (key: string, value: string) => void store.set(key, String(value)),
+  };
+}
+
+beforeEach(() => {
+  // Newer Node versions expose an experimental global `localStorage` that shadows jsdom's; use a deterministic in-memory one.
+  Object.defineProperty(window, 'localStorage', {
+    value: createMemoryStorage(),
+    configurable: true,
+    writable: true,
+  });
+});
+
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
+
+describe('Issue #29 <App /> async identity / space switching & out-of-order responses', () => {
+  it('loads personal events and tasks for the current identity', async () => {
+    const api = installFakeApi('sess_alice');
+    api.data.set('events:sess_alice:personal', [
+      eventFixture('Alice 行程', 'personal', { ownerUserId: 'usr_alice' }),
+    ]);
+    api.data.set('tasks:sess_alice:personal', [
+      taskFixture('Alice 待辦', 'personal', { ownerUserId: 'usr_alice' }),
+    ]);
+    render(<App />);
+    await waitFor(() => expect(titleCount('Alice 行程')).toBeGreaterThan(0));
+    await waitFor(() => expect(titleCount('Alice 待辦')).toBeGreaterThan(0));
+    expect(hasCall(api, '/api/tasks', 'sess_alice', 'scope=personal')).toBe(true);
+  });
+
+  it('immediately clears the previous user events AND tasks when switching identity (before the select response)', async () => {
+    const api = installFakeApi('sess_alice');
+    api.data.set('events:sess_alice:personal', [
+      eventFixture('Alice 私人行程', 'personal', { ownerUserId: 'usr_alice' }),
+    ]);
+    api.data.set('tasks:sess_alice:personal', [
+      taskFixture('Alice 私人待辦', 'personal', { ownerUserId: 'usr_alice' }),
+    ]);
+    api.data.set('events:sess_bob:personal', [
+      eventFixture('Bob 行程', 'personal', { ownerUserId: 'usr_bob' }),
+    ]);
+    api.data.set('tasks:sess_bob:personal', [
+      taskFixture('Bob 待辦', 'personal', { ownerUserId: 'usr_bob' }),
+    ]);
+    render(<App />);
+    await waitFor(() => expect(titleCount('Alice 私人待辦')).toBeGreaterThan(0));
+    expect(titleCount('Alice 私人行程')).toBeGreaterThan(0);
+
+    api.selectGate = deferred<void>();
+    clickPreset(/Bob \(合成帳號 B\)/);
+    await flush();
+    // select request still pending, Alice's private data must already be gone
+    expect(titleCount('Alice 私人行程')).toBe(0);
+    expect(titleCount('Alice 私人待辦')).toBe(0);
+
+    await act(async () => {
+      api.selectGate!.resolve();
+    });
+    await waitFor(() => expect(titleCount('Bob 待辦')).toBeGreaterThan(0));
+    expect(titleCount('Bob 行程')).toBeGreaterThan(0);
+    expect(titleCount('Alice 私人行程')).toBe(0);
+    expect(titleCount('Alice 私人待辦')).toBe(0);
+  });
+
+  it.each([
+    ['ignores the AbortSignal (late stale arrival)', false],
+    ['honours the AbortSignal like real fetch (AbortError)', true],
+  ])(
+    'A slow personal load resolving AFTER switching to B never overwrites B and never surfaces an error — fetch %s',
+    async (_label, honorAbort) => {
+      const api = installFakeApi('sess_alice');
+      // Payloads deliberately carry NO ownerUserId so only the App request guard can keep them out.
+      const slowEvents = deferred<unknown[]>();
+      const slowTasks = deferred<unknown[]>();
+      api.parked.set('events:sess_alice:personal', { gate: slowEvents, honorAbort });
+      api.parked.set('tasks:sess_alice:personal', { gate: slowTasks, honorAbort });
+      api.data.set('events:sess_bob:personal', [eventFixture('Bob 行程', 'personal')]);
+      api.data.set('tasks:sess_bob:personal', [taskFixture('Bob 待辦', 'personal')]);
+
+      render(<App />);
+      await waitFor(() => {
+        expect(hasCall(api, '/api/events', 'sess_alice')).toBe(true);
+        expect(hasCall(api, '/api/tasks', 'sess_alice')).toBe(true);
+      });
+
+      clickPreset(/Bob \(合成帳號 B\)/);
+      await waitFor(() => expect(titleCount('Bob 待辦')).toBeGreaterThan(0));
+      expect(titleCount('Bob 行程')).toBeGreaterThan(0);
+
+      // Alice's in-flight requests were aborted on switch
+      const aliceListCalls = api.calls.filter(
+        (c) => c.session === 'sess_alice' && (c.path === '/api/events' || c.path === '/api/tasks'),
+      );
+      expect(aliceListCalls.length).toBeGreaterThanOrEqual(2);
+      expect(aliceListCalls.every((c) => c.signal?.aborted === true)).toBe(true);
+
+      // The slow Alice responses finally arrive (out of order)
+      await act(async () => {
+        slowEvents.resolve([eventFixture('Alice 洩漏行程', 'personal')]);
+        slowTasks.resolve([taskFixture('Alice 洩漏待辦', 'personal')]);
+      });
+      await flush();
+
+      expect(titleCount('Alice 洩漏行程')).toBe(0);
+      expect(titleCount('Alice 洩漏待辦')).toBe(0);
+      expect(titleCount('Bob 行程')).toBeGreaterThan(0);
+      expect(titleCount('Bob 待辦')).toBeGreaterThan(0);
+      expect(screen.queryByTestId('events-api-error')).toBeNull();
+      expect(screen.queryByTestId('summary-tasks-api-error')).toBeNull();
+    },
+  );
+
+  it('space switch personal → family → personal: an older personal response resolving last is discarded', async () => {
+    const api = installFakeApi('sess_alice');
+    const slowEvents = deferred<unknown[]>();
+    const slowTasks = deferred<unknown[]>();
+    api.parked.set('events:sess_alice:personal', { gate: slowEvents, honorAbort: false });
+    api.parked.set('tasks:sess_alice:personal', { gate: slowTasks, honorAbort: false });
+    api.data.set('events:sess_alice:personal', [
+      eventFixture('新版個人行程', 'personal', { ownerUserId: 'usr_alice' }),
+    ]);
+    api.data.set('tasks:sess_alice:personal', [
+      taskFixture('新版個人待辦', 'personal', { ownerUserId: 'usr_alice' }),
+    ]);
+    api.data.set('events:sess_alice:family', [eventFixture('家庭行程', 'family')]);
+    api.data.set('tasks:sess_alice:family', [taskFixture('家庭待辦', 'family')]);
+
+    render(<App />);
+    // first (slow) personal requests are in flight
+    await waitFor(() => expect(hasCall(api, '/api/tasks', 'sess_alice', 'scope=personal')).toBe(true));
+    await screen.findByTestId('space-switch-family-fam_01');
+
+    fireEvent.click(screen.getByTestId('space-switch-family-fam_01'));
+    await waitFor(() => expect(titleCount('家庭待辦')).toBeGreaterThan(0));
+    expect(titleCount('家庭行程')).toBeGreaterThan(0);
+
+    fireEvent.click(screen.getByTestId('space-switch-personal'));
+    await waitFor(() => expect(titleCount('新版個人待辦')).toBeGreaterThan(0));
+    expect(titleCount('新版個人行程')).toBeGreaterThan(0);
+    expect(titleCount('家庭待辦')).toBe(0);
+
+    // the very first personal requests were aborted by the space switch
+    const firstPersonal = api.calls.filter(
+      (c) => c.session === 'sess_alice' && c.search.includes('scope=personal'),
+    )[0];
+    expect(firstPersonal?.signal?.aborted).toBe(true);
+
+    await act(async () => {
+      slowEvents.resolve([eventFixture('過期個人行程', 'personal', { ownerUserId: 'usr_alice' })]);
+      slowTasks.resolve([taskFixture('過期個人待辦', 'personal', { ownerUserId: 'usr_alice' })]);
+    });
+    await flush();
+
+    expect(titleCount('過期個人行程')).toBe(0);
+    expect(titleCount('過期個人待辦')).toBe(0);
+    expect(titleCount('新版個人行程')).toBeGreaterThan(0);
+    expect(titleCount('新版個人待辦')).toBeGreaterThan(0);
+  });
+
+  it('space switch personal → family: a slow personal response arriving while family is shown does not leak into family', async () => {
+    const api = installFakeApi('sess_alice');
+    api.data.set('events:sess_alice:personal', [
+      eventFixture('個人行程', 'personal', { ownerUserId: 'usr_alice' }),
+    ]);
+    api.data.set('tasks:sess_alice:personal', [
+      taskFixture('個人待辦', 'personal', { ownerUserId: 'usr_alice' }),
+    ]);
+    api.data.set('events:sess_alice:family', [eventFixture('家庭行程', 'family')]);
+    api.data.set('tasks:sess_alice:family', [taskFixture('家庭待辦', 'family')]);
+
+    render(<App />);
+    await waitFor(() => expect(titleCount('個人待辦')).toBeGreaterThan(0));
+    await screen.findByTestId('space-switch-family-fam_01');
+
+    // park the NEXT personal reload, go to family (fast), then back to personal (parked), then family again
+    const slowTasks = deferred<unknown[]>();
+    api.parked.set('tasks:sess_alice:personal', { gate: slowTasks, honorAbort: false });
+    fireEvent.click(screen.getByTestId('space-switch-personal'));
+    await waitFor(() => expect(hasCall(api, '/api/tasks', 'sess_alice', 'scope=personal')).toBe(true));
+    fireEvent.click(screen.getByTestId('space-switch-family-fam_01'));
+    await waitFor(() => expect(titleCount('家庭待辦')).toBeGreaterThan(0));
+
+    await act(async () => {
+      slowTasks.resolve([taskFixture('遲到的個人待辦', 'personal', { ownerUserId: 'usr_alice' })]);
+    });
+    await flush();
+    expect(titleCount('遲到的個人待辦')).toBe(0);
+    expect(titleCount('家庭待辦')).toBeGreaterThan(0);
+
+    // switching back to personal must show fresh personal data, not the stale late response
+    fireEvent.click(screen.getByTestId('space-switch-personal'));
+    await waitFor(() => expect(titleCount('個人待辦')).toBeGreaterThan(0));
+    expect(titleCount('遲到的個人待辦')).toBe(0);
+  });
+
+  it('logout while loads are in flight aborts them and a late response never renders', async () => {
+    const api = installFakeApi('sess_alice');
+    const slowEvents = deferred<unknown[]>();
+    const slowTasks = deferred<unknown[]>();
+    api.parked.set('events:sess_alice:personal', { gate: slowEvents, honorAbort: false });
+    api.parked.set('tasks:sess_alice:personal', { gate: slowTasks, honorAbort: false });
+
+    render(<App />);
+    await waitFor(() => expect(hasCall(api, '/api/tasks', 'sess_alice', 'scope=personal')).toBe(true));
+    fireEvent.click(await screen.findByRole('button', { name: '結束目前模擬身份' }));
+    await waitFor(() => expect(screen.queryByRole('button', { name: '結束目前模擬身份' })).toBeNull());
+
+    const aliceListCalls = api.calls.filter(
+      (c) => c.session === 'sess_alice' && (c.path === '/api/events' || c.path === '/api/tasks'),
+    );
+    expect(aliceListCalls.every((c) => c.signal?.aborted === true)).toBe(true);
+
+    await act(async () => {
+      slowEvents.resolve([eventFixture('登出後行程', 'personal')]);
+      slowTasks.resolve([taskFixture('登出後待辦', 'personal')]);
+    });
+    await flush();
+    expect(titleCount('登出後行程')).toBe(0);
+    expect(titleCount('登出後待辦')).toBe(0);
+
+    // signing in as Bob afterwards still starts from a clean slate
+    api.data.set('tasks:sess_bob:personal', [taskFixture('Bob 待辦', 'personal')]);
+    clickPreset(/Bob \(合成帳號 B\)/);
+    await waitFor(() => expect(titleCount('Bob 待辦')).toBeGreaterThan(0));
+    expect(titleCount('登出後待辦')).toBe(0);
+  });
+
+  it('leaving the selected family aborts its in-flight loads and falls back to personal data', async () => {
+    const api = installFakeApi('sess_alice');
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    api.data.set('events:sess_alice:personal', [
+      eventFixture('個人行程', 'personal', { ownerUserId: 'usr_alice' }),
+    ]);
+    api.data.set('tasks:sess_alice:personal', [
+      taskFixture('個人待辦', 'personal', { ownerUserId: 'usr_alice' }),
+    ]);
+
+    render(<App />);
+    await waitFor(() => expect(titleCount('個人待辦')).toBeGreaterThan(0));
+    await screen.findByTestId('space-switch-family-fam_01');
+
+    const slowEvents = deferred<unknown[]>();
+    const slowTasks = deferred<unknown[]>();
+    api.parked.set('events:sess_alice:family', { gate: slowEvents, honorAbort: false });
+    api.parked.set('tasks:sess_alice:family', { gate: slowTasks, honorAbort: false });
+    fireEvent.click(screen.getByTestId('space-switch-family-fam_01'));
+    await waitFor(() => expect(hasCall(api, '/api/tasks', 'sess_alice', 'scope=family')).toBe(true));
+
+    fireEvent.click(await screen.findByRole('button', { name: '退出該家庭' }));
+    await waitFor(() => expect(screen.queryByTestId('space-switch-family-fam_01')).toBeNull());
+    await waitFor(() => expect(titleCount('個人待辦')).toBeGreaterThan(0));
+    expect(screen.getByTestId('status-selected-space').textContent).toBe('個人空間');
+
+    const familyCalls = api.calls.filter((c) => c.search.includes('scope=family'));
+    expect(familyCalls.length).toBeGreaterThanOrEqual(2);
+    expect(familyCalls.every((c) => c.signal?.aborted === true)).toBe(true);
+
+    await act(async () => {
+      slowEvents.resolve([eventFixture('退出後的家庭行程', 'family')]);
+      slowTasks.resolve([taskFixture('退出後的家庭待辦', 'family')]);
+    });
+    await flush();
+    expect(titleCount('退出後的家庭行程')).toBe(0);
+    expect(titleCount('退出後的家庭待辦')).toBe(0);
+    expect(titleCount('個人待辦')).toBeGreaterThan(0);
+  });
+});
+
+describe('Issue #8 <App /> task CRUD against the API', () => {
+  it('creates (undated + dated), toggles completion and deletes tasks through /api/tasks', async () => {
+    const api = installFakeApi('sess_alice');
+    api.data.set('tasks:sess_alice:personal', [
+      taskFixture('既有待辦', 'personal', { ownerUserId: 'usr_alice', dueDate: null }),
+    ]);
+    render(<App />);
+    fireEvent.click(await screen.findByTestId('right-tab-tasks'));
+    await waitFor(() => expect(titleCount('既有待辦')).toBeGreaterThan(0));
+
+    // create undated task
+    fireEvent.click(screen.getByTestId('task-open-create-btn'));
+    fireEvent.change(screen.getByTestId('task-form-title-input'), { target: { value: '無日期新待辦' } });
+    fireEvent.click(screen.getByTestId('task-form-submit-btn'));
+    await waitFor(() => expect(titleCount('無日期新待辦')).toBeGreaterThan(0));
+    const post1 = api.taskMutations.find((m) => m.method === 'POST')!;
+    expect(post1.body).toMatchObject({ scope: 'personal', title: '無日期新待辦', dueDate: null });
+
+    // create dated task
+    fireEvent.click(screen.getByTestId('task-open-create-btn'));
+    fireEvent.change(screen.getByTestId('task-form-title-input'), { target: { value: '有日期新待辦' } });
+    fireEvent.change(screen.getByTestId('task-form-due-date-input'), { target: { value: TODAY } });
+    fireEvent.click(screen.getByTestId('task-form-submit-btn'));
+    await waitFor(() => expect(titleCount('有日期新待辦')).toBeGreaterThan(0));
+    const posts = api.taskMutations.filter((m) => m.method === 'POST');
+    expect(posts[1]!.body).toMatchObject({ title: '有日期新待辦', dueDate: TODAY });
+
+    // illegal date never reaches the API
+    fireEvent.click(screen.getByTestId('task-open-create-btn'));
+    fireEvent.change(screen.getByTestId('task-form-title-input'), { target: { value: '壞日期待辦' } });
+    fireEvent.change(screen.getByTestId('task-form-due-date-input'), { target: { value: '2026-02-30' } });
+    fireEvent.click(screen.getByTestId('task-form-submit-btn'));
+    await screen.findByTestId('task-form-error');
+    expect(api.taskMutations.filter((m) => m.method === 'POST')).toHaveLength(2);
+    fireEvent.click(screen.getByTestId('task-form-cancel-btn'));
+
+    // toggle completion -> PATCH { completed: true }
+    fireEvent.click(screen.getByTestId('task-toggle-task_既有待辦'));
+    await waitFor(() =>
+      expect(screen.getByTestId('task-item-task_既有待辦').getAttribute('data-completed')).toBe('true'),
+    );
+    const patch = api.taskMutations.find((m) => m.method === 'PATCH')!;
+    expect(decodeURIComponent(patch.path)).toBe('/api/tasks/task_既有待辦');
+    expect(patch.body).toEqual({ completed: true });
+
+    // delete
+    fireEvent.click(screen.getByTestId('task-delete-task_既有待辦'));
+    await waitFor(() => expect(screen.queryByTestId('task-item-task_既有待辦')).toBeNull());
+    expect(api.taskMutations.some((m) => m.method === 'DELETE')).toBe(true);
+  });
+
+  it('shows a task API load error without crashing and keeps events working', async () => {
+    const api = installFakeApi('sess_alice');
+    api.data.set('events:sess_alice:personal', [
+      eventFixture('正常行程', 'personal', { ownerUserId: 'usr_alice' }),
+    ]);
+    const original = globalThis.fetch;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const u = typeof input === 'string' ? input : input.toString();
+        if (u.includes('/api/tasks')) {
+          return json({ message: '待辦服務暫時不可用' }, 500);
+        }
+        return original(input, init);
+      }),
+    );
+    render(<App />);
+    await waitFor(() => expect(titleCount('正常行程')).toBeGreaterThan(0));
+    expect((await screen.findByTestId('summary-tasks-api-error')).textContent).toContain('待辦服務暫時不可用');
+  });
+});
